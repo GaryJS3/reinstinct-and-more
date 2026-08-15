@@ -621,6 +621,9 @@ Only `data:image/jpeg;base64,...` and `data:image/png;base64,...` are accepted.
 The decoded image is capped at 6 MiB; remote URLs, additional images, and
 non-user structured content are rejected. This path is Qwen-only and keeps
 ReInstinct as the LLM backend; the bridge performs only image frontend work.
+The HTTP request body is separately capped at 8 MiB. The path was validated
+with the llama.cpp `tools/mtmd/test-1.jpeg` fixture on gfx906; it is not
+enabled unless both vision options are supplied at server startup.
 
 ### Shared request fields
 

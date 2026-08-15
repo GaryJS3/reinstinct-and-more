@@ -91,8 +91,9 @@ the drafter is likely to land.
 
 ## Features
 
-> Multimodal image input is under active development. The pinned Furnace
-> `libmtmd` bridge and M-RoPE runtime are validated on Qwen3.6. The server
+> Multimodal image input is validated on Qwen3.6. The pinned Furnace
+> `libmtmd` bridge and M-RoPE runtime run entirely ahead of the ReInstinct
+> LLM backend. The server
 > accepts one local `data:image/jpeg|png;base64,...` input when started with
 > `--mmproj` and `--mtmd-bridge`; remote image URLs remain unsupported. See
 > [the plan](docs/MULTIMODAL_PLAN.md) and [current progress](docs/MULTIMODAL_PROGRESS.md).

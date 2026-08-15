@@ -92,3 +92,53 @@ pub fn write_response(stream: &mut TcpStream, status: u16, status_text: &str, bo
     stream.write_all(resp.as_bytes())?;
     stream.flush()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn with_request<T: Send + 'static>(request: String,
+                                       check: impl FnOnce(Result<Request, String>) -> T + Send + 'static) -> T {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            check(read_request(&stream))
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client.write_all(request.as_bytes()).unwrap();
+        client.flush().unwrap();
+        worker.join().unwrap()
+    }
+
+    #[test]
+    fn rejects_an_overlong_body_before_reading_it() {
+        let request = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            MAX_BODY_BYTES + 1,
+        );
+        with_request(request, |result| {
+            match result {
+                Err(error) => assert!(error.contains("exceeds server cap")),
+                Ok(_) => panic!("overlong body was accepted"),
+            }
+        });
+    }
+
+    #[test]
+    fn reads_an_exact_finite_body() {
+        let body = r#"{"model":"test","prompt":"hello"}"#;
+        let request = format!(
+            "POST /v1/completions HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len(),
+        );
+        with_request(request, move |result| {
+            let request = result.unwrap();
+            assert_eq!(request.method, "POST");
+            assert_eq!(request.path, "/v1/completions");
+            assert_eq!(request.body, body);
+        });
+    }
+}

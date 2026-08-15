@@ -35,14 +35,24 @@ Completed locally and validated on gfx906:
    embedding prefill for image. Advance physical position by `n_tokens` and
    logical position by `n_pos`. Keep MTP/speculative decode disabled.
 
-## After correctness
+## Completed end-to-end path
 
 - `vision-test` now reports bridge/vision, model load, per-chunk prefill, first
   logits, decode, and physical/logical position diagnostics.
 - Deterministic chunk metadata and temperature-zero greedy tokens match the
   equivalent Furnace prompt on the reproducible llama.cpp image fixture.
-- Add OpenAI structured text plus one `data:` JPEG/PNG image after CLI output
-  matches Furnace. Reject remote URLs and preserve finite body limits.
+- OpenAI structured content accepts text plus exactly one `data:` JPEG/PNG
+  image. Remote URLs and additional images are rejected; the HTTP body and
+  decoded image have independent finite limits.
+- The isolated MI50 server smoke test returned HTTP 200 for the reproducible
+  image fixture without starting the managed Furnace service.
+
+## Rollout status
+
+The image path is available when a Qwen server is explicitly started with
+`--mmproj` and `--mtmd-bridge`. The managed Furnace service remains stopped
+for development; production rollout, multi-image input, and remote image
+fetching are separate decisions.
 
 ## Non-goals for v1
 

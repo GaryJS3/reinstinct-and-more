@@ -38,8 +38,10 @@ embedding. This distinction is a correctness gate, not an optimization.
    accepted by the runtime.
 3. Separate KV/RoPE state and the four-plane Qwen M-RoPE kernel pass CPU/GPU
    parity on gfx906. `vision-test` also matches Furnace's first eight greedy
-   tokens on a real image at temperature zero. HTTP image requests remain
-   disabled pending structured-content parsing and finite-body tests.
+   tokens on a real image at temperature zero. The server accepts OpenAI
+   structured text plus one finite `data:` JPEG/PNG image when launched with
+   `--mmproj` and `--mtmd-bridge`; finite-body tests and an isolated MI50
+   HTTP-200 smoke request have passed.
 
 ## Validation commands
 
@@ -55,3 +57,5 @@ reinstinct-engine mtmd-test \
 The command reports deterministic xxh3 hashes for text tokens, FP32 image
 embeddings, and M-RoPE position data. Compare those fields with an equivalent
 Furnace diagnostic before changing transformer kernels.
+
+For the server request shape and v1 limits, see [the manual](../MANUAL.md#qwen36-image-input-v1).

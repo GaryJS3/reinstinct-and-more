@@ -77,7 +77,15 @@ extern "C" ri_mtmd_context *ri_mtmd_create(const char *model_path,
             set_error(error, error_size, "llama.cpp could not load the GGUF vocabulary metadata");
             return nullptr;
         }
-        result->embedding_dim = static_cast<size_t>(llama_model_n_embd_inp(result->model));
+        // vocab_only models in this pinned llama.cpp revision do not
+        // populate n_embd_inp, although the ordinary model embedding width
+        // remains available from GGUF metadata. For Qwen this is the LLM
+        // input width that mtmd projects into.
+        int32_t embedding_dim = llama_model_n_embd_inp(result->model);
+        if (embedding_dim == 0) {
+            embedding_dim = llama_model_n_embd(result->model);
+        }
+        result->embedding_dim = static_cast<size_t>(embedding_dim);
         if (result->embedding_dim == 0) {
             set_error(error, error_size, "GGUF reports a zero input embedding dimension");
             return nullptr;

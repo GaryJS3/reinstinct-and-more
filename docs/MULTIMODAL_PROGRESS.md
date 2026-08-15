@@ -37,10 +37,11 @@ metadata. This preserves the no-second-LLM requirement.
 ## Current gate
 
 End-to-end CLI image generation now passes against Furnace on the reproducible
-llama.cpp `tools/mtmd/test-1.jpeg` fixture. The next gate is OpenAI structured
-content parsing with one finite `data:` JPEG/PNG image; remote URLs remain out
-of scope. Keep image requests disabled in the server until that request path
-has finite-body tests and an MI50 smoke test.
+llama.cpp `tools/mtmd/test-1.jpeg` fixture. Server-side OpenAI structured
+content parsing is implemented for one finite `data:` JPEG/PNG image, with a
+6 MiB decoded-image cap and no remote URLs. It requires `--mmproj` plus
+`--mtmd-bridge`; keep it off the deployed server until finite-body tests and
+an MI50 smoke test pass.
 
 ## Latest validation
 

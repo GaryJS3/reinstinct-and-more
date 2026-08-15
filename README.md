@@ -92,9 +92,10 @@ the drafter is likely to land.
 ## Features
 
 > Multimodal image input is under active development. The pinned Furnace
-> `libmtmd` bridge is built and validated on Qwen3.6; end-to-end generation is
-> pending the M-RoPE runtime path. See [the plan](docs/MULTIMODAL_PLAN.md) and
-> [current progress](docs/MULTIMODAL_PROGRESS.md).
+> `libmtmd` bridge and M-RoPE runtime are validated on Qwen3.6. The server
+> accepts one local `data:image/jpeg|png;base64,...` input when started with
+> `--mmproj` and `--mtmd-bridge`; remote image URLs remain unsupported. See
+> [the plan](docs/MULTIMODAL_PLAN.md) and [current progress](docs/MULTIMODAL_PROGRESS.md).
 
 - **Dense + MoE model support**: Gemma 4 (E4B, 26B MoE, 31B), Qwen 3.5 (0.8B-35B), Qwen 3.6 (27B, 35B MoE)
 - **Unsloth Dynamic GGUF**: Native support for UD-Q4_K_XL and UD-Q6_K_XL

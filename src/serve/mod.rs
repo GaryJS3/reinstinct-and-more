@@ -107,6 +107,9 @@ impl Target {
 enum PromptInput {
     Raw(String),
     Chat(Vec<crate::chat::ChatMessage>),
+    /// One OpenAI structured-content image, retained as decoded bytes until
+    /// the serialized GPU worker passes it to the mtmd bridge.
+    ChatVision { messages: Vec<crate::chat::ChatMessage>, image: Vec<u8> },
 }
 
 /// A parsed `/v1/completions` or `/v1/chat/completions` request.
@@ -181,7 +184,7 @@ enum StreamMsg {
 }
 
 impl GenReq {
-    fn is_chat(&self) -> bool { matches!(self.prompt, PromptInput::Chat(_)) }
+    fn is_chat(&self) -> bool { matches!(self.prompt, PromptInput::Chat(_) | PromptInput::ChatVision { .. }) }
 }
 
 /// A unit of work handed from a connection thread to the GPU worker.
@@ -471,11 +474,10 @@ fn parse_chat_completions(body: &str) -> Result<GenReq, (u16, &'static str, Stri
         return Err(bad("'messages' must contain at least one message".into()));
     }
     let mut messages: Vec<ChatMessage> = Vec::with_capacity(arr.len());
+    let mut image: Option<Vec<u8>> = None;
     for (i, m) in arr.iter().enumerate() {
         let role_s = m.get("role").and_then(Json::as_str)
             .ok_or_else(|| bad(format!("messages[{i}]: missing string 'role'")))?;
-        let content = m.get("content").and_then(Json::as_str)
-            .ok_or_else(|| bad(format!("messages[{i}]: missing string 'content'")))?;
         let role = match role_s {
             "system"    => Role::System,
             "user"      => Role::User,
@@ -483,14 +485,105 @@ fn parse_chat_completions(body: &str) -> Result<GenReq, (u16, &'static str, Stri
             other => return Err(bad(format!(
                 "messages[{i}]: unknown role '{other}' (want system|user|assistant)"))),
         };
-        messages.push(ChatMessage { role, content: content.to_string() });
+        let content = match m.get("content") {
+            Some(Json::Str(text)) => text.clone(),
+            Some(Json::Arr(parts)) => {
+                if role != Role::User {
+                    return Err(bad(format!("messages[{i}]: structured content is supported only for user messages")));
+                }
+                let mut text = String::new();
+                for (part_i, part) in parts.iter().enumerate() {
+                    let kind = part.get("type").and_then(Json::as_str)
+                        .ok_or_else(|| bad(format!("messages[{i}].content[{part_i}]: missing string 'type'")))?;
+                    match kind {
+                        "text" => text.push_str(part.get("text").and_then(Json::as_str)
+                            .ok_or_else(|| bad(format!("messages[{i}].content[{part_i}]: text part needs string 'text'")))?),
+                        "image_url" => {
+                            if image.is_some() { return Err(bad("only one image is supported per request".into())); }
+                            let url = part.get("image_url").and_then(|v| v.get("url")).and_then(Json::as_str)
+                                .ok_or_else(|| bad(format!("messages[{i}].content[{part_i}]: image_url needs object field 'url'")))?;
+                            image = Some(decode_data_image(url).map_err(bad)?);
+                            text.push_str("<__media__>");
+                        }
+                        other => return Err(bad(format!("messages[{i}].content[{part_i}]: unsupported type '{other}' (want text|image_url)"))),
+                    }
+                }
+                text
+            }
+            _ => return Err(bad(format!("messages[{i}]: content must be a string or array"))),
+        };
+        messages.push(ChatMessage { role, content });
+    }
+    let media_markers: usize = messages.iter().map(|m| m.content.matches("<__media__>").count()).sum();
+    if media_markers != usize::from(image.is_some()) {
+        return Err(bad("reserved media marker is not allowed in text".into()));
     }
     let (max_tokens, sampler, use_speculative, speculative_k, speculative_p_min,
          request_timeout, stream, stream_include_usage, top_logprobs_n) =
         parse_common_fields(&j, CHAT_DEFAULTS);
-    Ok(GenReq { prompt: PromptInput::Chat(messages), max_tokens, sampler,
+    let prompt = match image { Some(image) => PromptInput::ChatVision { messages, image }, None => PromptInput::Chat(messages) };
+    Ok(GenReq { prompt, max_tokens, sampler,
                 use_speculative, speculative_k, speculative_p_min,
                 request_timeout, stream, stream_include_usage, top_logprobs_n })
+}
+
+const MAX_IMAGE_BYTES: usize = 6 * 1024 * 1024;
+
+/// Strict v1 data URL parser.  Remote fetches, SVG, and unexpected image
+/// types are deliberately excluded from the server attack surface.
+fn decode_data_image(url: &str) -> Result<Vec<u8>, String> {
+    let encoded = match url.strip_prefix("data:image/jpeg;base64,")
+        .or_else(|| url.strip_prefix("data:image/png;base64,")) {
+        Some(data) => data,
+        None if url.starts_with("http://") || url.starts_with("https://") => return Err("remote image URLs are not supported; use a data:image/jpeg|png;base64 URL".into()),
+        None => return Err("image_url must be a data:image/jpeg|png;base64 URL".into()),
+    };
+    if encoded.len() > MAX_IMAGE_BYTES.saturating_mul(4) / 3 + 8 {
+        return Err(format!("decoded image exceeds {} byte limit", MAX_IMAGE_BYTES));
+    }
+    let bytes = decode_base64(encoded)?;
+    if bytes.is_empty() { return Err("image input is empty".into()); }
+    if bytes.len() > MAX_IMAGE_BYTES { return Err(format!("decoded image exceeds {} byte limit", MAX_IMAGE_BYTES)); }
+    Ok(bytes)
+}
+
+/// Decode the standard RFC 4648 alphabet used in data URLs.  Keeping this
+/// tiny parser local avoids adding a dependency to the server's deliberately
+/// minimal request surface.
+fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
+    fn value(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62), b'/' => Some(63), _ => None,
+        }
+    }
+    let bytes = input.as_bytes();
+    if bytes.is_empty() || bytes.len() % 4 != 0 { return Err("image_url contains invalid base64".into()); }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for (group_index, group) in bytes.chunks_exact(4).enumerate() {
+        let last = group_index + 1 == bytes.len() / 4;
+        let a = value(group[0]).ok_or("image_url contains invalid base64")?;
+        let b = value(group[1]).ok_or("image_url contains invalid base64")?;
+        let c = if group[2] == b'=' { None } else {
+            Some(value(group[2]).ok_or("image_url contains invalid base64")?)
+        };
+        let d = if group[3] == b'=' { None } else {
+            Some(value(group[3]).ok_or("image_url contains invalid base64")?)
+        };
+        if c.is_none() && d.is_some() || (!last && (c.is_none() || d.is_none())) {
+            return Err("image_url contains invalid base64 padding".into());
+        }
+        if c.is_none() && (b & 0x0f) != 0 { return Err("image_url contains invalid base64 padding".into()); }
+        out.push((a << 2) | (b >> 4));
+        if let Some(c) = c {
+            if d.is_none() && (c & 0x03) != 0 { return Err("image_url contains invalid base64 padding".into()); }
+            out.push((b << 4) | (c >> 2));
+            if let Some(d) = d { out.push((c << 6) | d); }
+        }
+    }
+    Ok(out)
 }
 
 // --- OpenAI response shaping -------------------------------------------
@@ -678,6 +771,7 @@ enum ServerModel {
         eos: u32,
         max_seq: usize,
         name: String,
+        vision: Option<crate::multimodal::MtmdProcessor>,
     },
     Gemma {
         gpu: crate::runtime::gemma4::GpuGemma4,
@@ -699,6 +793,14 @@ enum ServerModel {
         /// hits even when interleaved on the same model.
         prefix_cache: PrefixCache,
     },
+}
+
+#[derive(Clone)]
+struct VisionConfig {
+    mmproj: PathBuf,
+    bridge: PathBuf,
+    threads: i32,
+    use_gpu: bool,
 }
 
 struct PrefixCacheEntry {
@@ -811,7 +913,7 @@ impl ServerModel {
     /// supported drafter (Qwen 3.6 MTP loads but its forward path is
     /// unwritten; see the gemma4-mtp memory file for the round arithmetic).
     fn load(path: &PathBuf, drafter_path: Option<&PathBuf>, cache: &KernelCache,
-            max_seq: usize) -> Result<ServerModel, String>
+            max_seq: usize, vision_config: Option<&VisionConfig>) -> Result<ServerModel, String>
     {
         let g = GgufFile::open(path).map_err(|e| e.to_string())?;
         let arch = g.metadata_get("general.architecture")
@@ -835,6 +937,9 @@ impl ServerModel {
         }
 
         if arch == "gemma4" {
+            if vision_config.is_some() {
+                return Err("server vision is supported only for Qwen 3.6 targets".into());
+            }
             use crate::model::gemma4::Gemma4Model;
             use crate::model::gemma4_assistant::Gemma4AssistantModel;
             use crate::runtime::gemma4::{GpuGemma4, Gemma4GpuState};
@@ -869,11 +974,21 @@ impl ServerModel {
             let gpu = GpuQwen35::new(&model, &g, cache, max_seq)?;
             let state = Qwen35GpuState::new(&model, max_seq)?;
             let tok = Tokenizer::from_gguf(&g)?;
+            let vision = match vision_config {
+                Some(v) => {
+                    info!("loading mtmd bridge {} ...", v.bridge.display());
+                    Some(crate::multimodal::MtmdProcessor::load(
+                        &v.bridge, path, &v.mmproj, model.config.hidden_size as usize,
+                        v.use_gpu, v.threads,
+                    )?)
+                }
+                None => None,
+            };
             if drafter_path.is_some() {
                 warn!("--big-drafter ignored on qwen35 target \
                        (no supported drafter; see gemma4-mtp memory file)");
             }
-            Ok(ServerModel::Qwen { gpu, state, tok, eos, max_seq, name })
+            Ok(ServerModel::Qwen { gpu, state, tok, eos, max_seq, name, vision })
         }
     }
 
@@ -909,7 +1024,7 @@ impl ServerModel {
             .map(|d| std::time::Instant::now() + d);
 
         match self {
-            ServerModel::Qwen { gpu, state, tok, eos, max_seq, .. } => {
+            ServerModel::Qwen { gpu, state, tok, eos, max_seq, vision, .. } => {
                 let prompt = match &req.prompt {
                     PromptInput::Raw(text) => tok.encode(text),
                     PromptInput::Chat(msgs) => {
@@ -918,20 +1033,49 @@ impl ServerModel {
                         // with assistant turn primed.
                         crate::chat::format_qwen3(tok, msgs, true)?
                     }
+                    PromptInput::ChatVision { messages, .. } => {
+                        // The bridge tokenizes the formatted text itself so it can
+                        // replace the marker with image embeddings.  We count its
+                        // physical rows after processing rather than estimating
+                        // from the text tokenizer here.
+                        let formatted = crate::chat::format_qwen3_with_media_marker(messages)?;
+                        let marker_count = formatted.matches("<__media__>").count();
+                        if marker_count != 1 { return Err(format!("multimodal chat needs exactly one image marker, found {marker_count}")); }
+                        // A placeholder keeps the normal text-only prompt path
+                        // below unused; the actual prefill happens after reset.
+                        tok.encode(&formatted)
+                    }
                 };
                 if prompt.is_empty() {
                     return Err("prompt encoded to zero tokens".into());
                 }
-                if prompt.len() + req.max_tokens + 4 > *max_seq {
-                    return Err(format!(
-                        "prompt ({}) + max_tokens ({}) exceeds context window ({})",
-                        prompt.len(), req.max_tokens, *max_seq));
-                }
                 state.reset()?;
-                let mut logits = if prompt.len() > 1 {
-                    gpu.forward_tokens_batched(&prompt, state)?
-                } else {
-                    gpu.forward_tokens(&prompt, state)?
+                let (mut logits, prompt_rows) = match &req.prompt {
+                    PromptInput::ChatVision { messages, image } => {
+                        let formatted = crate::chat::format_qwen3_with_media_marker(messages)?;
+                        let processor = vision.as_mut().ok_or(
+                            "image input is disabled; start serve with --mmproj PATH --mtmd-bridge PATH")?;
+                        let processed = processor.process(&formatted, image)?;
+                        let rows: usize = processed.chunks.iter().map(|c| match c {
+                            crate::multimodal::Chunk::Text { tokens, .. } => tokens.len(),
+                            crate::multimodal::Chunk::Image { embeddings, embedding_dim, .. } => embeddings.len() / embedding_dim,
+                        }).sum();
+                        if rows + req.max_tokens + 4 > *max_seq {
+                            return Err(format!("multimodal prompt ({rows} physical rows) + max_tokens ({}) exceeds context window ({})", req.max_tokens, max_seq));
+                        }
+                        (gpu.forward_multimodal_chunks(&processed.chunks, state)?, rows)
+                    }
+                    _ => {
+                        if prompt.len() + req.max_tokens + 4 > *max_seq {
+                            return Err(format!(
+                                "prompt ({}) + max_tokens ({}) exceeds context window ({})",
+                                prompt.len(), req.max_tokens, max_seq));
+                        }
+                        let logits = if prompt.len() > 1 {
+                            gpu.forward_tokens_batched(&prompt, state)?
+                        } else { gpu.forward_tokens(&prompt, state)? };
+                        (logits, prompt.len())
+                    }
                 };
                 let vocab = logits.len();
                 let mut counts: Vec<u16> = if sp.frequency_penalty != 0.0
@@ -974,7 +1118,7 @@ impl ServerModel {
                     }
                     logits = gpu.forward_token(t, state)?;
                 }
-                Ok((full_text, prompt.len(), out.len(), hit_eos, all_lp))
+                Ok((full_text, prompt_rows, out.len(), hit_eos, all_lp))
             }
             ServerModel::Gemma { gpu, state, tok, eos, bos, max_seq, drafter, prefix_cache, .. } => {
                 let prompt = match &req.prompt {
@@ -991,6 +1135,8 @@ impl ServerModel {
                         // accept rate over raw user text.
                         crate::chat::format_gemma4(tok, msgs, true)?
                     }
+                    PromptInput::ChatVision { .. } => return Err(
+                        "image input is supported only by a Qwen server started with --mmproj and --mtmd-bridge".into()),
                 };
                 if prompt.is_empty() {
                     return Err("prompt encoded to zero tokens".into());
@@ -1146,17 +1292,17 @@ impl ServerModel {
 // --- the GPU worker ----------------------------------------------------
 
 fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
-          small: Option<PathBuf>, max_seq: usize, metrics: Arc<Metrics>)
+          small: Option<PathBuf>, max_seq: usize, vision: Option<VisionConfig>, metrics: Arc<Metrics>)
 {
     let setup = (|| -> Result<(KernelCache, ServerModel, Option<ServerModel>), String> {
         crate::hip::Device::set(0)?;
         let cache = KernelCache::new()?;
-        let load = |label: &str, path: &PathBuf, drafter: Option<&PathBuf>|
+        let load = |label: &str, path: &PathBuf, drafter: Option<&PathBuf>, vision_config: Option<&VisionConfig>|
             -> Result<ServerModel, String>
         {
             info!("loading {label:5} model {} ...", path.display());
             let t = std::time::Instant::now();
-            let m = ServerModel::load(path, drafter, &cache, max_seq)
+            let m = ServerModel::load(path, drafter, &cache, max_seq, vision_config)
                 .map_err(|e| {
                     // VRAM-exhaustion → add a hint about model size vs VRAM.
                     if e.to_lowercase().contains("memory") {
@@ -1175,9 +1321,9 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
             info!("  loaded {} in {:.1}s", m.name(), t.elapsed().as_secs_f32());
             Ok(m)
         };
-        let big_m   = load("big",   &big,   big_drafter.as_ref())?;
+        let big_m   = load("big",   &big,   big_drafter.as_ref(), vision.as_ref())?;
         let small_m = match small {
-            Some(sp) => Some(load("small", &sp, None)?),
+            Some(sp) => Some(load("small", &sp, None, None)?),
             None => None,
         };
         Ok((cache, big_m, small_m))
@@ -1630,11 +1776,22 @@ fn acceptor(port: u16, target: Target, tx: mpsc::Sender<Job>,
 }
 
 /// Start the three-port multi-model server. Blocks forever.
-  pub fn run(big: PathBuf, big_drafter: Option<PathBuf>,
+pub fn run(big: PathBuf, big_drafter: Option<PathBuf>,
            small: Option<PathBuf>, embed: Option<PathBuf>,
-           big_port: u16, small_port: u16, embed_port: u16, max_seq: usize)
+           big_port: u16, small_port: u16, embed_port: u16, max_seq: usize,
+           mmproj: Option<PathBuf>, mtmd_bridge: Option<PathBuf>, vision_threads: i32,
+           vision_use_gpu: bool)
     -> Result<(), String>
 {
+    let vision = match (mmproj, mtmd_bridge) {
+        (None, None) => None,
+        (Some(mmproj), Some(bridge)) if vision_threads > 0 => Some(VisionConfig {
+            mmproj, bridge, threads: vision_threads, use_gpu: vision_use_gpu,
+        }),
+        (Some(_), None) | (None, Some(_)) => return Err(
+            "server vision requires both --mmproj PATH and --mtmd-bridge PATH".into()),
+        (_, _) => return Err("--vision-threads must be positive".into()),
+    };
     // Surface any REINSTINCT_* env vars at startup. Several of them are
     // perf-killers if set unintentionally on a serve box (graph capture
     // off, dp4a path off, etc) — better to log them than have an
@@ -1675,11 +1832,11 @@ fn acceptor(port: u16, target: Target, tx: mpsc::Sender<Job>,
     let metrics = Arc::new(Metrics::new());
 
     let worker_handle = {
-        let (big, big_drafter, small) =
-            (big.clone(), big_drafter.clone(), small.clone());
+        let (big, big_drafter, small, vision) =
+            (big.clone(), big_drafter.clone(), small.clone(), vision.clone());
         let metrics = Arc::clone(&metrics);
         thread::Builder::new().name("gpu-worker".into())
-            .spawn(move || worker(rx, big, big_drafter, small, max_seq, metrics))
+            .spawn(move || worker(rx, big, big_drafter, small, max_seq, vision, metrics))
             .map_err(|e| e.to_string())?
     };
 
@@ -1789,5 +1946,35 @@ mod logprobs_tests {
     fn empty_logprobs_render_as_null() {
         assert_eq!(render_text_logprobs(&[]).to_string(), "null");
         assert_eq!(render_chat_logprobs(&[]).to_string(), "null");
+    }
+
+    #[test]
+    fn chat_structured_content_accepts_one_data_png() {
+        let req = parse_chat_completions(r#"{
+            "messages":[{"role":"user","content":[
+              {"type":"text","text":"What is this? "},
+              {"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}}
+            ]}]
+        }"#).unwrap();
+        match req.prompt {
+            PromptInput::ChatVision { messages, image } => {
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages[0].content, "What is this? <__media__>");
+                assert_eq!(image, vec![137, 80, 78, 71, 13, 10, 26, 10]);
+            }
+            _ => panic!("expected vision request"),
+        }
+    }
+
+    #[test]
+    fn chat_structured_content_rejects_remote_or_multiple_images() {
+        let remote = r#"{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.test/x.png"}}]}]}"#;
+        let remote_error = parse_chat_completions(remote).err().expect("remote URL must fail");
+        assert!(remote_error.2.contains("remote image URLs"));
+        let two = r#"{"messages":[{"role":"user","content":[
+            {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,/9j/"}},
+            {"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}}
+        ]}]}"#;
+        assert!(parse_chat_completions(two).is_err());
     }
 }

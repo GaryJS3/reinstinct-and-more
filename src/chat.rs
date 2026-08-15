@@ -268,3 +268,26 @@ pub fn format_qwen3(tok: &Tokenizer, messages: &[ChatMessage],
     }
     Ok(out)
 }
+
+/// Render Qwen chat text for the mtmd bridge.  Unlike `format_qwen3`, this
+/// keeps exactly one `<__media__>` marker literal so Furnace can replace it
+/// with projected image embeddings before ReInstinct evaluates the LLM.
+pub fn format_qwen3_with_media_marker(messages: &[ChatMessage]) -> Result<String, String> {
+    let mut out = String::new();
+    for m in messages {
+        let role = match m.role {
+            Role::System => "system",
+            Role::User => "user",
+            Role::Assistant => "assistant",
+        };
+        out.push_str("<|im_start|>");
+        out.push_str(role);
+        out.push('\n');
+        out.push_str(&m.content);
+        out.push_str("<|im_end|>\n");
+    }
+    if !out.contains("<__media__>") {
+        return Err("multimodal chat is missing its media marker".into());
+    }
+    Ok(out + "<|im_start|>assistant\n")
+}

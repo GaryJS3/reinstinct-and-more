@@ -604,6 +604,24 @@ the templating.
 Response is OpenAI `chat.completion`-shaped — `choices[i].message.{role,content}`
 instead of the flat `text` field on text_completion. Same `usage` block.
 
+### Qwen3.6 image input (v1)
+
+Start a Qwen server with both `--mmproj PROJECTOR.gguf` and
+`--mtmd-bridge libreinstinct_mtmd.so`. A user message may use OpenAI
+structured content with text and exactly one `image_url` part:
+
+```json
+{"role":"user","content":[
+  {"type":"text","text":"Describe this image."},
+  {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,..."}}
+]}
+```
+
+Only `data:image/jpeg;base64,...` and `data:image/png;base64,...` are accepted.
+The decoded image is capped at 6 MiB; remote URLs, additional images, and
+non-user structured content are rejected. This path is Qwen-only and keeps
+ReInstinct as the LLM backend; the bridge performs only image frontend work.
+
 ### Shared request fields
 
 | Field | Type | Default | Meaning |

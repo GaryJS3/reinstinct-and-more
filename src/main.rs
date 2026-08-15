@@ -234,6 +234,18 @@ enum Command {
         /// Context window (prompt + generated tokens) per request.
         #[arg(long, default_value_t = 4096)]
         max_seq: usize,
+        /// Qwen vision projector GGUF. Requires --mtmd-bridge; enables one
+        /// local `data:image/jpeg|png;base64,...` input per chat request.
+        #[arg(long)]
+        mmproj: Option<PathBuf>,
+        /// Path to the optional Furnace/libmtmd bridge for server vision.
+        #[arg(long)]
+        mtmd_bridge: Option<PathBuf>,
+        #[arg(long, default_value_t = 8)]
+        vision_threads: i32,
+        /// Run the mtmd vision encoder on CPU instead of the HIP device.
+        #[arg(long)]
+        cpu_vision: bool,
     },
     /// QMTP-1 diagnostic: load a Qwen 3.6 MTP model, prefill a prompt,
     /// then decode N tokens with the main model while running the
@@ -374,9 +386,11 @@ fn main() -> anyhow::Result<()> {
         Command::HipInfo { mb, iters } => hip_info(mb, iters),
         Command::GpuBench { path, iters, token } => gpu_bench(&path, iters, token),
         Command::Serve { big, big_drafter, small, embed,
-                         big_port, small_port, embed_port, max_seq } =>
+                         big_port, small_port, embed_port, max_seq,
+                         mmproj, mtmd_bridge, vision_threads, cpu_vision } =>
             reinstinct_engine::serve::run(big, big_drafter, small, embed,
-                                          big_port, small_port, embed_port, max_seq)
+                                          big_port, small_port, embed_port, max_seq,
+                                          mmproj, mtmd_bridge, vision_threads, !cpu_vision)
                 .map_err(anyhow::Error::msg),
         Command::GenerateText { path, prompt, system, user, tokens, steps,
                                 temperature, top_k, seed, gpu } =>

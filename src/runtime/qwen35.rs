@@ -3371,6 +3371,22 @@ impl GpuQwen35 {
         Ok(last)
     }
 
+    /// Materialize ordinary token-embedding rows for the external-embedding
+    /// parity test and diagnostics. This deliberately exposes no weight
+    /// layout to callers.
+    pub fn token_embeddings(&self, tokens: &[u32]) -> Result<Vec<f32>, String> {
+        if tokens.is_empty() { return Err("token_embeddings needs at least one token".into()); }
+        let mut output = Vec::with_capacity(tokens.len() * self.hidden);
+        let mut row = vec![0.0f32; self.hidden];
+        for &token in tokens {
+            self.launch_embed_lookup_dispatch(&self.token_embd, self.hidden_a.raw_ptr(), token)?;
+            self.stream.synchronize()?;
+            self.hidden_a.copy_to_host(&mut row)?;
+            output.extend_from_slice(&row);
+        }
+        Ok(output)
+    }
+
     // ===== Batched prefill =================================================
 
     fn launch_cvt(&self, kname: &str, src: *mut c_void, dst: *mut c_void, n: u32)
@@ -4475,6 +4491,30 @@ mod tests {
             "batched argmax {bat_argmax} != sequential {seq_argmax}");
         assert!(overlap >= 4, "top-5 overlap {overlap}/5 too low — likely a real bug");
         assert_eq!(s_bat.pos, prompt.len(), "batched state didn't advance correctly");
+    }
+
+    #[test]
+    fn external_embeddings_match_token_prefill() {
+        if hip::device_count().ok().unwrap_or(0) < 1 { eprintln!("skip: no HIP"); return; }
+        let _dev = hip::Device::set(0).unwrap();
+        let Some(path) = fixture_path() else { eprintln!("skip: no GGUF"); return };
+        let cache = match KernelCache::new() { Ok(c) => c, Err(e) => { eprintln!("skip: {e}"); return } };
+        let g = GgufFile::open(&path).unwrap();
+        let m = Qwen35F32Model::load(&g).unwrap();
+        let gpu = GpuQwen35::new(&m.model, &g, &cache, 32).expect("gpu");
+        let prompt = [198u32, 100, 248046, 1, 2, 50_000, 7];
+
+        let embeddings = gpu.token_embeddings(&prompt).expect("lookup rows");
+        let mut token_state = Qwen35GpuState::new(&m.model, 32).unwrap();
+        let token_logits = gpu.forward_tokens(&prompt, &mut token_state).expect("token prefill");
+        let mut external_state = Qwen35GpuState::new(&m.model, 32).unwrap();
+        let external_logits = gpu.forward_embeddings(&embeddings, &mut external_state).expect("external prefill");
+
+        assert_eq!(token_state.pos, external_state.pos);
+        assert_eq!(token_logits.len(), external_logits.len());
+        for (i, (&a, &b)) in token_logits.iter().zip(&external_logits).enumerate() {
+            assert!((a - b).abs() <= 1.0e-5, "logit {i}: token={a} external={b}");
+        }
     }
 
     #[test]

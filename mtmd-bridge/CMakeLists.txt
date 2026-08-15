@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.21)
 project(reinstinct_mtmd LANGUAGES CXX)
 
+# The bridge is shared while the pinned Furnace libraries are embedded static
+# archives, so every transitive object must be position-independent.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # llama.cpp normally initializes this when configured as the top-level
 # project. Supplying it here keeps its mtmd target valid as a subdirectory.
 set(LLAMA_INSTALL_VERSION "0.0.0" CACHE STRING "" FORCE)

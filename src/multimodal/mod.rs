@@ -110,6 +110,11 @@ impl MtmdProcessor {
     }
 
     unsafe fn copy_result(&self, result: *const ResultOpaque) -> Result<ProcessedImage, String> {
+        // Every FFI function pointer and raw pointer dereference is confined
+        // to this block. The bridge contract guarantees result ownership until
+        // `ri_mtmd_result_destroy`, which the caller performs immediately
+        // after this method copies all storage into Rust-owned vectors.
+        unsafe {
         let uses_mrope = (self.result_uses_mrope)(result) != 0;
         let mut chunks = Vec::with_capacity((self.chunk_count)(result));
         for index in 0..(self.chunk_count)(result) {
@@ -140,6 +145,7 @@ impl MtmdProcessor {
             }
         }
         Ok(ProcessedImage { uses_mrope, chunks })
+        }
     }
 }
 

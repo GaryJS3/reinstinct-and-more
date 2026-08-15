@@ -153,6 +153,19 @@ enum Command {
         path: PathBuf,
         tokens: Vec<u32>,
     },
+    /// Decode, tokenize, and vision-encode one image through the optional
+    /// pinned Furnace/libmtmd bridge. Does not run ReInstinct transformer layers.
+    MtmdTest {
+        #[arg(long)] model: PathBuf,
+        #[arg(long)] mmproj: PathBuf,
+        #[arg(long)] image: PathBuf,
+        #[arg(long)] prompt: String,
+        /// Path to libreinstinct_mtmd.so (or .dll). Required so text-only
+        /// installations never need llama.cpp at runtime.
+        #[arg(long)] bridge: PathBuf,
+        #[arg(long, default_value_t = 8)] threads: i32,
+        #[arg(long)] cpu_vision: bool,
+    },
     /// Run forward N times, report per-stage timing breakdown.
     Bench {
         path: PathBuf,
@@ -339,6 +352,8 @@ fn main() -> anyhow::Result<()> {
         Command::Model { path } => model(&path),
         Command::Generate { path, token, tokens, k, gpu } => generate(&path, token, tokens, k, gpu),
         Command::DebugEmbed { path, tokens } => debug_embed(&path, &tokens),
+        Command::MtmdTest { model, mmproj, image, prompt, bridge, threads, cpu_vision } =>
+            mtmd_test_cli(&model, &mmproj, &image, &prompt, &bridge, threads, !cpu_vision),
         Command::Bench { path, iters, token } => bench(&path, iters, token),
         Command::HipInfo { mb, iters } => hip_info(mb, iters),
         Command::GpuBench { path, iters, token } => gpu_bench(&path, iters, token),
@@ -372,6 +387,50 @@ fn main() -> anyhow::Result<()> {
         Command::DumpTraces { target, prompts, out, steps, skip, limit } =>
             dump_traces_cli(&target, &prompts, &out, steps, skip, limit),
     }
+}
+
+/// Isolate the libmtmd boundary before ReInstinct's transformer consumes an
+/// image embedding. Hashes make Furnace/ReInstinct comparison scripts stable
+/// without dumping multi-megabyte embedding arrays.
+fn mtmd_test_cli(model: &std::path::Path, mmproj: &std::path::Path,
+                 image: &std::path::Path, prompt: &str,
+                 bridge: &std::path::Path, threads: i32, use_gpu: bool)
+    -> anyhow::Result<()>
+{
+    use reinstinct_engine::multimodal::{Chunk, MtmdProcessor};
+    use xxhash_rust::xxh3::xxh3_64;
+
+    let image_bytes = std::fs::read(image)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", image.display()))?;
+    // Qwen's normal server template; libmtmd replaces exactly this marker.
+    let formatted = format!("<|im_start|>user\n<__media__>\n{prompt}<|im_end|>\n<|im_start|>assistant\n");
+    let started = std::time::Instant::now();
+    let mut processor = MtmdProcessor::load(bridge, model, mmproj, use_gpu, threads)
+        .map_err(anyhow::Error::msg)?;
+    let loaded = started.elapsed();
+    let processed = processor.process(&formatted, &image_bytes).map_err(anyhow::Error::msg)?;
+    println!("mtmd vision supported: yes");
+    println!("M-RoPE: {}", if processed.uses_mrope { "yes" } else { "no" });
+    println!("chunks: {}", processed.chunks.len());
+    println!("bridge initialization: {:.3}s", loaded.as_secs_f64());
+    println!("decode/tokenize/encode: {:.3}s", started.elapsed().as_secs_f64() - loaded.as_secs_f64());
+    for (i, chunk) in processed.chunks.iter().enumerate() {
+        match chunk {
+            Chunk::Text { tokens, n_pos } => {
+                let bytes: &[u8] = bytemuck::cast_slice(tokens);
+                println!("chunk {i}: text  tokens: {}  positions: {}  token_hash: {:016x}",
+                         tokens.len(), n_pos, xxh3_64(bytes));
+            }
+            Chunk::Image { embeddings, embedding_dim, positions, n_pos } => {
+                let emb_bytes: &[u8] = bytemuck::cast_slice(embeddings);
+                let pos_bytes: &[u8] = bytemuck::cast_slice(positions);
+                println!("chunk {i}: image  tokens: {}  positions: {}  embedding dimension: {}  embedding floats: {}  embedding_hash: {:016x}  position_hash: {:016x}",
+                         embeddings.len() / embedding_dim, n_pos, embedding_dim, embeddings.len(),
+                         xxh3_64(emb_bytes), xxh3_64(pos_bytes));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Lockstep two GpuGemma4 forwards, advancing both with the target's

@@ -3344,6 +3344,33 @@ impl GpuQwen35 {
         Ok(last)
     }
 
+    /// Prefill caller-supplied FP32 input embeddings through the same decode
+    /// body used after token lookup. This is deliberately sequential for the
+    /// first multimodal cut: it establishes the exact injection boundary
+    /// before the batched/M-RoPE prefill path is generalized.
+    ///
+    /// The caller must supply one complete model-width row per physical input
+    /// position. It is used by the mtmd bridge; llama.cpp never evaluates LLM
+    /// layers on this path.
+    pub fn forward_embeddings(&self, embeddings: &[f32], state: &mut Qwen35GpuState)
+        -> Result<Vec<f32>, String>
+    {
+        if embeddings.is_empty() || embeddings.len() % self.hidden != 0 {
+            return Err(format!("external embeddings must contain a non-zero whole number of {}-float rows", self.hidden));
+        }
+        let mut last = Vec::new();
+        for row in embeddings.chunks_exact(self.hidden) {
+            self.set_pos(state.pos)?;
+            self.hidden_a.copy_from_host(row)?;
+            self.enqueue_decode_body(state)?;
+            self.stream.synchronize()?;
+            state.pos += 1;
+            last.resize(self.vocab, 0.0);
+            self.logits.copy_to_host(&mut last)?;
+        }
+        Ok(last)
+    }
+
     // ===== Batched prefill =================================================
 
     fn launch_cvt(&self, kname: &str, src: *mut c_void, dst: *mut c_void, n: u32)

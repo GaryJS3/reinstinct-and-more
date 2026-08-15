@@ -8,6 +8,7 @@ pub mod cpu;
 pub mod gguf;
 pub mod hip;
 pub mod model;
+pub mod multimodal;
 pub mod quant;
 pub mod runtime;
 pub mod sampling;

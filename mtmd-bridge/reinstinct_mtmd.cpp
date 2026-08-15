@@ -60,12 +60,13 @@ extern "C" uint32_t ri_mtmd_abi_version(void) { return RI_MTMD_ABI_VERSION; }
 
 extern "C" ri_mtmd_context *ri_mtmd_create(const char *model_path,
                                               const char *mmproj_path,
+                                              size_t embedding_dim,
                                               int use_gpu,
                                               int threads,
                                               char *error,
                                               size_t error_size) {
-    if (!model_path || !mmproj_path || threads < 1) {
-        set_error(error, error_size, "model path, mmproj path, and positive thread count are required");
+    if (!model_path || !mmproj_path || embedding_dim == 0 || threads < 1) {
+        set_error(error, error_size, "model path, mmproj path, positive embedding dimension, and positive thread count are required");
         return nullptr;
     }
     try {
@@ -77,19 +78,10 @@ extern "C" ri_mtmd_context *ri_mtmd_create(const char *model_path,
             set_error(error, error_size, "llama.cpp could not load the GGUF vocabulary metadata");
             return nullptr;
         }
-        // vocab_only models in this pinned llama.cpp revision do not
-        // populate n_embd_inp, although the ordinary model embedding width
-        // remains available from GGUF metadata. For Qwen this is the LLM
-        // input width that mtmd projects into.
-        int32_t embedding_dim = llama_model_n_embd_inp(result->model);
-        if (embedding_dim == 0) {
-            embedding_dim = llama_model_n_embd(result->model);
-        }
-        result->embedding_dim = static_cast<size_t>(embedding_dim);
-        if (result->embedding_dim == 0) {
-            set_error(error, error_size, "GGUF reports a zero input embedding dimension");
-            return nullptr;
-        }
+        // vocab_only leaves llama.cpp's embedding-size getters unset on this
+        // revision. ReInstinct parses the authoritative GGUF hidden size
+        // while loading its own model, so retain that explicit dimension.
+        result->embedding_dim = embedding_dim;
         auto params = mtmd_context_params_default();
         params.use_gpu = use_gpu != 0;
         params.n_threads = threads;

@@ -33,6 +33,7 @@ typedef struct ri_mtmd_decoder_pos {
 RI_MTMD_API uint32_t ri_mtmd_abi_version(void);
 RI_MTMD_API ri_mtmd_context *ri_mtmd_create(const char *model_path,
                                              const char *mmproj_path,
+                                             size_t embedding_dim,
                                              int use_gpu,
                                              int threads,
                                              char *error,

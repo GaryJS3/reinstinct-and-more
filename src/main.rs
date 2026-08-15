@@ -405,7 +405,10 @@ fn mtmd_test_cli(model: &std::path::Path, mmproj: &std::path::Path,
     // Qwen's normal server template; libmtmd replaces exactly this marker.
     let formatted = format!("<|im_start|>user\n<__media__>\n{prompt}<|im_end|>\n<|im_start|>assistant\n");
     let started = std::time::Instant::now();
-    let mut processor = MtmdProcessor::load(bridge, model, mmproj, use_gpu, threads)
+    let gguf = GgufFile::open(model).map_err(|e| anyhow::anyhow!("open {}: {e}", model.display()))?;
+    let qwen = Qwen35Model::load(&gguf).map_err(anyhow::Error::msg)?;
+    let mut processor = MtmdProcessor::load(bridge, model, mmproj,
+                                             qwen.config.hidden_size as usize, use_gpu, threads)
         .map_err(anyhow::Error::msg)?;
     let loaded = started.elapsed();
     let processed = processor.process(&formatted, &image_bytes).map_err(anyhow::Error::msg)?;

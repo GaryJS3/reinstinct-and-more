@@ -31,7 +31,7 @@ struct ContextOpaque { _private: [u8; 0] }
 #[repr(C)]
 struct ResultOpaque { _private: [u8; 0] }
 
-type Create = unsafe extern "C" fn(*const c_char, *const c_char, c_int, c_int, *mut c_char, usize) -> *mut ContextOpaque;
+type Create = unsafe extern "C" fn(*const c_char, *const c_char, usize, c_int, c_int, *mut c_char, usize) -> *mut ContextOpaque;
 type Destroy = unsafe extern "C" fn(*mut ContextOpaque);
 type Process = unsafe extern "C" fn(*mut ContextOpaque, *const c_char, *const u8, usize, *mut *mut ResultOpaque, *mut c_char, usize) -> c_int;
 type ResultDestroy = unsafe extern "C" fn(*mut ResultOpaque);
@@ -64,8 +64,8 @@ pub struct MtmdProcessor {
 }
 
 impl MtmdProcessor {
-    pub fn load(library_path: &Path, model: &Path, mmproj: &Path, use_gpu: bool, threads: i32) -> Result<Self, String> {
-        if threads < 1 { return Err("mtmd thread count must be positive".into()); }
+    pub fn load(library_path: &Path, model: &Path, mmproj: &Path, embedding_dim: usize, use_gpu: bool, threads: i32) -> Result<Self, String> {
+        if embedding_dim == 0 || threads < 1 { return Err("mtmd embedding dimension and thread count must be positive".into()); }
         let library = unsafe { Library::new(library_path) }.map_err(|e| format!("load mtmd bridge: {e}"))?;
         unsafe {
             let abi: AbiVersion = *library.get(b"ri_mtmd_abi_version\0").map_err(|e| e.to_string())?;
@@ -74,7 +74,7 @@ impl MtmdProcessor {
             let model = path_cstring(model)?;
             let mmproj = path_cstring(mmproj)?;
             let mut error = [0 as c_char; ERROR_CAP];
-            let raw = create(model.as_ptr(), mmproj.as_ptr(), if use_gpu { 1 } else { 0 }, threads, error.as_mut_ptr(), error.len());
+            let raw = create(model.as_ptr(), mmproj.as_ptr(), embedding_dim, if use_gpu { 1 } else { 0 }, threads, error.as_mut_ptr(), error.len());
             let context = NonNull::new(raw).ok_or_else(|| bridge_error("create mtmd context", &error))?;
             Ok(Self {
                 destroy: *library.get(b"ri_mtmd_destroy\0").map_err(|e| e.to_string())?,

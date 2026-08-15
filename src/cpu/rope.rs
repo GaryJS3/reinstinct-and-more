@@ -8,7 +8,8 @@
 //! M-RoPE (mrope_section [11, 11, 10]) is the multimodal extension for
 //! vision tokens. For pure-text tokens all three position axes share the
 //! same position id, so the M-RoPE freq table collapses to standard RoPE.
-//! This module implements the text path only.
+//! The scalar cache remains the text fast path. [`apply_mrope`] is the
+//! four-plane reference used to validate multimodal GPU kernels.
 
 /// Precomputed cos/sin tables for positions 0..max_seq_len.
 ///
@@ -96,6 +97,46 @@ pub fn apply_rope(head: &mut [f32], rope_cache: &RopeCache, position: usize) {
     }
 }
 
+/// Apply Qwen's four-plane, NEOX-ordered M-RoPE to one attention head.
+///
+/// `sections` counts frequency pairs assigned to the t/x/y/z planes and
+/// must cover exactly `rotary_dim / 2` pairs. Frequencies do not restart at
+/// section boundaries: pair `i` always uses `base^(-2*i/rotary_dim)`, matching
+/// `ggml_mrope_cache_init` with independent-section mode disabled.
+pub fn apply_mrope(
+    head: &mut [f32],
+    rotary_dim: usize,
+    freq_base: f32,
+    sections: &[u32],
+    positions: [u32; 4],
+) {
+    assert!(rotary_dim % 2 == 0, "rotary_dim must be even");
+    assert!(head.len() >= rotary_dim,
+        "head_dim {} < rotary_dim {}", head.len(), rotary_dim);
+    assert_eq!(sections.len(), 4, "M-RoPE requires four sections");
+    let half = rotary_dim / 2;
+    let section_total: usize = sections.iter().map(|&v| v as usize).sum();
+    assert_eq!(section_total, half,
+        "M-RoPE sections must sum to rotary_dim / 2");
+
+    let input = head[..rotary_dim].to_vec();
+    let mut boundary = sections[0] as usize;
+    let mut plane = 0usize;
+    for i in 0..half {
+        while i >= boundary && plane < 3 {
+            plane += 1;
+            boundary += sections[plane] as usize;
+        }
+        let inv_freq = freq_base.powf(-2.0 * i as f32 / rotary_dim as f32);
+        let theta = positions[plane] as f32 * inv_freq;
+        let (sin, cos) = theta.sin_cos();
+        let a = input[i];
+        let b = input[i + half];
+        head[i] = a * cos - b * sin;
+        head[i + half] = b * cos + a * sin;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,6 +213,41 @@ mod tests {
             let norm_out: f32 = head.iter().map(|v| v * v).sum::<f32>().sqrt();
             assert!(approx_eq(norm_in, norm_out, 1e-6),
                 "pos={pos}: norm changed {} → {}", norm_in, norm_out);
+        }
+    }
+
+    #[test]
+    fn mrope_text_broadcast_matches_scalar_rope() {
+        let rotary_dim = 64;
+        let freq_base = 1_000_000.0;
+        let sections = [11, 11, 10, 0];
+        let position = 17;
+        let cache = RopeCache::new(rotary_dim, position + 1, freq_base);
+        let input: Vec<f32> = (0..128).map(|i| (i as f32 * 0.17).sin()).collect();
+        let mut scalar = input.clone();
+        let mut multi = input;
+        apply_rope(&mut scalar, &cache, position);
+        apply_mrope(&mut multi, rotary_dim, freq_base, &sections,
+                    [position as u32; 4]);
+        for i in 0..multi.len() {
+            assert!(approx_eq(multi[i], scalar[i], 1e-6),
+                "i={i}: mrope={} scalar={}", multi[i], scalar[i]);
+        }
+    }
+
+    #[test]
+    fn mrope_uses_the_position_selected_by_each_section() {
+        let mut head = vec![0.0; 8];
+        head[..4].copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
+        apply_mrope(&mut head, 8, 10_000.0, &[1, 1, 1, 1], [0, 1, 2, 3]);
+        assert_eq!(head[0], 1.0); // t=0 is identity for pair 0
+        assert_eq!(head[4], 0.0);
+        for (i, &position) in [1_u32, 2, 3].iter().enumerate() {
+            let pair = i + 1;
+            let theta = position as f32 * 10_000.0_f32.powf(-2.0 * pair as f32 / 8.0);
+            let (sin, cos) = theta.sin_cos();
+            assert!(approx_eq(head[pair], (pair + 1) as f32 * cos, 1e-6));
+            assert!(approx_eq(head[pair + 4], (pair + 1) as f32 * sin, 1e-6));
         }
     }
 }

@@ -50,6 +50,7 @@ const RMSNORM_MULTIHEAD_SOURCE: &str = include_str!("../../kernels/rmsnorm_multi
 const SPLIT_Q_GATE_SOURCE:      &str = include_str!("../../kernels/split_q_gate.cpp");
 const SIGMOID_MUL_SOURCE:       &str = include_str!("../../kernels/sigmoid_mul.cpp");
 const ROPE_SOURCE:              &str = include_str!("../../kernels/rope.cpp");
+const MROPE_SOURCE:             &str = include_str!("../../kernels/rope_mrope_dpos.cpp");
 const KV_WRITE_F32_SOURCE:      &str = include_str!("../../kernels/kv_write_f32.cpp");
 const ATTN_STEP_SOURCE:         &str = include_str!("../../kernels/attn_step.cpp");
 const ATTN_PARTIAL_F32_SOURCE:  &str = include_str!("../../kernels/attn_partial_f32.cpp");
@@ -802,7 +803,10 @@ impl GpuBlockState {
 /// keeps its own position).
 pub struct Qwen35GpuState {
     pub block_states: Vec<GpuBlockState>,
-    pub pos: usize,
+    /// Physical cache row. Advances once per token or image embedding.
+    pub kv_pos: usize,
+    /// Logical Qwen RoPE continuation position. Equal to `kv_pos` for text.
+    pub rope_pos: usize,
 }
 
 impl Qwen35GpuState {
@@ -829,12 +833,13 @@ impl Qwen35GpuState {
                 ),
             });
         }
-        Ok(Self { block_states, pos: 0 })
+        Ok(Self { block_states, kv_pos: 0, rope_pos: 0 })
     }
 
     pub fn reset(&mut self) -> Result<(), String> {
         for s in &mut self.block_states { s.reset()?; }
-        self.pos = 0;
+        self.kv_pos = 0;
+        self.rope_pos = 0;
         Ok(())
     }
 }
@@ -851,7 +856,8 @@ pub struct Qwen35Snapshot {
     /// `None` for Full blocks — their rollback is just the KV `len`.
     gdn:    Vec<Option<(DeviceBuf<f32>, DeviceBuf<f32>)>>,
     kv_len: Vec<usize>,   // per block (block order); meaningful for Full
-    pos:    usize,
+    kv_pos:   usize,
+    rope_pos: usize,
 }
 
 impl Qwen35Snapshot {
@@ -866,12 +872,18 @@ impl Qwen35Snapshot {
                 )),
             });
         }
-        Ok(Self { gdn, kv_len: vec![0; state.block_states.len()], pos: state.pos })
+        Ok(Self {
+            gdn,
+            kv_len: vec![0; state.block_states.len()],
+            kv_pos: state.kv_pos,
+            rope_pos: state.rope_pos,
+        })
     }
 
     /// Capture `state` into this snapshot (reuses the allocated buffers).
     pub fn save(&mut self, state: &Qwen35GpuState) -> Result<(), String> {
-        self.pos = state.pos;
+        self.kv_pos = state.kv_pos;
+        self.rope_pos = state.rope_pos;
         for (i, bs) in state.block_states.iter().enumerate() {
             match bs {
                 GpuBlockState::Full(kv)  => self.kv_len[i] = kv.len,
@@ -888,7 +900,8 @@ impl Qwen35Snapshot {
 
     /// Roll `state` back to the captured checkpoint.
     pub fn restore(&self, state: &mut Qwen35GpuState) -> Result<(), String> {
-        state.pos = self.pos;
+        state.kv_pos = self.kv_pos;
+        state.rope_pos = self.rope_pos;
         for (i, bs) in state.block_states.iter_mut().enumerate() {
             match bs {
                 GpuBlockState::Full(kv)  => kv.len = self.kv_len[i],
@@ -990,7 +1003,11 @@ pub struct GpuQwen35 {
     use_old_attn:   bool,            // REINSTINCT_OLD_ATTN
     /// Decode position, device-resident — lets the rope / KV-write /
     /// attention kernels read it so the forward is graph-capturable.
-    d_pos:          DeviceBuf<u32>,
+    d_kv_pos:       DeviceBuf<u32>,
+    d_rope_pos:     DeviceBuf<u32>,
+    d_mrope_positions: DeviceBuf<u32>,
+    d_mrope_sections:  DeviceBuf<u32>,
+    mrope_active:      std::cell::Cell<bool>,
     /// `REINSTINCT_MOE_PROFILE` — per-stage decode timing (sync-per-lap,
     /// accumulated across layers/steps). See `prof_lap` / `moe_prof_report`.
     moe_prof_on:    bool,
@@ -1023,6 +1040,7 @@ pub struct GpuQwen35 {
     split_q_gate_module:     Module,
     sigmoid_mul_module:      Module,
     rope_module:             Module,
+    mrope_module:            Module,
     attn_step_module:        Module,
     /// Split-K decode attention (FlashDecoding) — partial + merge.
     attn_partial_module:     Module,
@@ -1202,7 +1220,21 @@ impl GpuQwen35 {
         let attn_m_partial = DeviceBuf::new(n_heads * ATTN_MAX_SPLITS as usize)?;
         let attn_l_partial = DeviceBuf::new(n_heads * ATTN_MAX_SPLITS as usize)?;
         let use_old_attn   = std::env::var_os("REINSTINCT_OLD_ATTN").is_some();
-        let d_pos          = DeviceBuf::new(1)?;
+        let d_kv_pos       = DeviceBuf::new(1)?;
+        let d_rope_pos     = DeviceBuf::new(1)?;
+        let d_mrope_positions = DeviceBuf::new(4)?;
+        let mut mrope_sections = [0_u32; 4];
+        if cfg.rope_dim_sections.len() > 4 {
+            return Err("rope.dimension_sections has more than four entries".into());
+        }
+        mrope_sections[..cfg.rope_dim_sections.len()]
+            .copy_from_slice(&cfg.rope_dim_sections);
+        if mrope_sections.iter().sum::<u32>() as usize != rotary_dim / 2 {
+            return Err(format!(
+                "rope.dimension_sections {:?} does not cover {} rotary pairs",
+                cfg.rope_dim_sections, rotary_dim / 2));
+        }
+        let d_mrope_sections = DeviceBuf::from_slice(&mrope_sections)?;
         let moe_prof_on    = std::env::var_os("REINSTINCT_MOE_PROFILE").is_some();
         let prof_mark      = std::cell::Cell::new(std::time::Instant::now());
         let prof_buckets   = std::cell::RefCell::new(Vec::new());
@@ -1236,6 +1268,7 @@ impl GpuQwen35 {
         let split_q_gate_hsaco      = cache.compile("split_q_gate",      SPLIT_Q_GATE_SOURCE)?;
         let sigmoid_mul_hsaco       = cache.compile("sigmoid_mul",       SIGMOID_MUL_SOURCE)?;
         let rope_hsaco              = cache.compile("rope",              ROPE_SOURCE)?;
+        let mrope_hsaco             = cache.compile("rope_mrope",       MROPE_SOURCE)?;
         let attn_step_hsaco         = cache.compile("attn_step",         ATTN_STEP_SOURCE)?;
         let attn_partial_hsaco      = cache.compile("attn_partial_f32",  ATTN_PARTIAL_F32_SOURCE)?;
         let attn_merge_hsaco        = cache.compile("attn_merge",        ATTN_MERGE_SOURCE)?;
@@ -1314,7 +1347,9 @@ impl GpuQwen35 {
             hidden_a, hidden_b, mtp_scratch, mtp_chain_hid, verify_hidden,
             pool_f32, pool_u8, pool_u16, prefill_warm_p, ffn_a, ffn_b,
             q_raw, q_buf, gate_buf, k_raw, v_raw, k_norm, attn_concat, logits,
-            attn_o_partial, attn_m_partial, attn_l_partial, use_old_attn, d_pos,
+            attn_o_partial, attn_m_partial, attn_l_partial, use_old_attn,
+            d_kv_pos, d_rope_pos, d_mrope_positions, d_mrope_sections,
+            mrope_active: std::cell::Cell::new(false),
             moe_prof_on, prof_mark, prof_buckets,
             rope_cos, rope_sin,
             embed_module:             Module::load(&embed_hsaco)?,
@@ -1326,6 +1361,7 @@ impl GpuQwen35 {
             split_q_gate_module:      Module::load(&split_q_gate_hsaco)?,
             sigmoid_mul_module:       Module::load(&sigmoid_mul_hsaco)?,
             rope_module:              Module::load(&rope_hsaco)?,
+            mrope_module:             Module::load(&mrope_hsaco)?,
             attn_step_module:         Module::load(&attn_step_hsaco)?,
             attn_partial_module:      Module::load(&attn_partial_hsaco)?,
             attn_merge_module:        Module::load(&attn_merge_hsaco)?,
@@ -1946,7 +1982,12 @@ impl GpuQwen35 {
     }
 
     fn launch_rope(&self, x: *mut c_void, n_heads: u32) -> Result<(), String> {
-        let f = self.rope_module.function("rope_apply_f32")?;
+        let use_mrope = self.mrope_active.get();
+        let f = if use_mrope {
+            self.mrope_module.function("rope_apply_mrope_f32")?
+        } else {
+            self.rope_module.function("rope_apply_f32")?
+        };
         let half = (self.rotary_dim / 2) as u32;
         let block: u32 = 64;
         let grid_x = (half + block - 1) / block;
@@ -1956,22 +1997,48 @@ impl GpuQwen35 {
         let mut hd = self.head_dim   as u32;
         let mut rd = self.rotary_dim as u32;
         let mut nh = n_heads;
-        let mut p  = self.d_pos.raw_ptr();
-        let mut args: [*mut c_void; 7] = [
-            &mut xa as *mut _ as *mut c_void,
-            &mut ca as *mut _ as *mut c_void,
-            &mut sa as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-            &mut rd as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-            &mut p  as *mut _ as *mut c_void,
-        ];
-        unsafe { f.launch((grid_x, n_heads, 1), (block, 1, 1), 0, Some(&self.stream), &mut args) }
+        if use_mrope {
+            let mut pp = self.d_mrope_positions.raw_ptr();
+            let mut sp = self.d_mrope_sections.raw_ptr();
+            let mut args: [*mut c_void; 8] = [
+                &mut xa as *mut _ as *mut c_void, &mut ca as *mut _ as *mut c_void,
+                &mut sa as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
+                &mut rd as *mut _ as *mut c_void, &mut nh as *mut _ as *mut c_void,
+                &mut pp as *mut _ as *mut c_void, &mut sp as *mut _ as *mut c_void,
+            ];
+            unsafe { f.launch((grid_x, n_heads, 1), (block, 1, 1), 0, Some(&self.stream), &mut args) }
+        } else {
+            let mut p = self.d_rope_pos.raw_ptr();
+            let mut args: [*mut c_void; 7] = [
+                &mut xa as *mut _ as *mut c_void, &mut ca as *mut _ as *mut c_void,
+                &mut sa as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
+                &mut rd as *mut _ as *mut c_void, &mut nh as *mut _ as *mut c_void,
+                &mut p as *mut _ as *mut c_void,
+            ];
+            unsafe { f.launch((grid_x, n_heads, 1), (block, 1, 1), 0, Some(&self.stream), &mut args) }
+        }
     }
 
-    /// Stage the decode position into the device-resident `d_pos`.
-    fn set_pos(&self, pos: usize) -> Result<(), String> {
-        self.d_pos.copy_from_host(&[pos as u32])
+    /// Stage independent physical-cache and logical-RoPE positions.
+    fn set_positions(&self, kv_pos: usize, rope_pos: usize) -> Result<(), String> {
+        self.mrope_active.set(false);
+        self.d_kv_pos.copy_from_host(&[kv_pos as u32])?;
+        self.d_rope_pos.copy_from_host(&[rope_pos as u32])
+    }
+
+    fn set_mrope_positions(&self, kv_pos: usize, positions: [u32; 4]) -> Result<(), String> {
+        if positions.iter().any(|&p| p as usize >= self.max_seq) {
+            return Err(format!("M-RoPE position {:?} exceeds max sequence {}", positions, self.max_seq));
+        }
+        self.d_kv_pos.copy_from_host(&[kv_pos as u32])?;
+        self.d_mrope_positions.copy_from_host(&positions)?;
+        self.mrope_active.set(true);
+        Ok(())
+    }
+
+    /// Text-only shorthand: physical and logical positions are identical.
+    fn set_text_pos(&self, pos: usize) -> Result<(), String> {
+        self.set_positions(pos, pos)
     }
 
     /// `REINSTINCT_MOE_PROFILE` per-stage timer. `prof_lap` syncs the
@@ -2009,7 +2076,7 @@ impl GpuQwen35 {
         let block: u32 = 256;
         let grid = (kv_dim + block - 1) / block;
         let mut sa = src; let mut ca = cache;
-        let mut pp = self.d_pos.raw_ptr(); let mut kd = kv_dim;
+        let mut pp = self.d_kv_pos.raw_ptr(); let mut kd = kv_dim;
         let mut args: [*mut c_void; 4] = [
             &mut sa as *mut _ as *mut c_void, &mut ca as *mut _ as *mut c_void,
             &mut pp as *mut _ as *mut c_void, &mut kd as *mut _ as *mut c_void];
@@ -2142,7 +2209,7 @@ impl GpuQwen35 {
         let n_kv    = self.n_kv_heads as u32;
         let head_dim = self.head_dim as u32;
         let max_seq = self.max_seq as u32;
-        let mut pp = self.d_pos.raw_ptr();   // decode pos, device-resident
+        let mut pp = self.d_kv_pos.raw_ptr();   // physical cache pos
 
         if self.use_old_attn {
             let f = self.attn_step_module.function("attn_step_f32")?;
@@ -2886,7 +2953,7 @@ impl GpuQwen35 {
                 if d == next { matches += 1; }
             }
             // MTP block runs as its own fresh sequence: position = step i.
-            self.set_pos(i)?;
+            self.set_text_pos(i)?;
             self.mtp_draft_forward(&self.mtp[0], self.hidden_a.raw_ptr(),
                                    next, &mut mtp_kv)?;
             self.stream.synchronize()?;
@@ -2928,7 +2995,7 @@ impl GpuQwen35 {
         let mut argmax_host = vec![0i32; 2];
         for i in 0..k {
             let prev = if i == 0 { prev_hidden } else { self.mtp_chain_hid.raw_ptr() };
-            self.set_pos(mtp_pos + i)?;
+            self.set_text_pos(mtp_pos + i)?;
             self.mtp_draft_forward(mtp, prev, embed, mtp_kv)?;
             if i + 1 < k {
                 // Preserve this link's block-hidden (mtp_scratch[2h..3h])
@@ -3077,7 +3144,8 @@ impl GpuQwen35 {
     {
         self.enqueue_forward_token(token, state)?;
         self.stream.synchronize()?;
-        state.pos += 1;
+        state.kv_pos += 1;
+        state.rope_pos += 1;
         let mut out = vec![0.0f32; self.vocab];
         self.logits.copy_to_host(&mut out)?;
         Ok(out)
@@ -3100,7 +3168,7 @@ impl GpuQwen35 {
         let q_scale   = (self.gdn_head_dim as f32).powf(-0.5);
 
         // Embed lookup → hidden_a
-        self.set_pos(state.pos)?;
+        self.set_positions(state.kv_pos, state.rope_pos)?;
         self.launch_embed_lookup_dispatch(&self.token_embd, self.hidden_a.raw_ptr(), token)?;
 
         // Walk blocks, but for `traced_block_idx` (which must be a Linear
@@ -3184,7 +3252,8 @@ impl GpuQwen35 {
         self.launch_matvec_dispatch(self.output_proj_tensor(),
                                     self.hidden_b.raw_ptr(), self.logits.raw_ptr())?;
         self.stream.synchronize()?;
-        state.pos += 1;
+        state.kv_pos += 1;
+        state.rope_pos += 1;
 
         let mut trace = Vec::with_capacity(traced_events.len());
         for (name, s, e) in &traced_events {
@@ -3211,7 +3280,7 @@ impl GpuQwen35 {
             .collect::<Result<Vec<_>, _>>()?;
 
         events[0].record(&self.stream)?;
-        self.set_pos(state.pos)?;
+        self.set_positions(state.kv_pos, state.rope_pos)?;
         self.launch_embed_lookup_dispatch(&self.token_embd, self.hidden_a.raw_ptr(), token)?;
         events[1].record(&self.stream)?;
 
@@ -3240,7 +3309,8 @@ impl GpuQwen35 {
 
         // Sync on the *last* event (finishes the chain) before reading.
         events[n_blocks + 3].synchronize()?;
-        state.pos += 1;
+        state.kv_pos += 1;
+        state.rope_pos += 1;
 
         let mut block_ms = Vec::with_capacity(n_blocks);
         for i in 0..n_blocks {
@@ -3291,7 +3361,7 @@ impl GpuQwen35 {
     fn enqueue_forward_token(&self, token: u32, state: &mut Qwen35GpuState)
         -> Result<(), String>
     {
-        self.set_pos(state.pos)?;
+        self.set_positions(state.kv_pos, state.rope_pos)?;
         self.launch_embed_lookup_dispatch(&self.token_embd, self.hidden_a.raw_ptr(), token)?;
         self.prof_reset();
         self.enqueue_decode_body(state)
@@ -3320,11 +3390,12 @@ impl GpuQwen35 {
                                    state: &mut Qwen35GpuState)
         -> Result<Vec<f32>, String>
     {
-        self.set_pos(state.pos)?;
+        self.set_positions(state.kv_pos, state.rope_pos)?;
         self.launch_embed_lookup_dispatch(&self.token_embd, self.hidden_a.raw_ptr(), token)?;
         exec.launch(&self.stream)?;
         self.stream.synchronize()?;
-        state.pos += 1;
+        state.kv_pos += 1;
+        state.rope_pos += 1;
         let mut out = vec![0.0f32; self.vocab];
         self.logits.copy_to_host(&mut out)?;
         Ok(out)
@@ -3360,15 +3431,107 @@ impl GpuQwen35 {
         }
         let mut last = Vec::new();
         for row in embeddings.chunks_exact(self.hidden) {
-            self.set_pos(state.pos)?;
+            self.set_positions(state.kv_pos, state.rope_pos)?;
             self.hidden_a.copy_from_host(row)?;
             self.enqueue_decode_body(state)?;
             self.stream.synchronize()?;
-            state.pos += 1;
+            state.kv_pos += 1;
+            state.rope_pos += 1;
             last.resize(self.vocab, 0.0);
             self.logits.copy_to_host(&mut last)?;
         }
         Ok(last)
+    }
+
+    /// Prefill image embeddings with one explicit four-plane M-RoPE position
+    /// per physical row. The bridge's `n_pos` is the logical continuation
+    /// count and can be smaller than the number of embeddings.
+    pub fn forward_embeddings_mrope(
+        &self,
+        embeddings: &[f32],
+        positions: &[crate::multimodal::DecoderPos],
+        n_pos: usize,
+        state: &mut Qwen35GpuState,
+    ) -> Result<Vec<f32>, String> {
+        if embeddings.is_empty() || embeddings.len() % self.hidden != 0 {
+            return Err(format!(
+                "external embeddings must contain a non-zero whole number of {}-float rows",
+                self.hidden));
+        }
+        let n_rows = embeddings.len() / self.hidden;
+        if positions.len() != n_rows {
+            return Err(format!(
+                "M-RoPE positions ({}) do not match embedding rows ({n_rows})",
+                positions.len()));
+        }
+        if state.kv_pos + n_rows > self.max_seq {
+            return Err(format!(
+                "image prefill needs {} KV rows at {}, exceeding max sequence {}",
+                n_rows, state.kv_pos, self.max_seq));
+        }
+
+        let mut last = Vec::new();
+        for (row, position) in embeddings.chunks_exact(self.hidden).zip(positions) {
+            self.set_mrope_positions(
+                state.kv_pos,
+                [position.t, position.x, position.y, position.z],
+            )?;
+            self.hidden_a.copy_from_host(row)?;
+            self.enqueue_decode_body(state)?;
+            self.stream.synchronize()?;
+            state.kv_pos += 1;
+            last.resize(self.vocab, 0.0);
+            self.logits.copy_to_host(&mut last)?;
+        }
+        state.rope_pos = state.rope_pos.checked_add(n_pos)
+            .ok_or("logical M-RoPE position overflow")?;
+        self.mrope_active.set(false);
+        Ok(last)
+    }
+
+    /// Prefill bridge chunks in their original text/image/text order.
+    /// This is the runtime boundary used by a future `vision-test`; it does
+    /// not expose multimodal input through the server yet.
+    pub fn forward_multimodal_chunks(
+        &self,
+        chunks: &[crate::multimodal::Chunk],
+        state: &mut Qwen35GpuState,
+    ) -> Result<Vec<f32>, String> {
+        let mut last = None;
+        for chunk in chunks {
+            let logits = match chunk {
+                crate::multimodal::Chunk::Text { tokens, n_pos } => {
+                    if tokens.is_empty() { continue; }
+                    if *n_pos != tokens.len() {
+                        return Err(format!(
+                            "text chunk has {} tokens but advances {n_pos} positions",
+                            tokens.len()));
+                    }
+                    self.forward_tokens(tokens, state)?
+                }
+                crate::multimodal::Chunk::Image {
+                    embeddings, embedding_dim, positions, n_pos,
+                } => {
+                    if *embedding_dim != self.hidden {
+                        return Err(format!(
+                            "image embedding dimension {embedding_dim} does not match model width {}",
+                            self.hidden));
+                    }
+                    if positions.is_empty() {
+                        let n_rows = embeddings.len() / self.hidden;
+                        if *n_pos != n_rows {
+                            return Err(format!(
+                                "non-M-RoPE image has {n_rows} rows but advances {n_pos} positions"));
+                        }
+                        self.forward_embeddings(embeddings, state)?
+                    } else {
+                        self.forward_embeddings_mrope(embeddings, positions, *n_pos, state)?
+                    }
+                }
+            };
+            last = Some(logits);
+        }
+        last.ok_or_else(|| "multimodal input contained no physical rows".into())
     }
 
     /// Materialize ordinary token-embedding rows for the external-embedding
@@ -3759,7 +3922,8 @@ impl GpuQwen35 {
         }
 
         self.stream.synchronize()?;
-        state.pos += n;
+        state.kv_pos += n;
+        state.rope_pos += n;
         let mut out = vec![0.0f32; self.vocab];
         self.logits.copy_to_host(&mut out)?;
         Ok(out)
@@ -3822,7 +3986,8 @@ impl GpuQwen35 {
             self.launch_matvec_dispatch(self.output_proj_tensor(), in_ptr, out_ptr)?;
         }
         self.stream.synchronize()?;
-        state.pos += n;
+        state.kv_pos += n;
+        state.rope_pos += n;
 
         let mut flat = vec![0.0f32; n * self.vocab];
         logits_all.copy_to_host(&mut flat)?;
@@ -4041,7 +4206,7 @@ impl GpuQwen35 {
         // the KV write + attention kernel both read pos=0 every step,
         // overwriting prior entries and limiting attention to a single
         // token (see step_full_attention's launch_kv_write / launch_attn_step).
-        self.set_pos(kv_cache.len)?;
+        self.set_text_pos(kv_cache.len)?;
 
         // Sub-layer 1: attention with pre-norm + residual.
         self.step_full_attention(self.hidden_a.raw_ptr(), self.hidden_b.raw_ptr(),
@@ -4198,7 +4363,7 @@ impl GpuQwen35 {
         // Stage decode position into device-resident d_pos so the KV
         // write + attention kernels see the right slot. Without this
         // they read pos=0 every call.
-        self.set_pos(kv_cache.len)?;
+        self.set_text_pos(kv_cache.len)?;
         self.step_full_attention(self.hidden_a.raw_ptr(), self.hidden_b.raw_ptr(),
                                  weights, kv_cache)?;
         self.stream.synchronize()?;
@@ -4490,7 +4655,8 @@ mod tests {
         assert_eq!(seq_argmax, bat_argmax,
             "batched argmax {bat_argmax} != sequential {seq_argmax}");
         assert!(overlap >= 4, "top-5 overlap {overlap}/5 too low — likely a real bug");
-        assert_eq!(s_bat.pos, prompt.len(), "batched state didn't advance correctly");
+        assert_eq!(s_bat.kv_pos, prompt.len(), "batched KV state didn't advance correctly");
+        assert_eq!(s_bat.rope_pos, prompt.len(), "batched RoPE state didn't advance correctly");
     }
 
     #[test]
@@ -4509,11 +4675,27 @@ mod tests {
         let token_logits = gpu.forward_tokens(&prompt, &mut token_state).expect("token prefill");
         let mut external_state = Qwen35GpuState::new(&m.model, 32).unwrap();
         let external_logits = gpu.forward_embeddings(&embeddings, &mut external_state).expect("external prefill");
+        let positions: Vec<crate::multimodal::DecoderPos> = (0..prompt.len())
+            .map(|p| crate::multimodal::DecoderPos {
+                t: p as u32, x: p as u32, y: p as u32, z: p as u32,
+            })
+            .collect();
+        let mut mrope_state = Qwen35GpuState::new(&m.model, 32).unwrap();
+        let logical_advance = 3;
+        let mrope_logits = gpu.forward_embeddings_mrope(
+            &embeddings, &positions, logical_advance, &mut mrope_state,
+        ).expect("broadcast M-RoPE external prefill");
 
-        assert_eq!(token_state.pos, external_state.pos);
+        assert_eq!(token_state.kv_pos, external_state.kv_pos);
+        assert_eq!(token_state.rope_pos, external_state.rope_pos);
+        assert_eq!(token_state.kv_pos, mrope_state.kv_pos);
+        assert_eq!(mrope_state.rope_pos, logical_advance);
         assert_eq!(token_logits.len(), external_logits.len());
         for (i, (&a, &b)) in token_logits.iter().zip(&external_logits).enumerate() {
             assert!((a - b).abs() <= 1.0e-5, "logit {i}: token={a} external={b}");
+        }
+        for (i, (&a, &b)) in token_logits.iter().zip(&mrope_logits).enumerate() {
+            assert!((a - b).abs() <= 1.0e-5, "logit {i}: token={a} mrope={b}");
         }
     }
 

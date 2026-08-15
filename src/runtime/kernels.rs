@@ -256,6 +256,7 @@ const SWIGLU_KERNEL: &str = "swiglu_mul_f32";
 
 const ROPE_SOURCE: &str = include_str!("../../kernels/rope.cpp");
 const ROPE_KERNEL: &str = "rope_apply_f32";
+const MROPE_SOURCE: &str = include_str!("../../kernels/rope_mrope_dpos.cpp");
 
 const ATTN_STEP_SOURCE: &str = include_str!("../../kernels/attn_step.cpp");
 const ATTN_STEP_KERNEL: &str = "attn_step_f32";
@@ -471,6 +472,57 @@ pub fn rope_apply_f32(cache: &KernelCache, x: &[f32], cos: &[f32], sin: &[f32],
     hip::Device(0).synchronize()?;
 
     let mut out = vec![0.0f32; x.len()];
+    dx.copy_to_host(&mut out)?;
+    Ok(out)
+}
+
+pub fn rope_apply_mrope_f32(
+    cache: &KernelCache,
+    x: &[f32],
+    cos: &[f32],
+    sin: &[f32],
+    head_dim: usize,
+    rotary_dim: usize,
+    n_heads: usize,
+    positions: [u32; 4],
+    sections: [u32; 4],
+) -> Result<Vec<f32>, String> {
+    assert_eq!(x.len(), n_heads * head_dim);
+    assert_eq!(cos.len(), sin.len());
+    assert_eq!(cos.len() % rotary_dim, 0);
+    assert_eq!(sections.iter().sum::<u32>() as usize, rotary_dim / 2);
+    let max_seq = cos.len() / rotary_dim;
+    assert!(positions.iter().all(|&p| (p as usize) < max_seq));
+
+    let module = Module::load(&cache.compile("rope_mrope", MROPE_SOURCE)?)?;
+    let f = module.function("rope_apply_mrope_f32")?;
+    let dx = DeviceBuf::from_slice(x)?;
+    let dc = DeviceBuf::from_slice(cos)?;
+    let ds = DeviceBuf::from_slice(sin)?;
+    let dp = DeviceBuf::from_slice(&positions)?;
+    let dsections = DeviceBuf::from_slice(&sections)?;
+    let half = (rotary_dim / 2) as u32;
+    let block = 64_u32;
+    let mut xp = dx.raw_ptr();
+    let mut cp = dc.raw_ptr();
+    let mut sp = ds.raw_ptr();
+    let mut hd = head_dim as u32;
+    let mut rd = rotary_dim as u32;
+    let mut nh = n_heads as u32;
+    let mut pp = dp.raw_ptr();
+    let mut sectp = dsections.raw_ptr();
+    let mut args: [*mut c_void; 8] = [
+        &mut xp as *mut _ as *mut c_void, &mut cp as *mut _ as *mut c_void,
+        &mut sp as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
+        &mut rd as *mut _ as *mut c_void, &mut nh as *mut _ as *mut c_void,
+        &mut pp as *mut _ as *mut c_void, &mut sectp as *mut _ as *mut c_void,
+    ];
+    unsafe {
+        f.launch(((half + block - 1) / block, n_heads as u32, 1),
+                 (block, 1, 1), 0, None, &mut args)?;
+    }
+    hip::Device(0).synchronize()?;
+    let mut out = vec![0.0; x.len()];
     dx.copy_to_host(&mut out)?;
     Ok(out)
 }
@@ -1396,6 +1448,42 @@ mod tests {
             eprintln!("rope pos={pos}: max_abs={max_abs:.3e}");
             assert!(max_abs < 1e-6, "rope pos={pos}: max_abs {max_abs:.3e}");
         }
+    }
+
+    #[test]
+    fn mrope_matches_cpu_reference() {
+        let Some(cache) = skip_if_no_gpu() else { return };
+        use crate::cpu::rope::{RopeCache, apply_mrope};
+        let head_dim = 128usize;
+        let rotary_dim = 64usize;
+        let n_heads = 4usize;
+        let max_seq = 64usize;
+        let freq_base = 1_000_000.0;
+        let sections = [11, 11, 10, 0];
+        let positions = [7, 19, 31, 43];
+        let rope = RopeCache::new(rotary_dim, max_seq, freq_base);
+        let x: Vec<f32> = (0..n_heads * head_dim)
+            .map(|i| ((i as f32 + 0.25) * 0.031).sin())
+            .collect();
+        let mut cos = vec![0.0; max_seq * rotary_dim];
+        let mut sin = vec![0.0; max_seq * rotary_dim];
+        for pos in 0..max_seq {
+            let (c, s) = rope.get(pos);
+            cos[pos * rotary_dim..(pos + 1) * rotary_dim].copy_from_slice(c);
+            sin[pos * rotary_dim..(pos + 1) * rotary_dim].copy_from_slice(s);
+        }
+        let mut cpu = x.clone();
+        for head in cpu.chunks_exact_mut(head_dim) {
+            apply_mrope(head, rotary_dim, freq_base, &sections, positions);
+        }
+        let gpu = rope_apply_mrope_f32(
+            &cache, &x, &cos, &sin, head_dim, rotary_dim, n_heads,
+            positions, sections,
+        ).expect("gpu mrope");
+        let max_abs = gpu.iter().zip(&cpu)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(max_abs < 1e-6, "M-RoPE CPU/GPU max_abs {max_abs:.3e}");
     }
 
     #[test]

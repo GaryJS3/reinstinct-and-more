@@ -32,12 +32,14 @@ embedding. This distinction is a correctness gate, not an optimization.
 1. The pinned submodule and `mtmd-bridge` expose stable copied text/image
    chunks. `reinstinct-engine mtmd-test` validates the image frontend without
    loading ReInstinct transformer weights.
-2. `GpuQwen35::forward_embeddings` provides the verified injection point for
-   external FP32 rows. It is sequential until position-aware batched prefill is
-   complete, so it is not yet an end-to-end vision path.
-3. Before enabling `vision-test` or HTTP image requests, implement separate
-   KV/RoPE state and four-plane Qwen M-RoPE kernels, then compare top logits
-   and greedy token sequences with Furnace at temperature zero.
+2. `GpuQwen35::forward_embeddings_mrope` provides the sequential,
+   position-correct injection point for external FP32 rows. Physical KV and
+   logical RoPE state advance independently, and ordered bridge chunks are
+   accepted by the runtime.
+3. Separate KV/RoPE state and the four-plane Qwen M-RoPE kernel pass CPU/GPU
+   parity on gfx906. Before enabling `vision-test` or HTTP image requests,
+   compare captured-image top logits and greedy token sequences with Furnace
+   at temperature zero.
 
 ## Validation commands
 

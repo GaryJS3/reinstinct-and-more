@@ -19,7 +19,9 @@ metadata; it must not evaluate language-model layers.
   copied FP32 embeddings, and return text/image chunks plus M-RoPE positions.
 - Add `mtmd-test` and external-embedding parity coverage.
 
-## Next: position-correct external prefill
+## Position-correct external prefill
+
+Completed locally and validated on gfx906:
 
 1. Split `Qwen35GpuState.pos` into physical `kv_pos` and logical `rope_pos`.
    Split device `d_pos` so graph-captured KV writes use physical position while
@@ -27,8 +29,8 @@ metadata; it must not evaluate language-model layers.
 2. Preserve the contiguous scalar text fast path. Add explicit image position
    buffers only for multimodal external embeddings.
 3. Implement the pinned llama.cpp Qwen four-plane M-RoPE semantics using
-   `rope.dimension_sections`; add CPU and gfx906 kernel tests for text,
-   randomized positions, and the captured image fixture.
+   `rope.dimension_sections`; CPU and gfx906 tests cover text-broadcast and
+   independent positions. Captured-image parity remains pending.
 4. Process bridge chunks in order: token prefill for text and external
    embedding prefill for image. Advance physical position by `n_tokens` and
    logical position by `n_pos`. Keep MTP/speculative decode disabled.

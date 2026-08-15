@@ -37,10 +37,10 @@ Completed locally and validated on gfx906:
 
 ## After correctness
 
-- Add `vision-test` with image/preprocess, projector, H2D, prefill, and decode
-  timing breakdowns.
-- Compare deterministic chunk hashes, positions, first logits, and greedy
-  tokens with Furnace at temperature zero.
+- `vision-test` now reports bridge/vision, model load, per-chunk prefill, first
+  logits, decode, and physical/logical position diagnostics.
+- Deterministic chunk metadata and temperature-zero greedy tokens match the
+  equivalent Furnace prompt on the reproducible llama.cpp image fixture.
 - Add OpenAI structured text plus one `data:` JPEG/PNG image after CLI output
   matches Furnace. Reject remote URLs and preserve finite body limits.
 

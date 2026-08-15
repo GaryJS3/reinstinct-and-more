@@ -37,9 +37,9 @@ embedding. This distinction is a correctness gate, not an optimization.
    logical RoPE state advance independently, and ordered bridge chunks are
    accepted by the runtime.
 3. Separate KV/RoPE state and the four-plane Qwen M-RoPE kernel pass CPU/GPU
-   parity on gfx906. Before enabling `vision-test` or HTTP image requests,
-   compare captured-image top logits and greedy token sequences with Furnace
-   at temperature zero.
+   parity on gfx906. `vision-test` also matches Furnace's first eight greedy
+   tokens on a real image at temperature zero. HTTP image requests remain
+   disabled pending structured-content parsing and finite-body tests.
 
 ## Validation commands
 

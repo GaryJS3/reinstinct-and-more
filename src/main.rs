@@ -166,6 +166,19 @@ enum Command {
         #[arg(long, default_value_t = 8)] threads: i32,
         #[arg(long)] cpu_vision: bool,
     },
+    /// Run one image through libmtmd and the full ReInstinct Qwen
+    /// transformer, then greedily decode tokens. Diagnostic only: this does
+    /// not enable image input on the HTTP server.
+    VisionTest {
+        #[arg(long)] model: PathBuf,
+        #[arg(long)] mmproj: PathBuf,
+        #[arg(long)] image: PathBuf,
+        #[arg(long)] prompt: String,
+        #[arg(long)] bridge: PathBuf,
+        #[arg(short = 'n', long, default_value_t = 16)] steps: usize,
+        #[arg(long, default_value_t = 8)] threads: i32,
+        #[arg(long)] cpu_vision: bool,
+    },
     /// Run forward N times, report per-stage timing breakdown.
     Bench {
         path: PathBuf,
@@ -354,6 +367,9 @@ fn main() -> anyhow::Result<()> {
         Command::DebugEmbed { path, tokens } => debug_embed(&path, &tokens),
         Command::MtmdTest { model, mmproj, image, prompt, bridge, threads, cpu_vision } =>
             mtmd_test_cli(&model, &mmproj, &image, &prompt, &bridge, threads, !cpu_vision),
+        Command::VisionTest { model, mmproj, image, prompt, bridge, steps, threads, cpu_vision } =>
+            vision_test_cli(&model, &mmproj, &image, &prompt, &bridge,
+                            steps, threads, !cpu_vision),
         Command::Bench { path, iters, token } => bench(&path, iters, token),
         Command::HipInfo { mb, iters } => hip_info(mb, iters),
         Command::GpuBench { path, iters, token } => gpu_bench(&path, iters, token),
@@ -433,6 +449,125 @@ fn mtmd_test_cli(model: &std::path::Path, mmproj: &std::path::Path,
             }
         }
     }
+    Ok(())
+}
+
+fn vision_test_cli(model_path: &std::path::Path, mmproj: &std::path::Path,
+                   image: &std::path::Path, prompt: &str,
+                   bridge: &std::path::Path, steps: usize,
+                   threads: i32, use_gpu_vision: bool) -> anyhow::Result<()>
+{
+    use reinstinct_engine::hip;
+    use reinstinct_engine::multimodal::{Chunk, MtmdProcessor};
+    use reinstinct_engine::runtime::{KernelCache, qwen35::{GpuQwen35, Qwen35GpuState}};
+    use reinstinct_engine::sampling::argmax;
+    use reinstinct_engine::tokenizer::Tokenizer;
+
+    if hip::device_count().ok().unwrap_or(0) < 1 { anyhow::bail!("no HIP device"); }
+    let _dev = hip::Device::set(0).map_err(anyhow::Error::msg)?;
+    let total_started = std::time::Instant::now();
+    let image_bytes = std::fs::read(image)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", image.display()))?;
+    let gguf = GgufFile::open(model_path)
+        .map_err(|e| anyhow::anyhow!("open {}: {e}", model_path.display()))?;
+    let model = Qwen35Model::load(&gguf).map_err(anyhow::Error::msg)?;
+    let tokenizer = Tokenizer::from_gguf(&gguf).map_err(anyhow::Error::msg)?;
+    // Match Furnace's Qwen chat template for a text part followed by an image
+    // part with reasoning enabled. `/apply-template` is the reference for
+    // this exact byte sequence.
+    let formatted = format!(
+        "<|im_start|>user\n{prompt}<__media__><|im_end|>\n<|im_start|>assistant\n<think>\n");
+
+    let bridge_started = std::time::Instant::now();
+    let mut processor = MtmdProcessor::load(
+        bridge, model_path, mmproj, model.config.hidden_size as usize,
+        use_gpu_vision, threads,
+    ).map_err(anyhow::Error::msg)?;
+    let bridge_load = bridge_started.elapsed();
+    let encode_started = std::time::Instant::now();
+    let processed = processor.process(&formatted, &image_bytes)
+        .map_err(anyhow::Error::msg)?;
+    let encode_elapsed = encode_started.elapsed();
+    if !processed.uses_mrope { anyhow::bail!("Qwen vision input did not provide M-RoPE positions"); }
+
+    let physical_rows: usize = processed.chunks.iter().map(|chunk| match chunk {
+        Chunk::Text { tokens, .. } => tokens.len(),
+        Chunk::Image { embeddings, embedding_dim, .. } => embeddings.len() / embedding_dim,
+    }).sum();
+    let logical_positions: usize = processed.chunks.iter().map(|chunk| match chunk {
+        Chunk::Text { n_pos, .. } | Chunk::Image { n_pos, .. } => *n_pos,
+    }).sum();
+    let max_seq = physical_rows.checked_add(steps).and_then(|v| v.checked_add(4))
+        .ok_or_else(|| anyhow::anyhow!("vision-test sequence length overflow"))?;
+
+    println!("model                 = {}", model_path.display());
+    println!("image                 = {}", image.display());
+    println!("chunks                = {}", processed.chunks.len());
+    println!("physical KV rows      = {physical_rows}");
+    println!("logical positions     = {logical_positions}");
+    println!("bridge initialization = {:.3} s", bridge_load.as_secs_f64());
+    println!("vision encode         = {:.3} s", encode_elapsed.as_secs_f64());
+
+    let model_started = std::time::Instant::now();
+    let cache = KernelCache::new().map_err(anyhow::Error::msg)?;
+    let gpu = GpuQwen35::new(&model, &gguf, &cache, max_seq).map_err(anyhow::Error::msg)?;
+    let mut state = Qwen35GpuState::new(&model, max_seq).map_err(anyhow::Error::msg)?;
+    println!("transformer load      = {:.3} s", model_started.elapsed().as_secs_f64());
+
+    let prefill_started = std::time::Instant::now();
+    let mut logits = Vec::new();
+    for (index, chunk) in processed.chunks.iter().enumerate() {
+        let started = std::time::Instant::now();
+        logits = match chunk {
+            Chunk::Text { tokens, n_pos } => {
+                if *n_pos != tokens.len() {
+                    anyhow::bail!("text chunk {index} has {} tokens but n_pos={n_pos}", tokens.len());
+                }
+                gpu.forward_tokens(tokens, &mut state).map_err(anyhow::Error::msg)?
+            }
+            Chunk::Image { embeddings, embedding_dim, positions, n_pos } => {
+                if *embedding_dim != model.config.hidden_size as usize {
+                    anyhow::bail!("image chunk {index} embedding width {embedding_dim} does not match model");
+                }
+                gpu.forward_embeddings_mrope(embeddings, positions, *n_pos, &mut state)
+                    .map_err(anyhow::Error::msg)?
+            }
+        };
+        println!("chunk {index} prefill       = {:.3} s  (kv={}, rope={})",
+                 started.elapsed().as_secs_f64(), state.kv_pos, state.rope_pos);
+    }
+    println!("total LLM prefill      = {:.3} s", prefill_started.elapsed().as_secs_f64());
+    println!("final state            = kv={} rope={}", state.kv_pos, state.rope_pos);
+    if state.kv_pos != physical_rows || state.rope_pos != logical_positions {
+        anyhow::bail!("position accounting mismatch after multimodal prefill");
+    }
+
+    let mut ranked: Vec<usize> = (0..logits.len()).collect();
+    ranked.sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]));
+    println!("first logits:");
+    for &id in ranked.iter().take(10) {
+        println!("  token {id:>8}  logit {:>9.4}  {:?}", logits[id], tokenizer.decode(&[id as u32]));
+    }
+
+    let graph = gpu.capture_forward_graph(&mut state).map_err(anyhow::Error::msg)?;
+    let decode_started = std::time::Instant::now();
+    let mut generated = Vec::with_capacity(steps);
+    for _ in 0..steps {
+        let token = argmax(&logits);
+        generated.push(token);
+        if token == model.config.eos_token_id { break; }
+        logits = gpu.forward_token_via_graph(&graph, token, &mut state)
+            .map_err(anyhow::Error::msg)?;
+    }
+    let decode_elapsed = decode_started.elapsed();
+    println!("generated ids          = {generated:?}");
+    println!("generated text         = {}", tokenizer.decode(&generated));
+    if !generated.is_empty() {
+        println!("decode                 = {:.1} tok/s ({:.3} s)",
+                 generated.len() as f64 / decode_elapsed.as_secs_f64(),
+                 decode_elapsed.as_secs_f64());
+    }
+    println!("total elapsed          = {:.3} s", total_started.elapsed().as_secs_f64());
     Ok(())
 }
 

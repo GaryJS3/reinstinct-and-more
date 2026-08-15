@@ -24,6 +24,8 @@ Last updated: 2026-08-15
   row per embedding and advances logical state by the chunk's `n_pos`.
 - Ordered text/image/text chunk prefill is implemented but is not exposed by
   the server.
+- `vision-test` runs the bridge and full ReInstinct transformer, prints
+  per-stage timing, top first logits, physical/logical state, and greedy text.
 
 ## Important discovery
 
@@ -32,13 +34,13 @@ On the pinned Furnace revision, `llama_model_n_embd_inp()` and
 therefore receives the embedding width parsed by ReInstinct from the same GGUF
 metadata. This preserves the no-second-LLM requirement.
 
-## Current blocker
+## Current gate
 
-The position split and M-RoPE kernel are implemented and pass synthetic and
-text-broadcast parity tests. The next correctness gate is running the captured
-752-row image fixture through the full Qwen3.6 model and comparing first
-logits and greedy tokens with Furnace. Do not enable HTTP image requests until
-that end-to-end comparison passes.
+End-to-end CLI image generation now passes against Furnace on the reproducible
+llama.cpp `tools/mtmd/test-1.jpeg` fixture. The next gate is OpenAI structured
+content parsing with one finite `data:` JPEG/PNG image; remote URLs remain out
+of scope. Keep image requests disabled in the server until that request path
+has finite-body tests and an MI50 smoke test.
 
 ## Latest validation
 
@@ -46,6 +48,12 @@ that end-to-end comparison passes.
 - Remote MI50 library suite: 184 passed, 1 ignored.
 - Dedicated gfx906 M-RoPE CPU/GPU parity test: passed.
 - Qwen3.5 4B token vs scalar-external vs broadcast-M-RoPE logits: passed.
+- Qwen3.6 35B real-image run: 316 physical KV rows, 36 logical positions,
+  3.891 s LLM prefill, and 75.4 tok/s decode.
+- Furnace and ReInstinct used the same `/apply-template` prompt and produced
+  the same first eight greedy tokens: `The user wants a description of the provided`.
+- Furnace's chat endpoint does not expose raw logits; greedy-token parity is
+  the cross-engine correctness evidence for this fixture.
 
 ## Commits
 

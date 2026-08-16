@@ -1050,12 +1050,16 @@ impl ServerModel {
                     return Err("prompt encoded to zero tokens".into());
                 }
                 state.reset()?;
+                let mut vision_profile = None;
+                let prefill_started = std::time::Instant::now();
                 let (mut logits, prompt_rows) = match &req.prompt {
                     PromptInput::ChatVision { messages, image } => {
                         let formatted = crate::chat::format_qwen3_with_media_marker(messages)?;
                         let processor = vision.as_mut().ok_or(
                             "image input is disabled; start serve with --mmproj PATH --mtmd-bridge PATH")?;
+                        let mtmd_started = std::time::Instant::now();
                         let processed = processor.process(&formatted, image)?;
+                        let mtmd_ms = mtmd_started.elapsed().as_secs_f64() * 1e3;
                         let rows: usize = processed.chunks.iter().map(|c| match c {
                             crate::multimodal::Chunk::Text { tokens, .. } => tokens.len(),
                             crate::multimodal::Chunk::Image { embeddings, embedding_dim, .. } => embeddings.len() / embedding_dim,
@@ -1063,7 +1067,9 @@ impl ServerModel {
                         if rows + req.max_tokens + 4 > *max_seq {
                             return Err(format!("multimodal prompt ({rows} physical rows) + max_tokens ({}) exceeds context window ({})", req.max_tokens, max_seq));
                         }
-                        (gpu.forward_multimodal_chunks(&processed.chunks, state)?, rows)
+                        let logits = gpu.forward_multimodal_chunks(&processed.chunks, state)?;
+                        vision_profile = Some((mtmd_ms, processed.timings));
+                        (logits, rows)
                     }
                     _ => {
                         if prompt.len() + req.max_tokens + 4 > *max_seq {
@@ -1077,6 +1083,8 @@ impl ServerModel {
                         (logits, prompt.len())
                     }
                 };
+                let prefill_ms = prefill_started.elapsed().as_secs_f64() * 1e3;
+                let prefill_logical_pos = state.rope_pos;
                 let vocab = logits.len();
                 let mut counts: Vec<u16> = if sp.frequency_penalty != 0.0
                     || sp.presence_penalty != 0.0 { vec![0u16; vocab] } else { Vec::new() };
@@ -1085,6 +1093,8 @@ impl ServerModel {
                 let mut prev_text_len: usize = 0;
                 let mut full_text = String::new();
                 let mut all_lp: Vec<TokenLogprob> = Vec::new();
+                let decode_started = std::time::Instant::now();
+                let mut first_token_ms = None;
                 for _ in 0..req.max_tokens {
                     if let Some(d) = deadline {
                         if std::time::Instant::now() >= d { break; }
@@ -1093,6 +1103,9 @@ impl ServerModel {
                     let t = res.token;
                     if t == *eos { hit_eos = true; break; }
                     out.push(t);
+                    if first_token_ms.is_none() {
+                        first_token_ms = Some(prefill_started.elapsed().as_secs_f64() * 1e3);
+                    }
                     if !counts.is_empty() { counts[t as usize] = counts[t as usize].saturating_add(1); }
                     // Re-decode the whole output: append-only token streams
                     // mean the previous prefix bytes are stable, so the
@@ -1117,6 +1130,13 @@ impl ServerModel {
                         all_lp.push(t);
                     }
                     logits = gpu.forward_token(t, state)?;
+                }
+                if let Some((mtmd_ms, mtmd)) = vision_profile {
+                    let decode_ms = decode_started.elapsed().as_secs_f64() * 1e3;
+                    info!("vision profile rows={} logical_pos={} decode_image_ms={:.1} tokenize_ms={:.1} projector_ms={:.1} copy_ms={:.1} mtmd_ms={:.1} prefill_ms={:.1} ttft_ms={:.1} decode_ms={:.1} generated={}",
+                        prompt_rows, prefill_logical_pos, mtmd.decode_ms, mtmd.tokenize_ms,
+                        mtmd.encode_ms, mtmd.copy_ms, mtmd_ms, prefill_ms,
+                        first_token_ms.unwrap_or(prefill_ms), decode_ms, out.len());
                 }
                 Ok((full_text, prompt_rows, out.len(), hit_eos, all_lp))
             }

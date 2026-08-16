@@ -64,12 +64,18 @@ below a 90 C junction guard, but the largest screenshot still tripped that
 guard. This is not a correctness failure and must not be hidden by changing
 the model prompt or reducing output quality.
 
-Before changing model behavior, add an explicit per-request timing breakdown:
+Before changing model behavior, add an explicit per-request timing breakdown
+(implemented in bridge ABI v2 and the warm server request log):
 
 1. Image decode/preprocess and projector encoding time.
 2. ReInstinct multimodal prefill time and physical/logical row counts.
 3. Decode time, generated-token count, and time to first generated token.
 4. Peak junction, memory temperature, and package power for the request.
+
+Items 1-3 are implemented. Item 4 remains deliberately external to the server:
+pair each stress request with the guarded ROCm telemetry sampler so a profiler
+cannot silently change fan or power policy and a wedged request can still be
+terminated independently.
 
 Use that data to choose the first optimization. Likely candidates are
 adaptive image resolution/token budgeting and projector-path optimization;

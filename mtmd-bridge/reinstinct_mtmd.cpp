@@ -5,6 +5,7 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <memory>
@@ -54,6 +55,10 @@ struct ri_mtmd_context {
 struct ri_mtmd_result {
     bool uses_mrope = false;
     std::vector<Chunk> chunks;
+    double decode_ms = 0.0;
+    double tokenize_ms = 0.0;
+    double encode_ms = 0.0;
+    double copy_ms = 0.0;
 };
 
 extern "C" uint32_t ri_mtmd_abi_version(void) { return RI_MTMD_ABI_VERSION; }
@@ -115,6 +120,8 @@ extern "C" int ri_mtmd_process(ri_mtmd_context *ctx,
     }
     *out_result = nullptr;
     try {
+        using Clock = std::chrono::steady_clock;
+        const auto decode_started = Clock::now();
         const auto wrapper = mtmd_helper_bitmap_init_from_buf(
             ctx->mtmd, encoded_image, encoded_image_size, false);
         if (!wrapper.bitmap) {
@@ -123,6 +130,7 @@ extern "C" int ri_mtmd_process(ri_mtmd_context *ctx,
         }
         std::unique_ptr<mtmd_bitmap, decltype(&mtmd_bitmap_free)> bitmap(wrapper.bitmap, mtmd_bitmap_free);
         std::unique_ptr<mtmd_helper_video, decltype(&mtmd_helper_video_free)> video(wrapper.video_ctx, mtmd_helper_video_free);
+        const auto decode_finished = Clock::now();
         std::unique_ptr<mtmd_input_chunks, decltype(&mtmd_input_chunks_free)> chunks(
             mtmd_input_chunks_init(), mtmd_input_chunks_free);
         if (!chunks) {
@@ -131,12 +139,16 @@ extern "C" int ri_mtmd_process(ri_mtmd_context *ctx,
         }
         const mtmd_input_text text { formatted_prompt, true, true };
         const mtmd_bitmap *bitmaps[] = { bitmap.get() };
+        const auto tokenize_started = Clock::now();
         if (mtmd_tokenize(ctx->mtmd, chunks.get(), &text, bitmaps, 1) != 0) {
             set_error(error, error_size, "libmtmd tokenization failed; the prompt must contain exactly one media marker");
             return -1;
         }
+        const auto tokenize_finished = Clock::now();
 
         auto result = std::make_unique<ri_mtmd_result>();
+        result->decode_ms = std::chrono::duration<double, std::milli>(decode_finished - decode_started).count();
+        result->tokenize_ms = std::chrono::duration<double, std::milli>(tokenize_finished - tokenize_started).count();
         result->uses_mrope = mtmd_decode_use_mrope(ctx->mtmd);
         const size_t count = mtmd_input_chunks_size(chunks.get());
         result->chunks.reserve(count);
@@ -165,9 +177,12 @@ extern "C" int ri_mtmd_process(ri_mtmd_context *ctx,
                 if (output.non_causal) {
                     set_error(error, error_size, "this projector requests non-causal attention, which ReInstinct does not yet support"); return -1;
                 }
+                const auto encode_started = Clock::now();
                 if (mtmd_encode_chunk(ctx->mtmd, input) != 0) {
                     set_error(error, error_size, "libmtmd vision encode/projector failed"); return -1;
                 }
+                const auto encode_finished = Clock::now();
+                result->encode_ms += std::chrono::duration<double, std::milli>(encode_finished - encode_started).count();
                 size_t floats = 0;
                 if (!checked_product(output.n_tokens, output.embedding_dim, &floats)) {
                     set_error(error, error_size, "image embedding size overflows size_t"); return -1;
@@ -176,6 +191,7 @@ extern "C" int ri_mtmd_process(ri_mtmd_context *ctx,
                 if (floats && !embeddings) {
                     set_error(error, error_size, "libmtmd returned null image embeddings"); return -1;
                 }
+                const auto copy_started = Clock::now();
                 output.embeddings.assign(embeddings, embeddings + floats);
                 if (!std::all_of(output.embeddings.begin(), output.embeddings.end(), [](float v) { return std::isfinite(v); })) {
                     set_error(error, error_size, "libmtmd produced a NaN or infinite image embedding"); return -1;
@@ -191,6 +207,7 @@ extern "C" int ri_mtmd_process(ri_mtmd_context *ctx,
                         output.positions[p] = { pos.t, pos.x, pos.y, pos.z };
                     }
                 }
+                result->copy_ms += std::chrono::duration<double, std::milli>(Clock::now() - copy_started).count();
             } else {
                 set_error(error, error_size, "audio chunks are unsupported by the ReInstinct bridge"); return -1;
             }
@@ -221,3 +238,7 @@ extern "C" size_t ri_mtmd_result_chunk_embedding_dim(const ri_mtmd_result *r, si
 extern "C" const ri_mtmd_decoder_pos *ri_mtmd_result_chunk_positions(const ri_mtmd_result *r, size_t i) { return r && i < r->chunks.size() && !r->chunks[i].positions.empty() ? r->chunks[i].positions.data() : nullptr; }
 extern "C" int ri_mtmd_result_uses_mrope(const ri_mtmd_result *r) { return r && r->uses_mrope; }
 extern "C" int ri_mtmd_result_chunk_uses_non_causal(const ri_mtmd_result *r, size_t i) { return r && i < r->chunks.size() && r->chunks[i].non_causal; }
+extern "C" double ri_mtmd_result_decode_ms(const ri_mtmd_result *r) { return r ? r->decode_ms : 0.0; }
+extern "C" double ri_mtmd_result_tokenize_ms(const ri_mtmd_result *r) { return r ? r->tokenize_ms : 0.0; }
+extern "C" double ri_mtmd_result_encode_ms(const ri_mtmd_result *r) { return r ? r->encode_ms : 0.0; }
+extern "C" double ri_mtmd_result_copy_ms(const ri_mtmd_result *r) { return r ? r->copy_ms : 0.0; }

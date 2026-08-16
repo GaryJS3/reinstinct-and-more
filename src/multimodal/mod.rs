@@ -10,7 +10,7 @@ use std::ptr::NonNull;
 
 use libloading::Library;
 
-const ABI_VERSION: u32 = 1;
+const ABI_VERSION: u32 = 2;
 const ERROR_CAP: usize = 512;
 
 #[repr(C)]
@@ -23,8 +23,20 @@ pub enum Chunk {
     Image { embeddings: Vec<f32>, embedding_dim: usize, positions: Vec<DecoderPos>, n_pos: usize },
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProcessTimings {
+    pub decode_ms: f64,
+    pub tokenize_ms: f64,
+    pub encode_ms: f64,
+    pub copy_ms: f64,
+}
+
 #[derive(Debug, Clone)]
-pub struct ProcessedImage { pub uses_mrope: bool, pub chunks: Vec<Chunk> }
+pub struct ProcessedImage {
+    pub uses_mrope: bool,
+    pub chunks: Vec<Chunk>,
+    pub timings: ProcessTimings,
+}
 
 #[repr(C)]
 struct ContextOpaque { _private: [u8; 0] }
@@ -43,6 +55,7 @@ type Embeddings = unsafe extern "C" fn(*const ResultOpaque, usize) -> *const f32
 type Positions = unsafe extern "C" fn(*const ResultOpaque, usize) -> *const DecoderPos;
 type UsesMrope = unsafe extern "C" fn(*const ResultOpaque) -> c_int;
 type AbiVersion = unsafe extern "C" fn() -> u32;
+type Timing = unsafe extern "C" fn(*const ResultOpaque) -> f64;
 
 /// A serialized bridge context. `libmtmd` reuses output storage per encode,
 /// so callers must hold `&mut self` for every operation.
@@ -61,6 +74,10 @@ pub struct MtmdProcessor {
     chunk_embedding_dim: ChunkSize,
     chunk_positions: Positions,
     result_uses_mrope: UsesMrope,
+    result_decode_ms: Timing,
+    result_tokenize_ms: Timing,
+    result_encode_ms: Timing,
+    result_copy_ms: Timing,
 }
 
 impl MtmdProcessor {
@@ -89,6 +106,10 @@ impl MtmdProcessor {
                 chunk_embedding_dim: *library.get(b"ri_mtmd_result_chunk_embedding_dim\0").map_err(|e| e.to_string())?,
                 chunk_positions: *library.get(b"ri_mtmd_result_chunk_positions\0").map_err(|e| e.to_string())?,
                 result_uses_mrope: *library.get(b"ri_mtmd_result_uses_mrope\0").map_err(|e| e.to_string())?,
+                result_decode_ms: *library.get(b"ri_mtmd_result_decode_ms\0").map_err(|e| e.to_string())?,
+                result_tokenize_ms: *library.get(b"ri_mtmd_result_tokenize_ms\0").map_err(|e| e.to_string())?,
+                result_encode_ms: *library.get(b"ri_mtmd_result_encode_ms\0").map_err(|e| e.to_string())?,
+                result_copy_ms: *library.get(b"ri_mtmd_result_copy_ms\0").map_err(|e| e.to_string())?,
                 _library: library,
                 context,
             })
@@ -144,7 +165,13 @@ impl MtmdProcessor {
                 other => return Err(format!("mtmd bridge returned unknown chunk type {other}")),
             }
         }
-        Ok(ProcessedImage { uses_mrope, chunks })
+        let timings = ProcessTimings {
+            decode_ms: (self.result_decode_ms)(result),
+            tokenize_ms: (self.result_tokenize_ms)(result),
+            encode_ms: (self.result_encode_ms)(result),
+            copy_ms: (self.result_copy_ms)(result),
+        };
+        Ok(ProcessedImage { uses_mrope, chunks, timings })
         }
     }
 }

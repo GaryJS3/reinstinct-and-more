@@ -26,6 +26,10 @@ Last updated: 2026-08-16
   structured-content `image_url` part when the vision options are enabled.
 - `vision-test` runs the bridge and full ReInstinct transformer, prints
   per-stage timing, top first logits, physical/logical state, and greedy text.
+- Bridge ABI v2 splits mtmd processing into image decode, media tokenization,
+  vision/projector execution, and result-copy time. The warm HTTP path logs
+  those fields alongside multimodal prefill, TTFT, decode, physical rows, and
+  logical positions for every image request.
 
 ## Important discovery
 
@@ -87,6 +91,23 @@ vision projector work, multimodal LLM prefill, and generation. They are not
 decode-only throughput. The primary performance gate is the vision/prefill
 phase: a single image expands to hundreds or thousands of prompt rows before
 the 35B language model can emit its first token.
+
+## Bottleneck profiling workflow
+
+Use `vision-test` for a cold, single-image breakdown and an isolated server for
+repeatable warm measurements. The managed Furnace service remains out of scope.
+The server emits one `vision profile` log line per completed image request with:
+
+- `decode_image_ms`, `tokenize_ms`, `projector_ms`, `copy_ms`, and total
+  `mtmd_ms`;
+- `prefill_ms`, physical `rows`, and `logical_pos`;
+- `ttft_ms`, `decode_ms`, and `generated` token count.
+
+Compare identical image bytes, prompt, output cap, vision device, and power cap.
+Discard the first request when comparing steady-state GPU performance. Record
+junction temperature, memory temperature, and package power externally with
+the existing guarded ROCm sampler; hardware telemetry remains host policy and
+is intentionally not collected or controlled by the inference process.
 
 ## Commits
 

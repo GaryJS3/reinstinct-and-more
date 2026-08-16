@@ -13,7 +13,7 @@
 extern "C" {
 #endif
 
-#define RI_MTMD_ABI_VERSION 1u
+#define RI_MTMD_ABI_VERSION 2u
 
 typedef struct ri_mtmd_context ri_mtmd_context;
 typedef struct ri_mtmd_result ri_mtmd_result;
@@ -58,6 +58,10 @@ RI_MTMD_API size_t ri_mtmd_result_chunk_embedding_dim(const ri_mtmd_result *resu
 RI_MTMD_API const ri_mtmd_decoder_pos *ri_mtmd_result_chunk_positions(const ri_mtmd_result *result, size_t index);
 RI_MTMD_API int ri_mtmd_result_uses_mrope(const ri_mtmd_result *result);
 RI_MTMD_API int ri_mtmd_result_chunk_uses_non_causal(const ri_mtmd_result *result, size_t index);
+RI_MTMD_API double ri_mtmd_result_decode_ms(const ri_mtmd_result *result);
+RI_MTMD_API double ri_mtmd_result_tokenize_ms(const ri_mtmd_result *result);
+RI_MTMD_API double ri_mtmd_result_encode_ms(const ri_mtmd_result *result);
+RI_MTMD_API double ri_mtmd_result_copy_ms(const ri_mtmd_result *result);
 
 #ifdef __cplusplus
 }

@@ -520,7 +520,11 @@ fn vision_test_cli(model_path: &std::path::Path, mmproj: &std::path::Path,
     println!("physical KV rows      = {physical_rows}");
     println!("logical positions     = {logical_positions}");
     println!("bridge initialization = {:.3} s", bridge_load.as_secs_f64());
-    println!("vision encode         = {:.3} s", encode_elapsed.as_secs_f64());
+    println!("mtmd total            = {:.3} s", encode_elapsed.as_secs_f64());
+    println!("  image decode        = {:.3} s", processed.timings.decode_ms / 1e3);
+    println!("  media tokenize      = {:.3} s", processed.timings.tokenize_ms / 1e3);
+    println!("  vision/projector    = {:.3} s", processed.timings.encode_ms / 1e3);
+    println!("  result copy         = {:.3} s", processed.timings.copy_ms / 1e3);
 
     let model_started = std::time::Instant::now();
     let cache = KernelCache::new().map_err(anyhow::Error::msg)?;
@@ -563,17 +567,24 @@ fn vision_test_cli(model_path: &std::path::Path, mmproj: &std::path::Path,
         println!("  token {id:>8}  logit {:>9.4}  {:?}", logits[id], tokenizer.decode(&[id as u32]));
     }
 
+    let graph_started = std::time::Instant::now();
     let graph = gpu.capture_forward_graph(&mut state).map_err(anyhow::Error::msg)?;
+    println!("decode graph capture  = {:.3} s", graph_started.elapsed().as_secs_f64());
     let decode_started = std::time::Instant::now();
+    let mut first_token_at = None;
     let mut generated = Vec::with_capacity(steps);
     for _ in 0..steps {
         let token = argmax(&logits);
+        if first_token_at.is_none() { first_token_at = Some(total_started.elapsed()); }
         generated.push(token);
         if token == model.config.eos_token_id { break; }
         logits = gpu.forward_token_via_graph(&graph, token, &mut state)
             .map_err(anyhow::Error::msg)?;
     }
     let decode_elapsed = decode_started.elapsed();
+    if let Some(ttft) = first_token_at {
+        println!("time to first token    = {:.3} s", ttft.as_secs_f64());
+    }
     println!("generated ids          = {generated:?}");
     println!("generated text         = {}", tokenizer.decode(&generated));
     if !generated.is_empty() {

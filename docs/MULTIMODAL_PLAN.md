@@ -54,6 +54,30 @@ The image path is available when a Qwen server is explicitly started with
 for development; production rollout, multi-image input, and remote image
 fetching are separate decisions.
 
+## Next performance and thermal work
+
+End-to-end GPU-vision validation exposed a practical deployment constraint on
+the MI50: large images expand to roughly 2,000 prompt rows and make vision
+encoding plus multimodal prefill dominate request latency and thermals. A
+temporary 100 W hardware cap allowed several representative images to finish
+below a 90 C junction guard, but the largest screenshot still tripped that
+guard. This is not a correctness failure and must not be hidden by changing
+the model prompt or reducing output quality.
+
+Before changing model behavior, add an explicit per-request timing breakdown:
+
+1. Image decode/preprocess and projector encoding time.
+2. ReInstinct multimodal prefill time and physical/logical row counts.
+3. Decode time, generated-token count, and time to first generated token.
+4. Peak junction, memory temperature, and package power for the request.
+
+Use that data to choose the first optimization. Likely candidates are
+adaptive image resolution/token budgeting and projector-path optimization;
+both must preserve the existing single-image OpenAI API contract and be
+compared at matched image inputs and output caps. Keep power-limit tuning as
+host configuration, outside inference code, and retain a thermal guard for
+stress runs.
+
 ## Non-goals for v1
 
 Multiple images, video, audio, remote image fetches, non-causal projectors,

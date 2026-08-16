@@ -1,6 +1,6 @@
 # Multimodal progress
 
-Last updated: 2026-08-15
+Last updated: 2026-08-16
 
 ## Verified on `ai@10.0.0.41`
 
@@ -59,6 +59,34 @@ coherent description; the managed Furnace service was kept stopped throughout.
   declared body larger than the 8 MiB HTTP cap is rejected before reading.
 - Isolated MI50 server smoke: the OpenAI structured JPEG request used 317
   physical prompt rows and generated 16 tokens with HTTP 200.
+
+## Image-workload and thermal validation
+
+The image path was exercised through an isolated ReInstinct server on MI50
+with GPU vision enabled. Every request used the same blind user prompt,
+`Describe this image in detail. Answer directly without explaining your
+reasoning.`, temperature zero, and a 64-token cap. No prompt named the image
+contents.
+
+- The default 178 W cap and a 150 W cap could not safely finish the larger
+  60 x 34 vision-grid images with the 90 C junction guard enabled.
+- A direct write to the MI50 hwmon `power1_cap` set a reversible 100 W cap;
+  this is a host tuning change, not an inference-code change.
+- At 100 W, the large beach image completed in 42.80 s (2,063 prompt / 64
+  completion tokens) and the large surveillance image completed in 41.88 s
+  (2,063 / 64). Their observed junction peaks were 84 C and 87 C.
+- A 943-token beach image completed in 18.82 s. A 2,151-token cookie image
+  completed in 44.31 s and peaked at 89 C. An 823-token property-agreement
+  image completed in 16.23 s.
+- The 2.82 MiB screenshot still reached the 90 C guard at 100 W after
+  45.94 s; the guarded suite stopped before the remaining images. The server
+  was stopped and VRAM released after the guard event.
+
+These timings are end-to-end and therefore include image decode/preprocess,
+vision projector work, multimodal LLM prefill, and generation. They are not
+decode-only throughput. The primary performance gate is the vision/prefill
+phase: a single image expands to hundreds or thousands of prompt rows before
+the 35B language model can emit its first token.
 
 ## Commits
 

@@ -77,6 +77,13 @@ pair each stress request with the guarded ROCm telemetry sampler so a profiler
 cannot silently change fan or power policy and a wedged request can still be
 terminated independently.
 
+The first engine optimization is implemented: projected image embeddings use
+the same batched transformer prefill strategy as text, extended with explicit
+per-row four-plane M-RoPE positions. This removes one full model invocation,
+GPU synchronization, and logits download per image row. The next gate is a
+matched MI50 scalar-versus-batched image run; do not begin resolution-quality
+tradeoffs until that runtime parity and speedup are measured.
+
 Use that data to choose the first optimization. Likely candidates are
 adaptive image resolution/token budgeting and projector-path optimization;
 both must preserve the existing single-image OpenAI API contract and be

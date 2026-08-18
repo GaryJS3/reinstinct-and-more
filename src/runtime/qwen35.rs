@@ -3507,7 +3507,11 @@ impl GpuQwen35 {
                             "text chunk has {} tokens but advances {n_pos} positions",
                             tokens.len()));
                     }
-                    self.forward_tokens(tokens, state)?
+                    if tokens.len() > 1 {
+                        self.forward_tokens_batched(tokens, state)?
+                    } else {
+                        self.forward_tokens(tokens, state)?
+                    }
                 }
                 crate::multimodal::Chunk::Image {
                     embeddings, embedding_dim, positions, n_pos,
@@ -3525,7 +3529,8 @@ impl GpuQwen35 {
                         }
                         self.forward_embeddings(embeddings, state)?
                     } else {
-                        self.forward_embeddings_mrope(embeddings, positions, *n_pos, state)?
+                        self.forward_embeddings_mrope_batched(
+                            embeddings, positions, *n_pos, state)?
                     }
                 }
             };
@@ -3783,6 +3788,35 @@ impl GpuQwen35 {
                           Some(&self.stream), &mut args) }
     }
 
+    fn launch_mrope_batched(&self, x: *mut c_void, n_heads: u32, n_rows: u32,
+                            positions: &DeviceBuf<u32>) -> Result<(), String>
+    {
+        let f = self.rope_batched_module.function("rope_apply_mrope_batched_f32")?;
+        let half = (self.rotary_dim / 2) as u32;
+        let block: u32 = 64;
+        let grid_x = (half + block - 1) / block;
+        let mut xa = x;
+        let mut ca = self.rope_cos.raw_ptr();
+        let mut sa = self.rope_sin.raw_ptr();
+        let mut hd = self.head_dim as u32;
+        let mut rd = self.rotary_dim as u32;
+        let mut nh = n_heads;
+        let mut pp = positions.raw_ptr();
+        let mut sp = self.d_mrope_sections.raw_ptr();
+        let mut args: [*mut c_void; 8] = [
+            &mut xa as *mut _ as *mut c_void,
+            &mut ca as *mut _ as *mut c_void,
+            &mut sa as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut rd as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut sp as *mut _ as *mut c_void,
+        ];
+        unsafe { f.launch((grid_x, n_heads, n_rows), (block, 1, 1), 0,
+                          Some(&self.stream), &mut args) }
+    }
+
     /// Batched causal attention for the qwen full-attention prefill —
     /// the flash-attention kernel (full causal, window 0). BQ=8 queries
     /// per workgroup, BK=8-key LDS tiles; must match the kernel #defines.
@@ -3876,7 +3910,7 @@ impl GpuQwen35 {
             let kind: char;
             match (block, st) {
                 (GpuBlock::Full(w), GpuBlockState::Full(kv)) => {
-                    self.batched_full_block(&ba, &bb, &bnorm, w, kv, n, scaling)?;
+                    self.batched_full_block(&ba, &bb, &bnorm, w, kv, n, scaling, None)?;
                     kind = 'F';
                 }
                 (GpuBlock::Linear(w), GpuBlockState::Linear(s)) => {
@@ -3929,6 +3963,67 @@ impl GpuQwen35 {
         Ok(out)
     }
 
+    /// Batched prefill for projected image embeddings with explicit Qwen
+    /// four-plane M-RoPE positions. Weights are read once per layer for all
+    /// physical rows, and only the final logits are copied back to the host.
+    pub fn forward_embeddings_mrope_batched(
+        &self,
+        embeddings: &[f32],
+        positions: &[crate::multimodal::DecoderPos],
+        n_pos: usize,
+        state: &mut Qwen35GpuState,
+    ) -> Result<Vec<f32>, String> {
+        if embeddings.is_empty() || embeddings.len() % self.hidden != 0 {
+            return Err(format!(
+                "external embeddings must contain a non-zero whole number of {}-float rows",
+                self.hidden));
+        }
+        let n = embeddings.len() / self.hidden;
+        if positions.len() != n {
+            return Err(format!(
+                "M-RoPE positions ({}) do not match embedding rows ({n})",
+                positions.len()));
+        }
+        if state.kv_pos + n > self.max_seq {
+            return Err(format!(
+                "image prefill needs {n} KV rows at {}, exceeding max sequence {}",
+                state.kv_pos, self.max_seq));
+        }
+
+        let h = self.hidden;
+        let scaling = (self.head_dim as f32).powf(-0.5);
+        let ba = self.pool_f32.take(n * h)?;
+        let bb = self.pool_f32.take(n * h)?;
+        let bnorm = self.pool_f32.take(n * h)?;
+        ba.copy_from_host(embeddings)?;
+        let flat_positions: &[u32] = bytemuck::cast_slice(positions);
+        let device_positions = DeviceBuf::from_slice(flat_positions)?;
+
+        for (block, st) in self.blocks.iter().zip(state.block_states.iter_mut()) {
+            match (block, st) {
+                (GpuBlock::Full(w), GpuBlockState::Full(kv)) =>
+                    self.batched_full_block(
+                        &ba, &bb, &bnorm, w, kv, n, scaling, Some(&device_positions))?,
+                (GpuBlock::Linear(w), GpuBlockState::Linear(s)) =>
+                    self.batched_linear_block(&ba, &bb, &bnorm, w, s, n)?,
+                _ => return Err("block kind mismatch".into()),
+            }
+        }
+
+        let last_in = unsafe { (ba.raw_ptr() as *mut f32).add((n - 1) * h) } as *mut c_void;
+        self.launch_rmsnorm(last_in, self.output_norm.raw_ptr(),
+                            self.hidden_b.raw_ptr(), h as u32, self.rms_eps)?;
+        self.launch_matvec_dispatch(self.output_proj_tensor(),
+                                    self.hidden_b.raw_ptr(), self.logits.raw_ptr())?;
+        self.stream.synchronize()?;
+        state.kv_pos += n;
+        state.rope_pos = state.rope_pos.checked_add(n_pos)
+            .ok_or("logical M-RoPE position overflow")?;
+        let mut out = vec![0.0f32; self.vocab];
+        self.logits.copy_to_host(&mut out)?;
+        Ok(out)
+    }
+
     /// QMTP-2 — K-token verify forward. Runs `tokens` through the main
     /// model in one batched pass (the same block kernels as
     /// `forward_tokens_batched`) but projects EVERY row, returning the
@@ -3961,7 +4056,7 @@ impl GpuQwen35 {
         for (block, st) in self.blocks.iter().zip(state.block_states.iter_mut()) {
             match (block, st) {
                 (GpuBlock::Full(w), GpuBlockState::Full(kv)) =>
-                    self.batched_full_block(&ba, &bb, &bnorm, w, kv, n, scaling)?,
+                    self.batched_full_block(&ba, &bb, &bnorm, w, kv, n, scaling, None)?,
                 (GpuBlock::Linear(w), GpuBlockState::Linear(s)) =>
                     self.batched_linear_block(&ba, &bb, &bnorm, w, s, n)?,
                 _ => return Err("block kind mismatch".into()),
@@ -3998,7 +4093,8 @@ impl GpuQwen35 {
     /// running hidden (mutated in place); `bb` / `bnorm` are scratch.
     fn batched_full_block(&self, ba: &DeviceBuf<f32>, bb: &DeviceBuf<f32>,
                           bnorm: &DeviceBuf<f32>, w: &GpuFullAttnBlock,
-                          kv: &mut GpuKvCache, n: usize, scaling: f32)
+                          kv: &mut GpuKvCache, n: usize, scaling: f32,
+                          mrope_positions: Option<&DeviceBuf<u32>>)
         -> Result<(), String>
     {
         let h = self.hidden;
@@ -4030,14 +4126,22 @@ impl GpuQwen35 {
                                       q_buf.raw_ptr(),
                                       (n * self.n_heads) as u32, self.head_dim as u32,
                                       self.rms_eps)?;
-        self.launch_rope_batched(q_buf.raw_ptr(), self.n_heads as u32, n as u32, base_pos as u32)?;
+        if let Some(positions) = mrope_positions {
+            self.launch_mrope_batched(q_buf.raw_ptr(), self.n_heads as u32, n as u32, positions)?;
+        } else {
+            self.launch_rope_batched(q_buf.raw_ptr(), self.n_heads as u32, n as u32, base_pos as u32)?;
+        }
         // per-kv-head K-norm.
         let k_norm = self.pool_f32.take(n * kv_dim)?;
         self.launch_rmsnorm_multihead(k_raw.raw_ptr(), w.attn.attn_k_norm.raw_ptr(),
                                       k_norm.raw_ptr(),
                                       (n * self.n_kv_heads) as u32, self.head_dim as u32,
                                       self.rms_eps)?;
-        self.launch_rope_batched(k_norm.raw_ptr(), self.n_kv_heads as u32, n as u32, base_pos as u32)?;
+        if let Some(positions) = mrope_positions {
+            self.launch_mrope_batched(k_norm.raw_ptr(), self.n_kv_heads as u32, n as u32, positions)?;
+        } else {
+            self.launch_rope_batched(k_norm.raw_ptr(), self.n_kv_heads as u32, n as u32, base_pos as u32)?;
+        }
 
         // Push all N (k, v) into the cache at slots [base_pos, base_pos+n).
         kv.k.copy_from_device_at_async(&k_norm, base_pos * kv_dim, &self.stream)?;
@@ -4685,11 +4789,17 @@ mod tests {
         let mrope_logits = gpu.forward_embeddings_mrope(
             &embeddings, &positions, logical_advance, &mut mrope_state,
         ).expect("broadcast M-RoPE external prefill");
+        let mut mrope_batched_state = Qwen35GpuState::new(&m.model, 32).unwrap();
+        let mrope_batched_logits = gpu.forward_embeddings_mrope_batched(
+            &embeddings, &positions, logical_advance, &mut mrope_batched_state,
+        ).expect("batched broadcast M-RoPE external prefill");
 
         assert_eq!(token_state.kv_pos, external_state.kv_pos);
         assert_eq!(token_state.rope_pos, external_state.rope_pos);
         assert_eq!(token_state.kv_pos, mrope_state.kv_pos);
         assert_eq!(mrope_state.rope_pos, logical_advance);
+        assert_eq!(mrope_batched_state.kv_pos, prompt.len());
+        assert_eq!(mrope_batched_state.rope_pos, logical_advance);
         assert_eq!(token_logits.len(), external_logits.len());
         for (i, (&a, &b)) in token_logits.iter().zip(&external_logits).enumerate() {
             assert!((a - b).abs() <= 1.0e-5, "logit {i}: token={a} external={b}");
@@ -4697,6 +4807,19 @@ mod tests {
         for (i, (&a, &b)) in token_logits.iter().zip(&mrope_logits).enumerate() {
             assert!((a - b).abs() <= 1.0e-5, "logit {i}: token={a} mrope={b}");
         }
+        let top = |logits: &[f32], n: usize| {
+            let mut indices: Vec<usize> = (0..logits.len()).collect();
+            indices.sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]));
+            indices.truncate(n);
+            indices
+        };
+        let scalar_top = top(&mrope_logits, 5);
+        let batched_top = top(&mrope_batched_logits, 5);
+        let overlap = batched_top.iter().filter(|i| scalar_top.contains(i)).count();
+        assert_eq!(scalar_top[0], batched_top[0],
+            "batched M-RoPE changed argmax: scalar={} batched={}",
+            scalar_top[0], batched_top[0]);
+        assert!(overlap >= 4, "batched M-RoPE top-5 overlap {overlap}/5");
     }
 
     #[test]

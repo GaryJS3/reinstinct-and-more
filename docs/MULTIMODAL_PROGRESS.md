@@ -109,6 +109,22 @@ junction temperature, memory temperature, and package power externally with
 the existing guarded ROCm sampler; hardware telemetry remains host policy and
 is intentionally not collected or controlled by the inference process.
 
+## Batched multimodal prefill
+
+The scalar compatibility path was identified as the dominant first-token
+bottleneck: it evaluated every projected image row as a separate decode step,
+synchronized the GPU, and downloaded logits for every row. The optimized path
+now sends all projected rows through ReInstinct's batched prefill machinery,
+using an explicit batched four-plane M-RoPE kernel. It also batches the text
+chunks surrounding the image and downloads logits only after each complete
+chunk.
+
+The new gfx906 M-RoPE batch kernel passes an exact CPU oracle. Full 35B image
+latency and greedy-output parity still require a matched MI50 run; the first
+attempt was blocked before model load because the `/mnt/ai-models` NFS mount
+stopped responding. Keep the scalar implementation as a correctness reference
+until that end-to-end comparison is recorded.
+
 ## Commits
 
 `a8cb383`, `2aad59a`, `ecb5cdd`, `4f02753`, `3137ee8`, `ffe6e07`, and

@@ -132,6 +132,27 @@ turquoise water, though fp16 batched-prefill drift changed the exact wording
 from the scalar reference. Peak junction temperature was 59 C under the 88 C
 guard, and the isolated server released VRAM after the run.
 
+## Projector precision and token budgets
+
+Bridge ABI v3 now passes dynamic image-token minimum/maximum limits into
+libmtmd. Diagnostics and the HTTP server expose explicit CLI options that
+default to projector metadata, preserving existing behavior.
+
+On the 943-row beach fixture, the matching Qwen3.6 35B BF16 projector reduced
+projector time from 3.778 s to 1.611 s and end-to-end time from 7.048 s to
+4.977 s. The coherent output kept identical image positions. `rocprof`
+identified F32 GEMM as 89% of projector GPU time; BF16 reduced captured GEMM
+time from 3.309 s to 0.941 s while vision FlashAttention stayed near 0.330 s.
+
+F32 tests at default / 768 / 512 / 384 maximum image tokens produced 920 /
+720 / 480 / 364 embeddings in 3.874 / 2.997 / 1.981 / 1.497 seconds. Caps
+therefore provide predictable latency control with an explicit quality tradeoff.
+
+The added server fan improved single-request thermals and the batched large
+suite completed at 100 W. A guarded back-to-back repeat still reached the 88 C
+internal junction cutoff, so the 125 W comparison was canceled. Large requests
+continue to require cooldown and active monitoring.
+
 ## Commits
 
 `a8cb383`, `2aad59a`, `ecb5cdd`, `4f02753`, `3137ee8`, `ffe6e07`, and

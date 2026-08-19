@@ -164,6 +164,8 @@ enum Command {
         /// installations never need llama.cpp at runtime.
         #[arg(long)] bridge: PathBuf,
         #[arg(long, default_value_t = 8)] threads: i32,
+        #[arg(long, default_value_t = -1)] image_min_tokens: i32,
+        #[arg(long, default_value_t = -1)] image_max_tokens: i32,
         #[arg(long)] cpu_vision: bool,
     },
     /// Run one image through libmtmd and the full ReInstinct Qwen
@@ -177,6 +179,8 @@ enum Command {
         #[arg(long)] bridge: PathBuf,
         #[arg(short = 'n', long, default_value_t = 16)] steps: usize,
         #[arg(long, default_value_t = 8)] threads: i32,
+        #[arg(long, default_value_t = -1)] image_min_tokens: i32,
+        #[arg(long, default_value_t = -1)] image_max_tokens: i32,
         #[arg(long)] cpu_vision: bool,
     },
     /// Run forward N times, report per-stage timing breakdown.
@@ -243,6 +247,12 @@ enum Command {
         mtmd_bridge: Option<PathBuf>,
         #[arg(long, default_value_t = 8)]
         vision_threads: i32,
+        /// Dynamic-resolution image token minimum; -1 uses projector metadata.
+        #[arg(long, default_value_t = -1)]
+        vision_min_tokens: i32,
+        /// Dynamic-resolution image token maximum; -1 uses projector metadata.
+        #[arg(long, default_value_t = -1)]
+        vision_max_tokens: i32,
         /// Run the mtmd vision encoder on CPU instead of the HIP device.
         #[arg(long)]
         cpu_vision: bool,
@@ -377,20 +387,21 @@ fn main() -> anyhow::Result<()> {
         Command::Model { path } => model(&path),
         Command::Generate { path, token, tokens, k, gpu } => generate(&path, token, tokens, k, gpu),
         Command::DebugEmbed { path, tokens } => debug_embed(&path, &tokens),
-        Command::MtmdTest { model, mmproj, image, prompt, bridge, threads, cpu_vision } =>
-            mtmd_test_cli(&model, &mmproj, &image, &prompt, &bridge, threads, !cpu_vision),
-        Command::VisionTest { model, mmproj, image, prompt, bridge, steps, threads, cpu_vision } =>
+        Command::MtmdTest { model, mmproj, image, prompt, bridge, threads, image_min_tokens, image_max_tokens, cpu_vision } =>
+            mtmd_test_cli(&model, &mmproj, &image, &prompt, &bridge, threads,
+                          image_min_tokens, image_max_tokens, !cpu_vision),
+        Command::VisionTest { model, mmproj, image, prompt, bridge, steps, threads, image_min_tokens, image_max_tokens, cpu_vision } =>
             vision_test_cli(&model, &mmproj, &image, &prompt, &bridge,
-                            steps, threads, !cpu_vision),
+                            steps, threads, image_min_tokens, image_max_tokens, !cpu_vision),
         Command::Bench { path, iters, token } => bench(&path, iters, token),
         Command::HipInfo { mb, iters } => hip_info(mb, iters),
         Command::GpuBench { path, iters, token } => gpu_bench(&path, iters, token),
         Command::Serve { big, big_drafter, small, embed,
                          big_port, small_port, embed_port, max_seq,
-                         mmproj, mtmd_bridge, vision_threads, cpu_vision } =>
+                         mmproj, mtmd_bridge, vision_threads, vision_min_tokens, vision_max_tokens, cpu_vision } =>
             reinstinct_engine::serve::run(big, big_drafter, small, embed,
                                           big_port, small_port, embed_port, max_seq,
-                                          mmproj, mtmd_bridge, vision_threads, !cpu_vision)
+                                          mmproj, mtmd_bridge, vision_threads, vision_min_tokens, vision_max_tokens, !cpu_vision)
                 .map_err(anyhow::Error::msg),
         Command::GenerateText { path, prompt, system, user, tokens, steps,
                                 temperature, top_k, seed, gpu } =>
@@ -424,7 +435,8 @@ fn main() -> anyhow::Result<()> {
 /// without dumping multi-megabyte embedding arrays.
 fn mtmd_test_cli(model: &std::path::Path, mmproj: &std::path::Path,
                  image: &std::path::Path, prompt: &str,
-                 bridge: &std::path::Path, threads: i32, use_gpu: bool)
+                 bridge: &std::path::Path, threads: i32,
+                 image_min_tokens: i32, image_max_tokens: i32, use_gpu: bool)
     -> anyhow::Result<()>
 {
     use reinstinct_engine::multimodal::{Chunk, MtmdProcessor};
@@ -438,7 +450,8 @@ fn mtmd_test_cli(model: &std::path::Path, mmproj: &std::path::Path,
     let gguf = GgufFile::open(model).map_err(|e| anyhow::anyhow!("open {}: {e}", model.display()))?;
     let qwen = Qwen35Model::load(&gguf).map_err(anyhow::Error::msg)?;
     let mut processor = MtmdProcessor::load(bridge, model, mmproj,
-                                             qwen.config.hidden_size as usize, use_gpu, threads)
+                                             qwen.config.hidden_size as usize, use_gpu, threads,
+                                             image_min_tokens, image_max_tokens)
         .map_err(anyhow::Error::msg)?;
     let loaded = started.elapsed();
     let processed = processor.process(&formatted, &image_bytes).map_err(anyhow::Error::msg)?;
@@ -469,7 +482,8 @@ fn mtmd_test_cli(model: &std::path::Path, mmproj: &std::path::Path,
 fn vision_test_cli(model_path: &std::path::Path, mmproj: &std::path::Path,
                    image: &std::path::Path, prompt: &str,
                    bridge: &std::path::Path, steps: usize,
-                   threads: i32, use_gpu_vision: bool) -> anyhow::Result<()>
+                   threads: i32, image_min_tokens: i32, image_max_tokens: i32,
+                   use_gpu_vision: bool) -> anyhow::Result<()>
 {
     use reinstinct_engine::hip;
     use reinstinct_engine::multimodal::{Chunk, MtmdProcessor};
@@ -495,7 +509,7 @@ fn vision_test_cli(model_path: &std::path::Path, mmproj: &std::path::Path,
     let bridge_started = std::time::Instant::now();
     let mut processor = MtmdProcessor::load(
         bridge, model_path, mmproj, model.config.hidden_size as usize,
-        use_gpu_vision, threads,
+        use_gpu_vision, threads, image_min_tokens, image_max_tokens,
     ).map_err(anyhow::Error::msg)?;
     let bridge_load = bridge_started.elapsed();
     let encode_started = std::time::Instant::now();

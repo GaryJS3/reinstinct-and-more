@@ -62,6 +62,49 @@ For the optimized 7.013-second request:
 The projector is now the dominant bottleneck. The engine-side image prefill is
 no longer the first optimization target.
 
+### BF16 projector result
+
+The matching `mmproj-Qwen3.6-35B-A3B-BF16.gguf` preserves the 920 image
+embeddings / 943 total prompt rows and 40 image positions. At 100 W:
+
+| Metric | F32 projector | BF16 projector | Change |
+|---|---:|---:|---:|
+| Projector | 3.778 s | 1.611 s | **2.35x** |
+| mtmd total | 3.846 s | 1.714 s | **2.24x** |
+| ReInstinct LLM prefill | 1.867 s | 1.834 s | same work |
+| TTFT | 5.719 s | 3.561 s | **1.61x** |
+| Decode, 64 tokens | 1.315 s | 1.403 s | load dependent |
+| Full request | 7.048 s | 4.977 s | **1.42x** |
+| End-to-end completion rate | 9.1 tok/s | 12.9 tok/s | **1.42x** |
+
+The BF16 result remained coherent, describing the same woman on a rope swing
+over turquoise water. Its embedding hash differs from F32, as expected for a
+precision change; its position hash is identical. Peak junction was 63 C.
+
+### Dynamic image-token budget
+
+Bridge ABI v3 exposes libmtmd's dynamic-resolution limits through
+`--image-min-tokens` / `--image-max-tokens` on diagnostics and
+`--vision-min-tokens` / `--vision-max-tokens` on the server:
+
+| Maximum | Image embeddings | Logical positions | Decode/tokenize/encode | Change |
+|---:|---:|---:|---:|---:|
+| model default | 920 | 40 | 3.874 s | baseline |
+| 768 | 720 | 36 | 2.997 s | 1.29x |
+| 512 | 480 | 30 | 1.981 s | 1.96x |
+| 384 | 364 | 26 | 1.497 s | 2.59x |
+
+Scaling is close to linear. Caps reduce both projector execution and following
+LLM prefill, but remain an explicit quality/latency tradeoff.
+
+### HIP profile
+
+An F32 `rocprof --stats` capture attributed 89.0% of GPU kernel time to 112
+F32 GEMMs and 8.9% to 27 vision FlashAttention kernels. Every other kernel
+family was below 1%. With BF16, GEMM fell from 3.309 s to 0.941 s of captured
+kernel time while FlashAttention stayed near 0.330 s. Projector precision and
+GEMM throughput—not copies, graph setup, or preprocessing—are the primary target.
+
 ## Historical image results
 
 These rows are useful trend data but are not all matched comparisons.
@@ -76,16 +119,22 @@ These rows are useful trend data but are not all matched comparisons.
 | cookie pizza | GPU | 2,151 | 64 | 44.31 s | 1.44 tok/s | 100 W, 89 C peak |
 | property agreement | GPU | 823 | 64 | 16.23 s | 3.94 tok/s | 100 W |
 | screenshot | GPU | not completed | 64 cap | stopped at 45.94 s | n/a | 100 W, 90 C guard |
+| beach-pic-1, batched | GPU | 2,063 | 64 | 14.87 s | 4.3 tok/s | 100 W, new fan |
+| driveway surveillance, batched | GPU | 4,103 | 64 | 34.03 s | 1.9 tok/s | 100 W, new fan |
+| cookie pizza, batched | GPU | 2,151 | 64 | 15.78 s | 4.1 tok/s | 100 W, new fan |
+| property agreement, batched | GPU | 823 | 64 | 6.15 s | 10.4 tok/s | 100 W, new fan |
+| screenshot, batched | GPU | 2,737 | 64 | 20.61 s | 3.1 tok/s | 100 W, new fan |
 
-The large-image rows predate batched image prefill and should be rerun before
-using them to predict current latency.
+The new fan allowed the guarded suite to complete once, but a telemetry-verified
+repeat reached the 88 C internal cutoff (76 C memory) at 100 W. Do not run
+sustained back-to-back large requests or raise the power cap. Cool down and
+retain the per-request guard even with the additional airflow.
 
 ## Bottleneck queue
 
-1. **Vision/projector execution — 3.743 s.** Investigate libmtmd/ggml HIP
-   profiling and image-token limits. An image-token cap can reduce both
-   projector and LLM work, but it is an observable quality tradeoff and must
-   be compared against identical uncapped images.
+1. **Vision/projector execution — 1.611 s with BF16.** Make the matching BF16
+   projector the preferred artifact after broader correctness coverage.
+   FlashAttention is now the largest remaining non-GEMM projector family.
 2. **Batched LLM prefill — 1.855 s for 943 rows.** Already improved 7.17x.
    Track milliseconds per physical row (~1.97 ms/row) across image sizes to
    identify nonlinear attention or allocation costs.

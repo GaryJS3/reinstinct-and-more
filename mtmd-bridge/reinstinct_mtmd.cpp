@@ -68,9 +68,13 @@ extern "C" ri_mtmd_context *ri_mtmd_create(const char *model_path,
                                               size_t embedding_dim,
                                               int use_gpu,
                                               int threads,
+                                              int image_min_tokens,
+                                              int image_max_tokens,
                                               char *error,
                                               size_t error_size) {
-    if (!model_path || !mmproj_path || embedding_dim == 0 || threads < 1) {
+    if (!model_path || !mmproj_path || embedding_dim == 0 || threads < 1 ||
+        image_min_tokens == 0 || image_max_tokens == 0 ||
+        (image_min_tokens > 0 && image_max_tokens > 0 && image_min_tokens > image_max_tokens)) {
         set_error(error, error_size, "model path, mmproj path, positive embedding dimension, and positive thread count are required");
         return nullptr;
     }
@@ -91,6 +95,8 @@ extern "C" ri_mtmd_context *ri_mtmd_create(const char *model_path,
         params.use_gpu = use_gpu != 0;
         params.n_threads = threads;
         params.print_timings = false;
+        params.image_min_tokens = image_min_tokens;
+        params.image_max_tokens = image_max_tokens;
         result->mtmd = mtmd_init_from_file(mmproj_path, result->model, params);
         if (!result->mtmd || !mtmd_support_vision(result->mtmd)) {
             set_error(error, error_size, "mmproj does not initialize vision support for this GGUF");

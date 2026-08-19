@@ -800,6 +800,8 @@ struct VisionConfig {
     mmproj: PathBuf,
     bridge: PathBuf,
     threads: i32,
+    image_min_tokens: i32,
+    image_max_tokens: i32,
     use_gpu: bool,
 }
 
@@ -979,7 +981,7 @@ impl ServerModel {
                     info!("loading mtmd bridge {} ...", v.bridge.display());
                     Some(crate::multimodal::MtmdProcessor::load(
                         &v.bridge, path, &v.mmproj, model.config.hidden_size as usize,
-                        v.use_gpu, v.threads,
+                        v.use_gpu, v.threads, v.image_min_tokens, v.image_max_tokens,
                     )?)
                 }
                 None => None,
@@ -1800,17 +1802,21 @@ pub fn run(big: PathBuf, big_drafter: Option<PathBuf>,
            small: Option<PathBuf>, embed: Option<PathBuf>,
            big_port: u16, small_port: u16, embed_port: u16, max_seq: usize,
            mmproj: Option<PathBuf>, mtmd_bridge: Option<PathBuf>, vision_threads: i32,
+           vision_min_tokens: i32, vision_max_tokens: i32,
            vision_use_gpu: bool)
     -> Result<(), String>
 {
     let vision = match (mmproj, mtmd_bridge) {
         (None, None) => None,
-        (Some(mmproj), Some(bridge)) if vision_threads > 0 => Some(VisionConfig {
-            mmproj, bridge, threads: vision_threads, use_gpu: vision_use_gpu,
+        (Some(mmproj), Some(bridge)) if vision_threads > 0 &&
+            vision_min_tokens != 0 && vision_max_tokens != 0 &&
+            !(vision_min_tokens > 0 && vision_max_tokens > 0 && vision_min_tokens > vision_max_tokens) => Some(VisionConfig {
+            mmproj, bridge, threads: vision_threads, image_min_tokens: vision_min_tokens,
+            image_max_tokens: vision_max_tokens, use_gpu: vision_use_gpu,
         }),
         (Some(_), None) | (None, Some(_)) => return Err(
             "server vision requires both --mmproj PATH and --mtmd-bridge PATH".into()),
-        (_, _) => return Err("--vision-threads must be positive".into()),
+        (_, _) => return Err("vision threads must be positive and token limits must be -1 or positive with minimum <= maximum".into()),
     };
     // Surface any REINSTINCT_* env vars at startup. Several of them are
     // perf-killers if set unintentionally on a serve box (graph capture

@@ -13,7 +13,7 @@
 extern "C" {
 #endif
 
-#define RI_MTMD_ABI_VERSION 2u
+#define RI_MTMD_ABI_VERSION 3u
 
 typedef struct ri_mtmd_context ri_mtmd_context;
 typedef struct ri_mtmd_result ri_mtmd_result;
@@ -36,6 +36,8 @@ RI_MTMD_API ri_mtmd_context *ri_mtmd_create(const char *model_path,
                                              size_t embedding_dim,
                                              int use_gpu,
                                              int threads,
+                                             int image_min_tokens,
+                                             int image_max_tokens,
                                              char *error,
                                              size_t error_size);
 RI_MTMD_API void ri_mtmd_destroy(ri_mtmd_context *ctx);

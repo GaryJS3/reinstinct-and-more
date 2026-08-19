@@ -10,7 +10,7 @@ use std::ptr::NonNull;
 
 use libloading::Library;
 
-const ABI_VERSION: u32 = 2;
+const ABI_VERSION: u32 = 3;
 const ERROR_CAP: usize = 512;
 
 #[repr(C)]
@@ -43,7 +43,7 @@ struct ContextOpaque { _private: [u8; 0] }
 #[repr(C)]
 struct ResultOpaque { _private: [u8; 0] }
 
-type Create = unsafe extern "C" fn(*const c_char, *const c_char, usize, c_int, c_int, *mut c_char, usize) -> *mut ContextOpaque;
+type Create = unsafe extern "C" fn(*const c_char, *const c_char, usize, c_int, c_int, c_int, c_int, *mut c_char, usize) -> *mut ContextOpaque;
 type Destroy = unsafe extern "C" fn(*mut ContextOpaque);
 type Process = unsafe extern "C" fn(*mut ContextOpaque, *const c_char, *const u8, usize, *mut *mut ResultOpaque, *mut c_char, usize) -> c_int;
 type ResultDestroy = unsafe extern "C" fn(*mut ResultOpaque);
@@ -81,8 +81,12 @@ pub struct MtmdProcessor {
 }
 
 impl MtmdProcessor {
-    pub fn load(library_path: &Path, model: &Path, mmproj: &Path, embedding_dim: usize, use_gpu: bool, threads: i32) -> Result<Self, String> {
+    pub fn load(library_path: &Path, model: &Path, mmproj: &Path, embedding_dim: usize, use_gpu: bool, threads: i32, image_min_tokens: i32, image_max_tokens: i32) -> Result<Self, String> {
         if embedding_dim == 0 || threads < 1 { return Err("mtmd embedding dimension and thread count must be positive".into()); }
+        if image_min_tokens == 0 || image_max_tokens == 0 ||
+            (image_min_tokens > 0 && image_max_tokens > 0 && image_min_tokens > image_max_tokens) {
+            return Err("image token limits must be -1 (model default) or positive, with minimum <= maximum".into());
+        }
         let library = unsafe { Library::new(library_path) }.map_err(|e| format!("load mtmd bridge: {e}"))?;
         unsafe {
             let abi: AbiVersion = *library.get(b"ri_mtmd_abi_version\0").map_err(|e| e.to_string())?;
@@ -91,7 +95,7 @@ impl MtmdProcessor {
             let model = path_cstring(model)?;
             let mmproj = path_cstring(mmproj)?;
             let mut error = [0 as c_char; ERROR_CAP];
-            let raw = create(model.as_ptr(), mmproj.as_ptr(), embedding_dim, if use_gpu { 1 } else { 0 }, threads, error.as_mut_ptr(), error.len());
+            let raw = create(model.as_ptr(), mmproj.as_ptr(), embedding_dim, if use_gpu { 1 } else { 0 }, threads, image_min_tokens, image_max_tokens, error.as_mut_ptr(), error.len());
             let context = NonNull::new(raw).ok_or_else(|| bridge_error("create mtmd context", &error))?;
             Ok(Self {
                 destroy: *library.get(b"ri_mtmd_destroy\0").map_err(|e| e.to_string())?,
@@ -187,4 +191,30 @@ fn path_cstring(path: &Path) -> Result<CString, String> {
 fn bridge_error(operation: &str, error: &[c_char]) -> String {
     let message = unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy();
     if message.is_empty() { format!("mtmd bridge failed to {operation}") } else { format!("mtmd bridge failed to {operation}: {message}") }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MtmdProcessor;
+    use std::path::Path;
+
+    #[test]
+    fn rejects_zero_image_token_limit_before_loading_library() {
+        let err = match MtmdProcessor::load(Path::new("missing"), Path::new("model"),
+            Path::new("projector"), 2048, true, 8, -1, 0) {
+            Ok(_) => panic!("zero token limit should be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.contains("token limits"));
+    }
+
+    #[test]
+    fn rejects_reversed_image_token_range_before_loading_library() {
+        let err = match MtmdProcessor::load(Path::new("missing"), Path::new("model"),
+            Path::new("projector"), 2048, true, 8, 768, 512) {
+            Ok(_) => panic!("reversed token range should be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.contains("minimum <= maximum"));
+    }
 }

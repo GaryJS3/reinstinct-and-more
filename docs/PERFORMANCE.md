@@ -105,6 +105,40 @@ family was below 1%. With BF16, GEMM fell from 3.309 s to 0.941 s of captured
 kernel time while FlashAttention stayed near 0.330 s. Projector precision and
 GEMM throughput—not copies, graph setup, or preprocessing—are the primary target.
 
+### Matched Furnace comparison
+
+Furnace revision `5013b9f` and ReInstinct used the same MI50, 100 W cap,
+Qwen3.6 35B model, image bytes, prompt, temperature zero, 64-token output cap,
+GPU projector, and eight vision threads. Furnace ran as an isolated one-slot
+server with FlashAttention enabled; its managed service remained inactive.
+Furnace counts four additional prompt bookkeeping tokens, while both engines
+receive the same number of image embeddings.
+
+| Projector / image cap | Furnace prompt | Furnace total | ReInstinct TTFT | ReInstinct total | Faster total |
+|---|---:|---:|---:|---:|---:|
+| F32 / default | 5.223 s | 6.413 s | 5.719 s | 7.048 s | Furnace 9.0% |
+| BF16 / default | 2.965 s | 4.142 s | 3.561 s | 4.977 s | Furnace 16.8% |
+| BF16 / 768 | 2.368 s | 3.588 s | 2.748 s | 4.170 s | Furnace 14.0% |
+| BF16 / 512 | 1.717 s | 2.951 s | 1.860 s | 3.146 s | Furnace 6.2% |
+| BF16 / 384 | 1.397 s | 2.586 s | 1.508 s | 2.792 s | Furnace 7.4% |
+
+The BF16 projector itself is effectively tied at the default resolution:
+Furnace reports 1.566 s and ReInstinct 1.611 s. Furnace wins in the subsequent
+multimodal LLM prefill and usually in decode (about 54.4 versus 45.6 tok/s in
+the default BF16 repetition). ReInstinct closes most of the gap at 512--384
+image tokens but is not yet faster end to end for this image workload.
+
+Selected matched F32 large-image results show the gap grows again with rows:
+
+| Workload | Image rows | Furnace total | ReInstinct total | Faster total | Furnace peak junction |
+|---|---:|---:|---:|---:|---:|
+| beach-pic-1 | 2,040 | 13.339 s | 14.869 s | Furnace 10.3% | 63 C |
+| driveway surveillance | 4,080 | 28.475 s | 34.026 s | Furnace 16.3% | 71 C |
+| screenshot | 2,714 | 17.982 s | 20.609 s | Furnace 12.7% | 73 C |
+
+Rows in this table exclude each engine's surrounding text tokens. Requests
+were separated by cooldown and all descriptions remained coherent.
+
 ## Historical image results
 
 These rows are useful trend data but are not all matched comparisons.
@@ -132,15 +166,17 @@ retain the per-request guard even with the additional airflow.
 
 ## Bottleneck queue
 
-1. **Vision/projector execution — 1.611 s with BF16.** Make the matching BF16
+1. **Batched LLM prefill — 1.834 s after BF16 projection for 920 image rows.**
+   Furnace spends roughly 1.399 s after its effectively tied projector. Profile
+   ReInstinct's attention, MoE, and chunk/allocation behavior against Furnace;
+   this is now the primary cross-engine gap.
+2. **Decode — 1.403 s for 64 tokens (~45.6 tok/s) in the matched BF16 run.**
+   Furnace reached 54.4 tok/s. Recheck warm repetitions and graph state, then
+   compare against the established text-only decode benchmark.
+3. **Vision/projector execution — 1.611 s with BF16.** Make the matching BF16
    projector the preferred artifact after broader correctness coverage.
-   FlashAttention is now the largest remaining non-GEMM projector family.
-2. **Batched LLM prefill — 1.855 s for 943 rows.** Already improved 7.17x.
-   Track milliseconds per physical row (~1.97 ms/row) across image sizes to
-   identify nonlinear attention or allocation costs.
-3. **Decode — 1.329 s for 64 tokens (~48.2 decode tok/s).** This is no longer
-   on the TTFT critical path; optimize only after projector work unless the
-   workload shifts toward long outputs.
+   Furnace's 1.566 s is effectively tied; FlashAttention is the remaining
+   shared non-GEMM projector target rather than a ReInstinct-specific gap.
 4. **Cold model startup.** Multi-minute GGUF/NFS load time is excluded from
    request measurements. Keep the production model resident; report startup
    separately when deployment behavior is under test.

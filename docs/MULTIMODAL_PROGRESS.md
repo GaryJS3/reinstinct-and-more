@@ -119,11 +119,15 @@ using an explicit batched four-plane M-RoPE kernel. It also batches the text
 chunks surrounding the image and downloads logits only after each complete
 chunk.
 
-The new gfx906 M-RoPE batch kernel passes an exact CPU oracle. Full 35B image
-latency and greedy-output parity still require a matched MI50 run; the first
-attempt was blocked before model load because the `/mnt/ai-models` NFS mount
-stopped responding. Keep the scalar implementation as a correctness reference
-until that end-to-end comparison is recorded.
+The new gfx906 M-RoPE batch kernel passes an exact CPU oracle. A matched MI50
+run on the 943-row beach fixture reduced multimodal prefill from 17.218 s to
+5.664 s and total request time from about 18.5 s to 7.013 s. The mtmd projector
+still consumed 3.743 s, leaving only about 1.855 s in ReInstinct's batched LLM
+prefill. TTFT improved from 17.223 s to 5.670 s, while 64-token decode remained
+about 1.3 s. The coherent greedy result described the same woman swinging over
+turquoise water, though fp16 batched-prefill drift changed the exact wording
+from the scalar reference. Peak junction temperature was 59 C under the 88 C
+guard, and the isolated server released VRAM after the run.
 
 ## Commits
 

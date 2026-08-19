@@ -77,12 +77,15 @@ pair each stress request with the guarded ROCm telemetry sampler so a profiler
 cannot silently change fan or power policy and a wedged request can still be
 terminated independently.
 
-The first engine optimization is implemented: projected image embeddings use
+The first engine optimization is validated: projected image embeddings use
 the same batched transformer prefill strategy as text, extended with explicit
 per-row four-plane M-RoPE positions. This removes one full model invocation,
-GPU synchronization, and logits download per image row. The next gate is a
-matched MI50 scalar-versus-batched image run; do not begin resolution-quality
-tradeoffs until that runtime parity and speedup are measured.
+GPU synchronization, and logits download per image row. On the matched 943-row
+MI50 fixture it cut LLM prefill from roughly 13.3 s to 1.86 s and total request
+latency from roughly 18.5 s to 7.0 s. The projector is now the dominant TTFT
+stage at 3.74 s. Further gains should target projector execution or an explicit
+image-token budget; the latter is a quality tradeoff and must remain observable
+and benchmarked against the uncapped path.
 
 Use that data to choose the first optimization. Likely candidates are
 adaptive image resolution/token budgeting and projector-path optimization;

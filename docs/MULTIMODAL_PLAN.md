@@ -1,5 +1,8 @@
 # Multimodal implementation plan
 
+Measured baselines, stage breakdowns, and the ranked optimization queue live in
+[`PERFORMANCE.md`](PERFORMANCE.md).
+
 ## Objective
 
 Accept one Qwen3.6 image and prompt while keeping ReInstinct as the only LLM

@@ -1,6 +1,9 @@
 # Multimodal progress
 
-Last updated: 2026-08-16
+Last updated: 2026-08-18
+
+Canonical speed results and the active bottleneck queue are tracked in
+[`PERFORMANCE.md`](PERFORMANCE.md).
 
 ## Verified on `ai@10.0.0.41`
 

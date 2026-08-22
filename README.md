@@ -19,6 +19,22 @@ The fork concentrates on practical multimodal serving and operating an MI50 as a
 
 This is not intended to replace upstream or to promise broad model or hardware compatibility. Upstream changes should be brought in deliberately and tested against the fork's multimodal and service behavior.
 
+## Operations dashboard
+
+The fork includes an embedded operations console for watching a live MI50 service. These screenshots are representative examples from the Qwen3.6 deployment:
+
+![Operations dashboard overview](media/screenshots/screenshot-v0-main.png)
+
+![Engine configuration](media/screenshots/screenshot-v0-engine-config.png)
+
+![GPU inventory and thermal guard](media/screenshots/screenshot-v0-gpus-thermal-config.png)
+
+![Recent request runs](media/screenshots/screenshot-v0-runs.png)
+
+![Request details](media/screenshots/screenshot-v0-run.png)
+
+![Engine logs](media/screenshots/screenshot-v0-logs.png)
+
 ## Project map
 
 - [`MANUAL.md`](MANUAL.md) — CLI, server, model, image-input, and deployment reference.

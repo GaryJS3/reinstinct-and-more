@@ -48,6 +48,13 @@ disconnect recovery all passed through the C# suite. A deliberate service
 restart also recovered to HTTP 200; guarded junction temperature stayed at
 45–56 C during the contract run and 45–47 C during restart recovery.
 
+On 2026-08-21 the deployment was rebuilt with incremental UTF-8 output
+assembly. The exact Paperless-AI custom-provider validation request (`Test`,
+with only `model` and `messages`) returned HTTP 200 and preserved the generated
+emoji. The full C# contract suite, including that fixture, then passed all 18
+checks against port 8006 after a service restart. Furnace remained inactive
+and unchanged.
+
 The endpoint currently binds openly on the server's network interface. It is
 not a production exposure: authentication, TLS, CORS, rate limiting, and a
 public request-size policy still belong behind a reverse proxy.
@@ -66,6 +73,8 @@ The server currently exposes:
 - `POST /v1/chat/completions` for text chat and one structured image input;
 - OpenAI-shaped non-streaming responses and errors;
 - SSE streaming terminated by `data: [DONE]`, with optional usage chunks.
+- UTF-8-safe output assembly when one character spans multiple generated
+  byte-level tokens.
 
 The OpenAPI document describes the implemented subset rather than claiming
 the entire OpenAI API. Responses, Conversations, tool calling, and structured

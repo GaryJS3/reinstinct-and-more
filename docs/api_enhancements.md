@@ -131,7 +131,7 @@ subset that has actually passed its compatibility gates.
 
 | Application | Required surface | Important behaviors | Current state |
 |---|---|---|---|
-| Paperless-ngx suggestions/chat | Chat Completions | long text prompts, JSON results, timeout up to 120 s, configurable model/base URL | Partial: text works; JSON enforcement unproven |
+| Paperless-ngx suggestions/chat | Chat Completions | long text prompts, JSON results, timeout up to 120 s, configurable model/base URL | Partial: Paperless-AI custom-provider validation passes live; JSON enforcement unproven |
 | Paperless-ngx RAG | Embeddings plus Chat Completions | deterministic fixed-width vectors, batch input, correct model/dimensions | Blocked: embeddings returns 503 |
 | paperless-gpt metadata | Chat Completions | generic `OPENAI_BASE_URL`, reliable JSON, longer documents | Partial |
 | paperless-gpt OCR/vision | Chat Completions image input | base64 image content, JSON result, predictable error behavior | Partial: one JPEG/PNG works; real client gate missing |
@@ -142,6 +142,9 @@ subset that has actually passed its compatibility gates.
 
 Reference findings:
 
+- Paperless-AI's custom-provider startup probe sends only the configured model
+  and one user message containing `Test`. That exact fixture passes against
+  the isolated port-8006 deployment, including generated multibyte Unicode.
 - Paperless-ngx calls its backend `openai-like` and separately configures an
   OpenAI-compatible embeddings backend for RAG.
 - paperless-gpt explicitly supports custom OpenAI-compatible base URLs.

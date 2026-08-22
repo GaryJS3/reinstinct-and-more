@@ -151,6 +151,7 @@ sealed class ContractSuite
             ("model discovery", ModelsAsync),
             ("model retrieval", ModelRetrievalAsync),
             ("text chat", TextChatAsync),
+            ("Paperless custom-provider validation", PaperlessValidationAsync),
             ("run history and detail", RunHistoryAsync),
             ("text streaming and usage", TextStreamingAsync),
             ("JPEG image chat", () => ImageChatAsync("jpeg")),
@@ -334,6 +335,19 @@ sealed class ContractSuite
     {
         using var response = await _client.SendJsonAsync(HttpMethod.Post, "v1/chat/completions",
             ChatPayload(DefaultPrompt, maxTokens: 4));
+        using var document = await ReadJsonAsync(response, HttpStatusCode.OK);
+        ValidateChatCompletion(document.RootElement);
+    }
+
+    private async Task PaperlessValidationAsync()
+    {
+        var payload = new
+        {
+            model = _model ?? "contract-test-model",
+            messages = new[] { new { role = "user", content = "Test" } },
+        };
+        using var response = await _client.SendJsonAsync(
+            HttpMethod.Post, "v1/chat/completions", payload);
         using var document = await ReadJsonAsync(response, HttpStatusCode.OK);
         ValidateChatCompletion(document.RootElement);
     }

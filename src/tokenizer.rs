@@ -203,11 +203,10 @@ impl Tokenizer {
         self.vocab_map.get(s).copied()
     }
 
-    /// Decode a sequence of token ids to a UTF-8 string. Token strings
-    /// are concatenated and then the GPT2 byte permutation is inverted
-    /// to recover the original byte stream, which is finally lossy-UTF-8-
-    /// decoded back to a Rust String.
-    pub fn decode(&self, ids: &[u32]) -> String {
+    /// Decode token ids to their original GPT-2 byte stream. Keeping this
+    /// available separately lets streaming callers retain an incomplete
+    /// trailing UTF-8 sequence until a later token completes it.
+    pub fn decode_bytes(&self, ids: &[u32]) -> Vec<u8> {
         // First concatenate the vocab pieces.
         let mut joined = String::new();
         for &id in ids {
@@ -230,7 +229,15 @@ impl Tokenizer {
             }
         }
 
-        String::from_utf8_lossy(&bytes).into_owned()
+        bytes
+    }
+
+    /// Decode a sequence of token ids to a UTF-8 string. Token strings
+    /// are concatenated and then the GPT2 byte permutation is inverted
+    /// to recover the original byte stream, which is finally lossy-UTF-8-
+    /// decoded back to a Rust String.
+    pub fn decode(&self, ids: &[u32]) -> String {
+        String::from_utf8_lossy(&self.decode_bytes(ids)).into_owned()
     }
 }
 
@@ -374,9 +381,9 @@ impl GemmaTokenizer {
         self.vocab_map.get(s).copied()
     }
 
-    /// Decode ids to text: byte tokens become raw bytes, the metaspace
-    /// char becomes a space, everything else is literal.
-    pub fn decode(&self, ids: &[u32]) -> String {
+    /// Decode ids to bytes: byte tokens remain raw bytes, the metaspace
+    /// char becomes a space, and everything else is literal UTF-8.
+    pub fn decode_bytes(&self, ids: &[u32]) -> Vec<u8> {
         let mut bytes: Vec<u8> = Vec::new();
         for &id in ids {
             if let Some(&b) = self.id_to_byte.get(&id) {
@@ -393,7 +400,12 @@ impl GemmaTokenizer {
                 }
             }
         }
-        String::from_utf8_lossy(&bytes).into_owned()
+        bytes
+    }
+
+    /// Decode ids to text, replacing any terminal invalid byte sequence.
+    pub fn decode(&self, ids: &[u32]) -> String {
+        String::from_utf8_lossy(&self.decode_bytes(ids)).into_owned()
     }
 }
 

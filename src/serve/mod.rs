@@ -635,12 +635,45 @@ fn stop_visible_end(text: &str, stops: &[String]) -> (usize, bool) {
     for stop in stops {
         let bytes = stop.as_bytes();
         for len in 1..bytes.len() {
-            if text.as_bytes().ends_with(&bytes[..len]) {
+            if stop.is_char_boundary(len)
+                && text.as_bytes().ends_with(&bytes[..len])
+                && text.is_char_boundary(text.len() - len)
+            {
                 pending = pending.max(len);
             }
         }
     }
     (text.len().saturating_sub(pending), false)
+}
+
+/// Decode every complete UTF-8 sequence while retaining an incomplete
+/// trailing sequence for the next token. Definite invalid sequences are
+/// replaced exactly as `String::from_utf8_lossy` would replace them, so the
+/// returned text is an append-only stable prefix of the eventual decode.
+fn stable_utf8_prefix(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    let mut rest = bytes;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(text) => {
+                out.push_str(text);
+                break;
+            }
+            Err(error) => {
+                let valid = error.valid_up_to();
+                // SAFETY: `Utf8Error::valid_up_to` guarantees this prefix.
+                out.push_str(unsafe { std::str::from_utf8_unchecked(&rest[..valid]) });
+                match error.error_len() {
+                    Some(invalid) => {
+                        out.push('\u{fffd}');
+                        rest = &rest[valid + invalid..];
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+    out
 }
 
 const MAX_IMAGE_BYTES: usize = 6 * 1024 * 1024;
@@ -1216,7 +1249,9 @@ impl ServerModel {
                 let mut out: Vec<u32> = Vec::new();
                 let mut hit_eos = false;
                 let mut prev_text_len: usize = 0;
+                let mut full_bytes = Vec::new();
                 let mut full_text = String::new();
+                let mut matched_text_stop = false;
                 let mut all_lp: Vec<TokenLogprob> = Vec::new();
                 let mut client_open = true;
                 let decode_started = std::time::Instant::now();
@@ -1233,12 +1268,13 @@ impl ServerModel {
                         first_token_ms = Some(prefill_started.elapsed().as_secs_f64() * 1e3);
                     }
                     if !counts.is_empty() { counts[t as usize] = counts[t as usize].saturating_add(1); }
-                    // Re-decode the whole output: append-only token streams
-                    // mean the previous prefix bytes are stable, so the
-                    // delta is the suffix past prev_text_len. Multi-token
-                    // unicode glyphs render correctly because we only emit
-                    // bytes once the trailing token completes them.
-                    full_text = tok.decode(&out);
+                    // Re-decode the raw byte stream and expose only complete
+                    // UTF-8. A byte-level token can end inside a multibyte
+                    // glyph; lossy-decoding each intermediate token sequence
+                    // would insert a replacement character that disappears
+                    // on the next token and invalidate `prev_text_len`.
+                    full_bytes = tok.decode_bytes(&out);
+                    full_text = stable_utf8_prefix(&full_bytes);
                     let tlp = if want_lp > 0 {
                         Some(decode_token_logprob(|ids| tok.decode(ids), t, &res))
                     } else { None };
@@ -1259,10 +1295,14 @@ impl ServerModel {
                     }
                     if matched_stop {
                         full_text.truncate(visible_end);
+                        matched_text_stop = true;
                         hit_eos = true;
                         break;
                     }
                     logits = gpu.forward_token(t, state)?;
+                }
+                if !matched_text_stop {
+                    full_text = String::from_utf8_lossy(&full_bytes).into_owned();
                 }
                 if client_open && prev_text_len < full_text.len() {
                     let _ = on_token(&full_text[prev_text_len..], None);
@@ -1370,7 +1410,9 @@ impl ServerModel {
                     let mut out: Vec<u32> = Vec::new();
                     let mut hit_eos = false;
                     let mut prev_text_len: usize = 0;
+                    let mut full_bytes = Vec::new();
                     let mut full_text = String::new();
+                    let mut matched_text_stop = false;
                     let mut all_lp: Vec<TokenLogprob> = Vec::new();
                     let mut client_open = true;
                     let decode_started = std::time::Instant::now();
@@ -1389,7 +1431,8 @@ impl ServerModel {
                         if !counts.is_empty() {
                             counts[t as usize] = counts[t as usize].saturating_add(1);
                         }
-                        full_text = tok.decode(&out);
+                        full_bytes = tok.decode_bytes(&out);
+                        full_text = stable_utf8_prefix(&full_bytes);
                         let tlp = if want_lp > 0 {
                             Some(decode_token_logprob(|ids| tok.decode(ids), t, &res))
                         } else { None };
@@ -1408,10 +1451,14 @@ impl ServerModel {
                         }
                         if matched_stop {
                             full_text.truncate(visible_end);
+                            matched_text_stop = true;
                             hit_eos = true;
                             break;
                         }
                         logits = gpu.forward_token(t, state)?;
+                    }
+                    if !matched_text_stop {
+                        full_text = String::from_utf8_lossy(&full_bytes).into_owned();
                     }
                     if client_open && prev_text_len < full_text.len() {
                         let _ = on_token(&full_text[prev_text_len..], None);
@@ -2492,5 +2539,18 @@ mod logprobs_tests {
         assert_eq!(stop_visible_end("answer EN", &stops), (7, false));
         assert_eq!(stop_visible_end("answer END trailing", &stops), (7, true));
         assert_eq!(stop_visible_end("answer", &stops), (6, false));
+
+        let unicode_stops = vec!["😊END".to_string()];
+        assert_eq!(stop_visible_end("answer 😊", &unicode_stops), (7, false));
+    }
+
+    #[test]
+    fn stable_utf8_decode_holds_incomplete_multibyte_suffix() {
+        let complete = "prefix 😊".as_bytes();
+        for end in 8..complete.len() {
+            assert_eq!(stable_utf8_prefix(&complete[..end]), "prefix ");
+        }
+        assert_eq!(stable_utf8_prefix(complete), "prefix 😊");
+        assert_eq!(stable_utf8_prefix(b"ok\xff!"), "ok\u{fffd}!");
     }
 }

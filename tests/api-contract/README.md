@@ -14,8 +14,9 @@ The suite exercises liveness, model discovery, text chat, SSE streaming and
 usage, bounded run-history summaries/details, engine logs, network telemetry,
 model catalog metadata, safe rejection of out-of-catalog switches, and throughput fields,
 deterministic JPEG/PNG data URLs, OpenAI-shaped errors, the 8 MiB body limit,
-timeout recovery, and client-disconnect recovery. A nonzero exit code means at
-least one contract check failed.
+the exact Paperless-AI custom-provider `Test` request, timeout recovery, and
+client-disconnect recovery. A nonzero exit code means at least one contract
+check failed.
 
 The same command can target a named OpenAI-compatible reference service or
 SDK proxy. Record the endpoint name, version, configuration, and result in

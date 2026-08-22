@@ -4,8 +4,9 @@
 
 The current deployed service includes separate configuration Save/Reload
 actions, PCI-keyed GPU telemetry, and the thermal interlock. It runs on
-`ai@10.0.0.41:8006` as the enabled `reinstinct-server.service`, from the isolated checkout
-`/home/ai/inference-bench/reinstinct-service-20260822`.
+`ai@10.0.0.41:8006` as the enabled `reinstinct-server.service`, from the
+isolated checkout
+`/home/ai/inference-bench/reinstinct-service-20260822-aaf38b2`.
 
 - Default service configuration: `/etc/reinstinct/server.json`.
 - Unit rollback copy: `/etc/systemd/system/reinstinct-server.service.bak-20260822`.
@@ -19,10 +20,11 @@ actions, PCI-keyed GPU telemetry, and the thermal interlock. It runs on
   listener stays available.
 - Furnace remains enabled but inactive and was not restarted or modified.
 
-The deployed smoke checks passed after restart: `/readyz` returned `200 ready`,
-`/api/config` reported the persisted config path, and a text chat request
-returned HTTP 200. The local worktree still contains unrelated `Cargo.toml`,
-`images/`, and `media/` changes; keep them out of service/docs commits.
+The deployed checks passed after restart: `/readyz` returned `200 ready`, the
+20-check C# HTTP contract suite passed, repeated dashboard samples retained
+thermal labels and consistent error counts, and Furnace remained inactive.
+The local worktree still contains unrelated `Cargo.toml`, `images/`, and
+`media/` changes; keep them out of service/docs commits.
 
 Snapshot for moving the project to another machine. Picks up after commit `1afa1a9`.
 

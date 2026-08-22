@@ -56,6 +56,14 @@ updated Rust sources on the MI50 host. After model load, `/readyz` returned
 document exposed `POST /api/config/reload`, and a text chat smoke request
 returned HTTP `200`.
 
+The reviewed GPU/thermal and dashboard-refresh follow-up is deployed from
+commit `aaf38b2` in checkout
+`/home/ai/inference-bench/reinstinct-service-20260822-aaf38b2`. The full live
+C# suite passed 20 checks. Eight repeated status samples consistently reported
+the same retained-error count and `monitoring` thermal state with 46–47°C
+junction readings; the dashboard now has one non-overlapping status refresh
+path. Furnace remained inactive.
+
 The dashboard exposes the **Engine configuration** panel when the service is
 started with `--config`. **Save** validates and persists edits without
 disturbing the running engine; **Reload** explicitly applies saved engine

@@ -63,8 +63,9 @@ isolated MI50 thermal test should be run only with an operator-approved,
 reversible workload and independent hardware cutoff. Furnace remains outside
 the scope and stayed unchanged.
 
-Before deployment, install the helper with a root-owned binary and restricted
-socket, require authenticated reverse-proxy access, run conservative capped
-workloads, watch junction temperature and `power1_input`/`power1_cap`, and stop
-immediately on unsafe readings. Record API capability, measured pause/resume
-behavior, limitations, and service state separately.
+For future deployments or upgrades, install the helper with a root-owned binary
+and restricted socket, require authenticated reverse-proxy access, run
+conservative capped workloads, watch junction temperature and
+`power1_input`/`power1_cap`, and stop immediately on unsafe readings. Record API
+capability, measured pause/resume behavior, limitations, and service state
+separately.

@@ -32,6 +32,9 @@ Cargo.lock.bak
 perf.data*
 *.json.gz
 
+# Local multimodal benchmark inputs (keep curated fixtures under tests/)
+/images/
+
 # Compiled golden-logits helper (built per-host via tests/golden/build.sh)
 /tests/golden/dump_logits
 

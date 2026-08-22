@@ -1308,6 +1308,11 @@ VBIOS ceilings, expose voltage, or persist tuning across reboot. Non-AMD GPUs
 remain visible and read-only. Use an authenticated reverse proxy before
 exposing management routes outside a trusted network.
 
+The operations dashboard's AMD power control is a driver-bounded range
+slider. It shows the current power limit and the reported minimum/maximum
+range; if those fields are unavailable, the control stays disabled rather
+than accepting an unconstrained value.
+
 The live JSON settings are `gpu_thermal_guard_enabled`, `gpu_max_temp_c`,
 `gpu_max_temp_seconds`, and `gpu_resume_temp_c`. Save applies these fields
 without a model reload, and the resume temperature must be lower than the

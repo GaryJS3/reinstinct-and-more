@@ -2,8 +2,8 @@
 
 ## Current deployment snapshot (2026-08-22)
 
-The current deployed service is commit `baa2cc0` (`serve: add config-backed
-dashboard reloads`). It runs on `ai@10.0.0.41:8006` as the enabled
+The current deployed service is commit `7ddf521` (`serve: split config save
+and reload actions`). It runs on `ai@10.0.0.41:8006` as the enabled
 `reinstinct-server.service`, from the isolated checkout
 `/home/ai/inference-bench/reinstinct-service-20260822`.
 
@@ -12,9 +12,11 @@ dashboard reloads`). It runs on `ai@10.0.0.41:8006` as the enabled
 - Dashboard: `http://10.0.0.41:8006/`.
 - Health/readiness: `/healthz` and `/readyz`; config/reload state:
   `/api/config` and `/api/config/reload`.
-- The dashboard persists supported settings and reloads the engine only while
-  idle. Startup and GPU-worker failures remain visible in the dashboard and
-  engine-log panel while the HTTP listener stays available.
+- The dashboard separates **Save** (validate and persist) from **Reload**
+  (apply saved engine settings only while idle). Port changes are persisted but
+  require a service restart and are surfaced separately. Startup and GPU-worker
+  failures remain visible in the dashboard and engine-log panel while the HTTP
+  listener stays available.
 - Furnace remains enabled but inactive and was not restarted or modified.
 
 The deployed smoke checks passed after restart: `/readyz` returned `200 ready`,

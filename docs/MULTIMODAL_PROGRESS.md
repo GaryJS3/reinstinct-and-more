@@ -35,8 +35,9 @@ Canonical speed results and the active bottleneck queue are tracked in
   logical positions for every image request.
 - The deployed `reinstinct-server.service` now runs from the isolated
   `reinstinct-service-20260822` checkout and loads `/etc/reinstinct/server.json`
-  by default. The dashboard validates and persists supported settings, then
-  reloads the engine while idle; port changes remain a service-restart concern.
+  by default. The dashboard separates **Save** (validate and persist) from
+  **Reload** (apply saved engine settings while idle); port changes remain a
+  service-restart concern and are marked accordingly in the form.
 - Startup and GPU-worker failures remain visible through the dashboard and
   `/api/logs` while the HTTP listener stays available for diagnosis.
 

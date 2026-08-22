@@ -2115,9 +2115,34 @@ fn handle_conn(mut stream: std::net::TcpStream, target: Target,
             Ok(v) => v,
             Err(e) => { let _ = http::write_response(&mut stream, 400, "Bad Request", &error_body(&e, "invalid_request_error")); return; }
         };
+        if let Err(e) = next.persist() {
+            let _ = http::write_response(&mut stream, 500, "Internal Server Error", &error_body(&e, "server_error"));
+            return;
+        }
+        let reload = current.restart_required_fields(&next);
+        let body = serde_json::json!({"state":"saved","restart_required_fields":reload}).to_string();
+        let _ = http::write_response(&mut stream, 200, "OK", &body);
+        return;
+    }
+    if request.method.eq_ignore_ascii_case("POST") && path == "/api/config/reload" {
+        if request.headers.get("x-reinstinct-action").map(String::as_str) != Some("reload-config") {
+            let body = error_body("configuration reload requires X-ReInstinct-Action: reload-config", "invalid_request_error");
+            let _ = http::write_response(&mut stream, 400, "Bad Request", &body);
+            return;
+        }
+        if target != Target::Big {
+            let body = error_body("configuration reload is available only on the big-model dashboard", "invalid_request_error");
+            let _ = http::write_response(&mut stream, 400, "Bad Request", &body);
+            return;
+        }
+        let current = match status.config.lock() { Ok(c) => c.clone(), Err(_) => { let _ = http::write_response(&mut stream, 503, "Service Unavailable", &error_body("configuration state is unavailable", "server_error")); return; } };
+        let next = match current.load_persisted() {
+            Ok(v) => v,
+            Err(e) => { let _ = http::write_response(&mut stream, 400, "Bad Request", &error_body(&e, "invalid_request_error")); return; }
+        };
         let restart = current.restart_required_fields(&next);
         if !restart.is_empty() {
-            let _ = http::write_response(&mut stream, 409, "Conflict", &error_body(&format!("restart required for: {}", restart.join(", ")), "restart_required"));
+            let _ = http::write_response(&mut stream, 409, "Conflict", &error_body(&format!("service restart required for: {}", restart.join(", ")), "restart_required"));
             return;
         }
         let reload_id = match status.queue_config_reload(&next) {

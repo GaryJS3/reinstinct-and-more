@@ -50,9 +50,17 @@ live checks returned `200` from `/readyz`, reported the persisted config from
 service restart. The installed unit backup is retained at
 `/etc/systemd/system/reinstinct-server.service.bak-20260822` for rollback.
 
+The 2026-08-22 deployment of commit `7ddf521` rebuilt the service from the
+updated Rust sources on the MI50 host. After model load, `/readyz` returned
+`200`, the dashboard exposed separate Save/Reload controls, the OpenAPI
+document exposed `POST /api/config/reload`, and a text chat smoke request
+returned HTTP `200`.
+
 The dashboard exposes the **Engine configuration** panel when the service is
-started with `--config`; edits validate, reload only while idle, and persist
-atomically. If startup or the GPU worker fails, the listener stays available
+started with `--config`. **Save** validates and persists edits without
+disturbing the running engine; **Reload** explicitly applies saved engine
+settings while idle. Port edits are saved but reported as requiring a service
+restart. If startup or the GPU worker fails, the listener stays available
 and the dashboard shows the error and recent engine logs, so first diagnosis
 does not require host-shell access.
 
@@ -73,8 +81,9 @@ The server currently exposes:
 
 - `GET /` for a live, browser-friendly server dashboard;
 - `GET /api/status` for machine-readable model, worker, GPU, settings, and counter state;
-- `GET /api/config` for effective JSON settings, CLI-locked fields, and reload state;
-- `PUT /api/config` plus `GET /api/config/reload` for validated idle-only engine reloads;
+- `GET /api/config` for active/saved JSON settings, CLI-locked fields, pending reload fields, and reload state;
+- `PUT /api/config` for validated atomic persistence without an engine reload;
+- `GET /api/config/reload` plus `POST /api/config/reload` for reload state and explicit idle-only engine reloads;
 - `GET /openapi.json` for the canonical OpenAPI 3.1 contract;
 - `GET /docs` for interactive Swagger UI documentation;
 - `GET /healthz` for liveness;

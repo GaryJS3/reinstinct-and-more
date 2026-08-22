@@ -266,6 +266,17 @@ impl ServeConfig {
         fs::write(&tmp, text).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
         fs::rename(&tmp, path).map_err(|e| format!("cannot replace {}: {e}", path.display()))
     }
+
+    pub fn load_persisted(&self) -> Result<Self, String> {
+        let Some(path) = self.config_path.as_ref() else {
+            return Err("server was not started with --config".into());
+        };
+        let text = fs::read_to_string(path)
+            .map_err(|e| format!("cannot read config {}: {e}", path.display()))?;
+        let value: Value = serde_json::from_str(&text)
+            .map_err(|e| format!("invalid JSON in {}: {e}", path.display()))?;
+        self.apply_update(&value)
+    }
 }
 
 fn validate_keys(value: &Value) -> Result<(), String> {

@@ -1,0 +1,831 @@
+#![allow(dead_code)]
+
+use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
+use std::io::{self, Write};
+use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use super::Metrics;
+use serde_json::{Value, json};
+
+pub struct ApiStatus {
+    pub started_at: u64,
+    pub max_seq: usize,
+    pub target: &'static str,
+    pub port: u16,
+    pub model: Mutex<ModelStatus>,
+    pub model_dir: PathBuf,
+    pub phase: Mutex<Phase>,
+    pub loading: Mutex<Option<LoadingStatus>>,
+    pub network: Mutex<NetworkSample>,
+    pub queued: AtomicU64,
+    pub active_request: AtomicU64,
+    pub history: Mutex<RunHistory>,
+    pub catalog: Mutex<Option<CatalogCache>>,
+    pub model_switch: Mutex<ModelSwitchStatus>,
+    pub next_switch_id: AtomicU64,
+}
+
+pub struct CatalogCache {
+    value: Value,
+    scanned_at_ms: u64,
+    duration_ms: u64,
+}
+
+#[derive(Clone)]
+pub struct ModelSwitchStatus {
+    pub id: u64,
+    pub state: &'static str,
+    pub requested_path: Option<PathBuf>,
+    pub previous_model: Option<String>,
+    pub accepted_at_ms: Option<u64>,
+    pub completed_at_ms: Option<u64>,
+    pub error: Option<String>,
+}
+
+impl Default for ModelSwitchStatus {
+    fn default() -> Self {
+        Self { id: 0, state: "idle", requested_path: None, previous_model: None,
+            accepted_at_ms: None, completed_at_ms: None, error: None }
+    }
+}
+
+#[derive(Clone)]
+pub struct ModelStatus {
+    pub id: String,
+    pub path: PathBuf,
+    pub drafter: Option<PathBuf>,
+    pub vision: Option<VisionStatus>,
+}
+
+pub struct LoadingStatus {
+    pub started_at_ms: u64,
+    pub expected_bytes: u64,
+    pub network_rx_start: u64,
+}
+
+#[derive(Default)]
+pub struct NetworkSample {
+    at_ms: u64,
+    rx_bytes: u64,
+    tx_bytes: u64,
+    rx_mbps: f64,
+    tx_mbps: f64,
+}
+
+pub const RUN_HISTORY_CAPACITY: usize = 128;
+const CAPTURE_TEXT_BYTES: usize = 64 * 1024;
+const LOG_CAPACITY: usize = 1000;
+
+static ENGINE_LOGS: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
+
+pub struct DashboardLogWriter;
+
+impl Write for DashboardLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let text = String::from_utf8_lossy(bytes);
+        let logs = ENGINE_LOGS.get_or_init(|| Mutex::new(VecDeque::with_capacity(LOG_CAPACITY)));
+        if let Ok(mut logs) = logs.lock() {
+            for line in text.lines().filter(|line| !line.trim().is_empty()) {
+                while logs.len() >= LOG_CAPACITY { logs.pop_front(); }
+                logs.push_back(line.to_string());
+            }
+        }
+        io::stderr().write_all(bytes)?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> { io::stderr().flush() }
+}
+
+pub fn logs_json() -> String {
+    let logs = ENGINE_LOGS.get_or_init(|| Mutex::new(VecDeque::with_capacity(LOG_CAPACITY)));
+    let lines = logs.lock().map(|logs| logs.iter().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    json!({"capacity":LOG_CAPACITY,"retained":lines.len(),"lines":lines}).to_string()
+}
+
+fn logs_summary_json() -> Value {
+    let retained = ENGINE_LOGS.get().and_then(|logs| logs.lock().ok().map(|logs| logs.len())).unwrap_or(0);
+    json!({"capacity":LOG_CAPACITY,"retained":retained})
+}
+
+#[derive(Clone, Default)]
+pub struct RunStats {
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub queue_ms: f64,
+    pub prefill_ms: f64,
+    pub ttft_ms: f64,
+    pub generation_ms: f64,
+    pub total_ms: f64,
+    pub prompt_tokens_per_second: f64,
+    pub generation_tokens_per_second: f64,
+}
+
+pub struct RunRecord {
+    id: u64,
+    client_ip: String,
+    method: String,
+    path: String,
+    request_type: String,
+    state: &'static str,
+    queued_at_ms: u64,
+    started_at_ms: Option<u64>,
+    completed_at_ms: Option<u64>,
+    status_code: Option<u16>,
+    request: Value,
+    response: Option<Value>,
+    error: Option<String>,
+    stats: RunStats,
+}
+
+pub struct RunHistory {
+    entries: VecDeque<RunRecord>,
+    capacity: usize,
+}
+
+impl RunHistory {
+    pub fn new() -> Self {
+        Self { entries: VecDeque::with_capacity(RUN_HISTORY_CAPACITY),
+               capacity: RUN_HISTORY_CAPACITY }
+    }
+
+    fn push(&mut self, run: RunRecord) {
+        while self.entries.len() >= self.capacity { self.entries.pop_front(); }
+        self.entries.push_back(run);
+    }
+
+    fn find_mut(&mut self, id: u64) -> Option<&mut RunRecord> {
+        self.entries.iter_mut().find(|run| run.id == id)
+    }
+
+    fn find(&self, id: u64) -> Option<&RunRecord> {
+        self.entries.iter().find(|run| run.id == id)
+    }
+}
+
+#[derive(Clone)]
+pub struct VisionStatus {
+    pub projector: PathBuf,
+    pub threads: i32,
+    pub min_tokens: i32,
+    pub max_tokens: i32,
+    pub device: &'static str,
+}
+
+pub struct Phase {
+    pub name: &'static str,
+    pub detail: Option<String>,
+}
+
+impl ApiStatus {
+    pub fn set_phase(&self, name: &'static str, detail: Option<String>) {
+        if let Ok(mut phase) = self.phase.lock() {
+            *phase = Phase { name, detail };
+        }
+    }
+
+    pub fn begin_loading(&self, path: &std::path::Path) {
+        let expected_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let (network_rx_start, _) = network_totals();
+        if let Ok(mut loading) = self.loading.lock() {
+            *loading = Some(LoadingStatus { started_at_ms: unix_now_ms(), expected_bytes,
+                network_rx_start });
+        }
+        self.set_phase("loading", Some(format!("Loading {}", path.display())));
+    }
+
+    pub fn finish_loading(&self, model: ModelStatus) {
+        if let Ok(mut current) = self.model.lock() { *current = model; }
+        if let Ok(mut loading) = self.loading.lock() { *loading = None; }
+        self.set_phase("ready", None);
+    }
+
+    pub fn queue_run(&self, id: u64, client_ip: String, method: &str,
+                     path: &str, request_type: &str, body: &str) {
+        if let Ok(mut history) = self.history.lock() {
+            history.push(RunRecord {
+                id, client_ip, method: method.into(), path: path.into(),
+                request_type: request_type.into(), state: "queued",
+                queued_at_ms: unix_now_ms(), started_at_ms: None,
+                completed_at_ms: None, status_code: None,
+                request: capture_json(body), response: None, error: None,
+                stats: RunStats::default(),
+            });
+        }
+    }
+
+    pub fn activate_run(&self, id: u64) {
+        if let Ok(mut history) = self.history.lock() {
+            if let Some(run) = history.find_mut(id) {
+                let now = unix_now_ms();
+                run.state = "active";
+                run.started_at_ms = Some(now);
+                run.stats.queue_ms = now.saturating_sub(run.queued_at_ms) as f64;
+            }
+        }
+    }
+
+    pub fn update_generation_progress(&self, id: u64, completion_tokens: usize,
+                                      generation_ms: f64) {
+        if let Ok(mut history) = self.history.lock() {
+            if let Some(run) = history.find_mut(id) {
+                run.stats.completion_tokens = completion_tokens;
+                run.stats.generation_ms = generation_ms;
+                run.stats.generation_tokens_per_second = per_second(completion_tokens, generation_ms);
+            }
+        }
+    }
+
+    pub fn finish_run(&self, id: u64, status_code: u16, response: &str,
+                      stats: Option<RunStats>) {
+        if let Ok(mut history) = self.history.lock() {
+            if let Some(run) = history.find_mut(id) {
+                run.state = if status_code < 400 { "complete" } else { "errored" };
+                run.completed_at_ms = Some(unix_now_ms());
+                run.status_code = Some(status_code);
+                run.response = Some(capture_json(response));
+                run.error = if status_code >= 400 { error_message(response) } else { None };
+                if let Some(mut stats) = stats {
+                    stats.queue_ms = run.stats.queue_ms;
+                    run.stats = stats;
+                }
+            }
+        }
+    }
+
+    pub fn runs_json(&self) -> String {
+        let history = match self.history.lock() {
+            Ok(history) => history,
+            Err(_) => return json!({"capacity":RUN_HISTORY_CAPACITY,"runs":[]}).to_string(),
+        };
+        let runs: Vec<Value> = history.entries.iter().rev().map(run_summary_json).collect();
+        json!({"capacity":history.capacity,"retained":runs.len(),"runs":runs}).to_string()
+    }
+
+    pub fn run_json(&self, id: u64) -> Option<String> {
+        let history = self.history.lock().ok()?;
+        history.find(id).map(|run| run_detail_json(run).to_string())
+    }
+
+    pub fn models_json(&self, refresh: bool) -> String {
+        if !refresh {
+            if let Ok(cache) = self.catalog.lock() {
+                if let Some(cache) = cache.as_ref() { return catalog_response(cache, true).to_string(); }
+            }
+        }
+        let started = std::time::Instant::now();
+        let value = catalog_value(&self.model_dir);
+        let cache = CatalogCache { value, scanned_at_ms: unix_now_ms(),
+            duration_ms: started.elapsed().as_millis() as u64 };
+        let response = catalog_response(&cache, false).to_string();
+        if let Ok(mut slot) = self.catalog.lock() { *slot = Some(cache); }
+        response
+    }
+
+    pub fn queue_model_switch(&self, path: &std::path::Path) -> Result<u64, String> {
+        let phase = self.phase.lock().map_err(|_| "service state is unavailable")?;
+        if phase.name != "ready" { return Err(format!("service is {}", phase.name)); }
+        drop(phase);
+        if self.queued.load(Ordering::Relaxed) > 0 || self.active_request.load(Ordering::Relaxed) > 0 {
+            return Err("model switch requires an idle worker and empty queue".into());
+        }
+        let id = self.next_switch_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let previous_model = self.model.lock().ok().map(|m| m.id.clone());
+        if let Ok(mut switch) = self.model_switch.lock() {
+            *switch = ModelSwitchStatus { id, state: "queued", requested_path: Some(path.to_path_buf()),
+                previous_model, accepted_at_ms: Some(unix_now_ms()), completed_at_ms: None, error: None };
+        }
+        self.set_phase("switching", Some(format!("Queued model switch to {}", path.display())));
+        Ok(id)
+    }
+
+    pub fn start_model_switch(&self, id: u64, path: &std::path::Path) {
+        if let Ok(mut switch) = self.model_switch.lock() {
+            if switch.id == id { switch.state = "loading"; }
+        }
+        self.begin_loading(path);
+    }
+
+    pub fn complete_model_switch(&self, id: u64, model: ModelStatus) {
+        self.finish_loading(model);
+        if let Ok(mut switch) = self.model_switch.lock() {
+            if switch.id == id { switch.state = "complete"; switch.completed_at_ms = Some(unix_now_ms()); }
+        }
+    }
+
+    pub fn fail_model_switch(&self, id: u64, message: String, restored: bool) {
+        if let Ok(mut loading) = self.loading.lock() { *loading = None; }
+        if restored { self.set_phase("ready", Some("Selected model failed; previous model restored".into())); }
+        else { self.set_phase("error", Some(message.clone())); }
+        if let Ok(mut switch) = self.model_switch.lock() {
+            if switch.id == id { switch.state = "failed"; switch.completed_at_ms = Some(unix_now_ms()); switch.error = Some(message); }
+        }
+    }
+
+    pub fn switch_json(&self) -> String { self.switch_value().to_string() }
+
+    fn switch_value(&self) -> Value {
+        self.model_switch.lock().map(|s| json!({"id":s.id,"state":s.state,
+            "requested_path":s.requested_path,"previous_model":s.previous_model,
+            "accepted_at_ms":s.accepted_at_ms,"completed_at_ms":s.completed_at_ms,"error":s.error}))
+            .unwrap_or(Value::Null)
+    }
+
+    pub fn json(&self, metrics: &Metrics) -> String {
+        let (phase, detail) = self
+            .phase
+            .lock()
+            .map(|p| (p.name, p.detail.clone()))
+            .unwrap_or(("unknown", None));
+        let model = self.model.lock().map(|m| m.clone()).unwrap_or(ModelStatus {
+            id: "unknown".into(), path: PathBuf::new(), drafter: None, vision: None });
+        let vision = model.vision.as_ref().map(|v| json!({"enabled":true,"projector":v.projector,
+            "threads":v.threads,"min_tokens":v.min_tokens,"max_tokens":v.max_tokens,"device":v.device}))
+            .unwrap_or_else(|| json!({"enabled":false}));
+        let network = self.network_json();
+        let loading = self.loading_json();
+        let (history_summary, performance) = self.history.lock().map(|history| {
+            let active = history.entries.iter().rev().find(|run| run.state == "active")
+                .map(run_summary_json).unwrap_or(Value::Null);
+            let last = history.entries.iter().rev().find(|run| run.state == "complete")
+                .map(run_summary_json).unwrap_or(Value::Null);
+            let errored = history.entries.iter().filter(|run| run.state == "errored").count();
+            (json!({"capacity":history.capacity,"retained":history.entries.len(),
+                    "active_count":history.entries.iter().filter(|run| run.state == "active").count(),
+                    "completed":history.entries.iter().filter(|run| run.state == "complete").count(),
+                    "errored":errored,
+                    "active":active,"last_completed":last,
+                    "capture":"requests and responses retained in process memory; image data redacted"}),
+             performance_json(metrics, &history))
+        }).unwrap_or((json!({"capacity":RUN_HISTORY_CAPACITY,"retained":0}), Value::Null));
+        json!({
+            "service":{"name":"reinstinct","version":env!("CARGO_PKG_VERSION")},
+            "status":phase,"status_detail":detail,"started_at":self.started_at,
+            "uptime_seconds":super::unix_now().saturating_sub(self.started_at),
+            "endpoint":{"target":self.target,"port":self.port},
+            "model":{"id":model.id,"path":model.path,"max_context_tokens":self.max_seq,
+                "drafter":model.drafter,"vision":vision,"catalog_root":self.model_dir},
+            "worker":{"queued_requests":self.queued.load(Ordering::Relaxed),
+                "active_request_id":match self.active_request.load(Ordering::Relaxed){0=>Value::Null,n=>json!(n)}},
+            "performance":performance,
+            "loading":loading,
+            "network":network,
+            "run_history":history_summary,
+            "logs":logs_summary_json(),
+            "management":{"model_switch":self.switch_value(),"switch_requires_action_header":true},
+            "gpu":gpu_json(),
+            "metrics":{"requests_total":metrics.requests_total.load(Ordering::Relaxed),
+                "http_requests_total":metrics.requests_total.load(Ordering::Relaxed),
+                "inference_runs_total":metrics.inference_runs_total.load(Ordering::Relaxed),
+                "requests_ok":metrics.requests_ok.load(Ordering::Relaxed),
+                "requests_4xx":metrics.requests_4xx.load(Ordering::Relaxed),
+                "requests_5xx":metrics.requests_5xx.load(Ordering::Relaxed),
+                "prompt_tokens":metrics.prompt_tokens.load(Ordering::Relaxed),
+                "completion_tokens":metrics.completion_tokens.load(Ordering::Relaxed),
+                "prefill_us_total":metrics.prefill_us_total.load(Ordering::Relaxed),
+                "generation_us_total":metrics.decode_us_total.load(Ordering::Relaxed),
+                "ttft_us_total":metrics.ttft_us_total.load(Ordering::Relaxed),
+                "panics_recovered":metrics.panics_recovered.load(Ordering::Relaxed)},
+            "api":{"openapi":"/openapi.json","docs":"/docs","health":"/healthz","ready":"/readyz",
+                "models":"/v1/models","runs":"/api/runs","logs":"/api/logs","catalog":"/api/models"}
+        }).to_string()
+    }
+
+    fn network_json(&self) -> Value {
+        let now = unix_now_ms();
+        let (rx, tx) = network_totals();
+        let mut sample = match self.network.lock() { Ok(sample) => sample, Err(_) => return Value::Null };
+        if sample.at_ms > 0 && now > sample.at_ms {
+            let seconds = (now - sample.at_ms) as f64 / 1000.0;
+            sample.rx_mbps = rx.saturating_sub(sample.rx_bytes) as f64 * 8.0 / seconds / 1_000_000.0;
+            sample.tx_mbps = tx.saturating_sub(sample.tx_bytes) as f64 * 8.0 / seconds / 1_000_000.0;
+        }
+        sample.at_ms = now; sample.rx_bytes = rx; sample.tx_bytes = tx;
+        json!({"receive_mbps":sample.rx_mbps,"transmit_mbps":sample.tx_mbps,
+            "receive_bytes":rx,"transmit_bytes":tx,
+            "scope":"sum of non-loopback Linux interfaces"})
+    }
+
+    fn loading_json(&self) -> Value {
+        let loading = match self.loading.lock() { Ok(loading) => loading, Err(_) => return Value::Null };
+        let Some(load) = loading.as_ref() else { return Value::Null };
+        let elapsed_ms = unix_now_ms().saturating_sub(load.started_at_ms);
+        let (rx, _) = network_totals();
+        let observed = rx.saturating_sub(load.network_rx_start).min(load.expected_bytes);
+        let transfer_fraction = if load.expected_bytes > 0 { observed as f64 / load.expected_bytes as f64 } else { 0.0 };
+        // Model parsing, GPU allocation and graph setup continue after NFS
+        // transfer. Never claim completion until the worker is actually ready.
+        let progress = transfer_fraction.min(0.98);
+        let bytes_per_second = if elapsed_ms > 0 { observed as f64 * 1000.0 / elapsed_ms as f64 } else { 0.0 };
+        let eta_seconds = if bytes_per_second > 0.0 && observed < load.expected_bytes {
+            Some((load.expected_bytes - observed) as f64 / bytes_per_second) } else { None };
+        let stage = if transfer_fraction >= 1.0 { "finalizing_gpu" } else { "receiving_model" };
+        json!({"elapsed_seconds":elapsed_ms as f64 / 1000.0,"expected_bytes":load.expected_bytes,
+            "observed_network_bytes":observed,"estimated_fraction":progress,
+            "transfer_fraction":transfer_fraction,"stage":stage,
+            "estimated_eta_seconds":eta_seconds,"estimate_basis":"network receive bytes during load"})
+    }
+}
+
+pub fn resolve_catalog_model(root: &std::path::Path, requested: &str) -> Option<(PathBuf, Option<PathBuf>)> {
+    let wanted = std::fs::canonicalize(requested).ok()?;
+    let canonical_root = std::fs::canonicalize(root).ok()?;
+    if !wanted.starts_with(&canonical_root) { return None; }
+    let metadata = std::fs::metadata(&wanted).ok()?;
+    if !metadata.is_file() || !is_model_gguf(&wanted) { return None; }
+    Some((wanted.clone(), projector_for(&wanted)))
+}
+
+fn catalog_value(root: &std::path::Path) -> Value {
+    let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut files = Vec::new();
+    scan_gguf(&canonical_root, &mut files);
+    let mut projectors: HashMap<PathBuf, PathBuf> = HashMap::new();
+    for path in &files {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_ascii_lowercase();
+        if name.starts_with("mmproj") && name.ends_with(".gguf") {
+            if let Some(parent) = path.parent() {
+                projectors.entry(parent.to_path_buf()).and_modify(|current| {
+                    if path < current { *current = path.clone(); }
+                }).or_insert_with(|| path.clone());
+            }
+        }
+    }
+    let mut models: Vec<Value> = files.into_iter().filter(|path| is_model_gguf(path)).map(|path| {
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let projector = path.parent().and_then(|parent| projectors.get(parent)).cloned();
+        json!({"id":path.file_stem().and_then(|s| s.to_str()).unwrap_or("model"),
+            "path":path,"size_bytes":size,"size_gib":size as f64 / 1_073_741_824.0,
+            "image_projector":projector,"vision_capable":projector.is_some()})
+    }).collect();
+    models.sort_by(|a,b| a["path"].as_str().cmp(&b["path"].as_str()));
+    json!({"root":canonical_root,"count":models.len(),"models":models})
+}
+
+fn catalog_response(cache: &CatalogCache, cached: bool) -> Value {
+    let mut value = cache.value.clone();
+    if let Value::Object(ref mut map) = value {
+        map.insert("cached".into(), json!(cached));
+        map.insert("scanned_at_ms".into(), json!(cache.scanned_at_ms));
+        map.insert("scan_duration_ms".into(), json!(cache.duration_ms));
+    }
+    value
+}
+
+fn scan_gguf(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(kind) = entry.file_type() else { continue };
+        if kind.is_dir() { scan_gguf(&path, out); }
+        else if kind.is_file() && path.extension().and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("gguf")).unwrap_or(false) {
+            out.push(path);
+        }
+    }
+}
+
+fn is_model_gguf(path: &std::path::Path) -> bool {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_ascii_lowercase();
+    path.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("gguf")).unwrap_or(false)
+        && !name.starts_with("mmproj") && !name.contains("projector")
+}
+
+fn projector_for(model: &std::path::Path) -> Option<PathBuf> {
+    let parent = model.parent()?;
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(parent).ok()?.flatten()
+        .map(|e| e.path()).filter(|path| {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_ascii_lowercase();
+            path.is_file() && name.starts_with("mmproj") && name.ends_with(".gguf")
+        }).collect();
+    candidates.sort();
+    candidates.into_iter().next().map(|p| std::fs::canonicalize(&p).unwrap_or(p))
+}
+
+fn network_totals() -> (u64, u64) {
+    let text = std::fs::read_to_string("/proc/net/dev").unwrap_or_default();
+    text.lines().filter_map(|line| {
+        let (name, values) = line.split_once(':')?;
+        if name.trim() == "lo" { return None; }
+        let fields: Vec<&str> = values.split_whitespace().collect();
+        Some((fields.first()?.parse::<u64>().ok()?, fields.get(8)?.parse::<u64>().ok()?))
+    }).fold((0, 0), |(ar, at), (rx, tx)| (ar.saturating_add(rx), at.saturating_add(tx)))
+}
+
+fn unix_now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+fn per_second(tokens: usize, milliseconds: f64) -> f64 {
+    if tokens > 0 && milliseconds > 0.0 { tokens as f64 * 1000.0 / milliseconds } else { 0.0 }
+}
+
+fn nullable_number(value: f64) -> Value {
+    if value > 0.0 && value.is_finite() { json!(value) } else { Value::Null }
+}
+
+fn stats_json(stats: &RunStats) -> Value {
+    json!({
+        "prompt_tokens":stats.prompt_tokens,
+        "completion_tokens":stats.completion_tokens,
+        "queue_ms":stats.queue_ms,
+        "prefill_ms":nullable_number(stats.prefill_ms),
+        "ttft_ms":nullable_number(stats.ttft_ms),
+        "generation_ms":nullable_number(stats.generation_ms),
+        "total_ms":nullable_number(stats.total_ms),
+        "prompt_tokens_per_second":nullable_number(stats.prompt_tokens_per_second),
+        "generation_tokens_per_second":nullable_number(stats.generation_tokens_per_second)
+    })
+}
+
+fn run_summary_json(run: &RunRecord) -> Value {
+    json!({
+        "id":run.id,"client_ip":run.client_ip,"method":run.method,"path":run.path,
+        "request_type":run.request_type,"state":run.state,
+        "queued_at_ms":run.queued_at_ms,"started_at_ms":run.started_at_ms,
+        "completed_at_ms":run.completed_at_ms,"status_code":run.status_code,
+        "error":run.error,"stats":stats_json(&run.stats)
+    })
+}
+
+fn run_detail_json(run: &RunRecord) -> Value {
+    let mut value = run_summary_json(run);
+    if let Value::Object(ref mut map) = value {
+        map.insert("request".into(), run.request.clone());
+        map.insert("response".into(), run.response.clone().unwrap_or(Value::Null));
+    }
+    value
+}
+
+fn performance_json(metrics: &Metrics, history: &RunHistory) -> Value {
+    let prompt_tokens = metrics.prompt_tokens.load(Ordering::Relaxed);
+    let completion_tokens = metrics.completion_tokens.load(Ordering::Relaxed);
+    let prefill_us = metrics.prefill_us_total.load(Ordering::Relaxed);
+    let generation_us = metrics.decode_us_total.load(Ordering::Relaxed);
+    let prompt_tps = if prefill_us > 0 { prompt_tokens as f64 * 1_000_000.0 / prefill_us as f64 } else { 0.0 };
+    let generation_tps = if generation_us > 0 { completion_tokens as f64 * 1_000_000.0 / generation_us as f64 } else { 0.0 };
+    let last = history.entries.iter().rev().find(|run| run.state == "complete");
+    json!({
+        "aggregate":{"prompt_tokens_per_second":nullable_number(prompt_tps),
+                     "generation_tokens_per_second":nullable_number(generation_tps)},
+        "last":{"prompt_tokens_per_second":last.map(|r| nullable_number(r.stats.prompt_tokens_per_second)).unwrap_or(Value::Null),
+                "generation_tokens_per_second":last.map(|r| nullable_number(r.stats.generation_tokens_per_second)).unwrap_or(Value::Null)}
+    })
+}
+
+fn capture_json(body: &str) -> Value {
+    if body.is_empty() { return Value::Null; }
+    match serde_json::from_str::<Value>(body) {
+        Ok(mut value) => {
+            redact_images(&mut value);
+            let compact = value.to_string();
+            if compact.len() <= CAPTURE_TEXT_BYTES { value }
+            else { json!({"truncated":true,"preview":truncate_utf8(&compact, CAPTURE_TEXT_BYTES)}) }
+        }
+        Err(_) => json!({"raw":truncate_utf8(body, CAPTURE_TEXT_BYTES),
+                         "truncated":body.len() > CAPTURE_TEXT_BYTES}),
+    }
+}
+
+fn redact_images(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                if key == "url" {
+                    if let Value::String(url) = child {
+                        if url.starts_with("data:image/") {
+                            *url = format!("[image data URL redacted: {} characters]", url.len());
+                            continue;
+                        }
+                    }
+                }
+                redact_images(child);
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(redact_images),
+        _ => {}
+    }
+}
+
+fn truncate_utf8(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes { return text.to_string(); }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) { end -= 1; }
+    format!("{}…", &text[..end])
+}
+
+fn error_message(body: &str) -> Option<String> {
+    serde_json::from_str::<Value>(body).ok()
+        .and_then(|v| v.get("error")?.get("message")?.as_str().map(str::to_string))
+}
+
+fn gpu_json() -> Value {
+    match crate::hip::device_count() {
+        Ok(n) => {
+            let name = (n > 0).then(|| crate::hip::device_name(0).ok()).flatten();
+            let memory=(n > 0).then(|| crate::hip::mem_info().ok()).flatten()
+            .map(|(free,total)|json!({"free_bytes":free,"used_bytes":total.saturating_sub(free),"total_bytes":total}));
+            let architecture = std::env::var("REINSTINCT_OFFLOAD_ARCH")
+                .unwrap_or_else(|_| crate::runtime::DEFAULT_ARCH.into());
+            json!({"available":n>0,"device_count":n,"name":name,"architecture":architecture,"memory":memory})
+        }
+        Err(e) => json!({"available":false,"error":e}),
+    }
+}
+
+pub fn openapi_json() -> String {
+    json!({"openapi":"3.1.0","info":{"title":"ReInstinct API","version":env!("CARGO_PKG_VERSION"),
+      "description":"OpenAI Chat Completions-compatible inference API. Unsupported API families are intentionally omitted."},
+      "servers":[{"url":"/"}],"paths":{
+        "/":{"get":{"summary":"Server dashboard","responses":{"200":{"description":"HTML status page","content":{"text/html":{}}}}}},
+        "/healthz":{"get":{"summary":"Liveness","responses":{"200":{"description":"Alive","content":{"text/plain":{"schema":{"type":"string"}}}}}}},
+        "/readyz":{"get":{"summary":"Readiness","responses":{"200":{"description":"Model ready","content":{"text/plain":{"schema":{"type":"string"}}}}},"503":{"description":"Loading or unavailable"}}},
+        "/api/status":{"get":{"summary":"Live server status","responses":{"200":{"description":"Runtime, model, queue, GPU and counters","content":{"application/json":{"schema":{"$ref":"#/components/schemas/ServerStatus"}}}}}}},
+        "/api/runs":{"get":{"summary":"List bounded in-memory inference run history","responses":{"200":{"description":"Newest retained runs first","content":{"application/json":{"schema":{"$ref":"#/components/schemas/RunList"}}}}}}},
+        "/api/runs/{id}":{"get":{"summary":"Get one retained run with captured request and response","parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"integer"}}],"responses":{"200":{"description":"Run detail","content":{"application/json":{"schema":{"$ref":"#/components/schemas/RunDetail"}}}},"404":{"description":"Run was evicted or does not exist","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}}},
+        "/api/logs":{"get":{"summary":"List bounded in-memory engine logs","responses":{"200":{"description":"Oldest-to-newest log lines"}}}},
+        "/api/models":{"get":{"summary":"Scan the configured model catalog","responses":{"200":{"description":"Canonical model paths, sizes, and associated image projectors"}}}},
+        "/api/models/switch":{"get":{"summary":"Get current model-switch state"},"post":{"summary":"Queue replacement of the resident big model","parameters":[{"name":"X-ReInstinct-Action","in":"header","required":true,"schema":{"const":"switch-model"}}],"responses":{"202":{"description":"Switch queued"},"400":{"description":"Missing action header or invalid model"},"409":{"description":"Busy or unavailable"}}}},
+        "/v1/models":{"get":{"summary":"List models","responses":{"200":{"description":"Models available on this port","content":{"application/json":{}}}}}},
+        "/v1/models/{model}":{"get":{"summary":"Retrieve a model","parameters":[{"name":"model","in":"path","required":true,"schema":{"type":"string"}}],"responses":{"200":{"description":"Selected model","content":{"application/json":{}}},"404":{"description":"Model not found","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}}},
+        "/v1/completions":{"post":{"summary":"Create a text completion","requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/CompletionRequest"}}}},"responses":response_set()}},
+        "/v1/chat/completions":{"post":{"summary":"Create a chat completion","description":"Text plus one JPEG/PNG data-URL image in user content.","requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/ChatCompletionRequest"}}}},"responses":response_set()}}
+      },"components":{"schemas":{
+        "CompletionRequest":{"type":"object","required":["prompt"],"properties":common_request(json!({"prompt":{"type":"string"}}))},
+        "ChatCompletionRequest":{"type":"object","required":["messages"],"properties":common_request(json!({"messages":{"type":"array","minItems":1,"items":{"$ref":"#/components/schemas/ChatMessage"}}}))},
+        "ChatMessage":{"type":"object","required":["role","content"],"properties":{"role":{"type":"string","enum":["system","user","assistant"]},"content":{"oneOf":[{"type":"string"},{"type":"array","items":{"oneOf":[{"$ref":"#/components/schemas/TextPart"},{"$ref":"#/components/schemas/ImagePart"}]}}]}}},
+        "TextPart":{"type":"object","required":["type","text"],"properties":{"type":{"const":"text"},"text":{"type":"string"}}},
+        "ImagePart":{"type":"object","required":["type","image_url"],"properties":{"type":{"const":"image_url"},"image_url":{"type":"object","required":["url"],"properties":{"url":{"type":"string","pattern":"^data:image/(jpeg|png);base64,"}}}}},
+        "ServerStatus":{"type":"object","additionalProperties":true},
+        "RunList":{"type":"object","additionalProperties":true},
+        "RunDetail":{"type":"object","additionalProperties":true},
+        "Error":{"type":"object","required":["error"],"properties":{"error":{"type":"object","required":["message","type","param","code"],"properties":{"message":{"type":"string"},"type":{"type":"string"},"param":{"oneOf":[{"type":"string"},{"type":"null"}]},"code":{"oneOf":[{"type":"string"},{"type":"null"}]}}}}}
+      }}}).to_string()
+}
+
+fn common_request(mut v: Value) -> Value {
+    let Value::Object(ref mut m) = v else {
+        return v;
+    };
+    m.extend(serde_json::Map::from_iter([
+        ("model".into(), json!({"type":"string"})),
+        (
+            "max_tokens".into(),
+            json!({"type":"integer","minimum":1,"maximum":4096,"default":256}),
+        ),
+        (
+            "max_completion_tokens".into(),
+            json!({"type":"integer","minimum":1,"maximum":4096,"description":"Alias for max_tokens; do not send both."}),
+        ),
+        (
+            "stop".into(),
+            json!({"oneOf":[{"type":"string","minLength":1},{"type":"array","maxItems":4,"items":{"type":"string","minLength":1}}]}),
+        ),
+        ("n".into(), json!({"type":"integer","const":1,"default":1})),
+        ("user".into(), json!({"type":"string","description":"Accepted for attribution and ignored by local inference."})),
+        ("metadata".into(), json!({"type":"object","description":"Accepted for attribution and ignored by local inference."})),
+        ("temperature".into(), json!({"type":"number","minimum":0})),
+        ("top_k".into(), json!({"type":"integer","minimum":0})),
+        (
+            "top_p".into(),
+            json!({"type":"number","minimum":0,"maximum":1}),
+        ),
+        (
+            "min_p".into(),
+            json!({"type":"number","minimum":0,"maximum":1}),
+        ),
+        ("frequency_penalty".into(), json!({"type":"number"})),
+        ("presence_penalty".into(), json!({"type":"number"})),
+        ("seed".into(), json!({"type":"integer"})),
+        ("stream".into(), json!({"type":"boolean","default":false})),
+        (
+            "stream_options".into(),
+            json!({"type":"object","properties":{"include_usage":{"type":"boolean"}}}),
+        ),
+        (
+            "logprobs".into(),
+            json!({"oneOf":[{"type":"boolean"},{"type":"integer","minimum":0,"maximum":20}]}),
+        ),
+        (
+            "top_logprobs".into(),
+            json!({"type":"integer","minimum":0,"maximum":20}),
+        ),
+        ("use_speculative".into(), json!({"type":"boolean"})),
+        (
+            "speculative_k".into(),
+            json!({"type":"integer","minimum":1,"maximum":4}),
+        ),
+        (
+            "request_timeout_seconds".into(),
+            json!({"type":"number","minimum":0.1,"maximum":600}),
+        ),
+    ]));
+    v
+}
+fn response_set() -> Value {
+    json!({"200":{"description":"Completion or SSE stream","content":{"application/json":{},"text/event-stream":{}}},"400":{"description":"Invalid request","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"503":{"description":"Unavailable","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}})
+}
+
+pub const DOCS_HTML: &str = r#"<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>ReInstinct API docs</title><link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css"></head><body><div id="swagger-ui"><a href="/openapi.json">OpenAPI document</a></div><script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script><script>if(window.SwaggerUIBundle)SwaggerUIBundle({url:'/openapi.json',dom_id:'#swagger-ui',deepLinking:true});</script></body></html>"#;
+pub const INDEX_HTML: &str = r#"<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>ReInstinct status</title><style>:root{color-scheme:dark;font:15px system-ui;background:#0b1017;color:#dbe7f3}body{max-width:1050px;margin:auto;padding:38px 22px}header{display:flex;justify-content:space-between;align-items:center}h1{margin:0}.badge{padding:6px 11px;border-radius:99px;background:#243243}.ready{background:#123d2c;color:#83f0b4}.error{background:#53242a;color:#ffabb3}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:14px;margin-top:24px}.card{background:#121a24;border:1px solid #263343;border-radius:12px;padding:17px}.card h2{font-size:13px;text-transform:uppercase;color:#8fa5bb;margin:0 0 14px}dl{display:grid;grid-template-columns:1fr 1.5fr;gap:8px;margin:0}dt{color:#8fa5bb}dd{margin:0;overflow-wrap:anywhere}nav{display:flex;gap:16px;margin-top:28px}a{color:#68d8ff}small{color:#7890a8}</style></head><body><header><div><h1>ReInstinct</h1><small id="version">Inference server</small></div><span id="phase" class="badge">connecting</span></header><div id="cards" class="grid"></div><nav><a href="/docs">API docs</a><a href="/openapi.json">OpenAPI 3.1</a><a href="/metrics">Metrics</a><a href="/v1/models">Models</a></nav><script>const e=x=>String(x??'—').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])),z=n=>n==null?'—':(n/1073741824).toFixed(2)+' GiB',c=(t,r)=>`<section class="card"><h2>${e(t)}</h2><dl>${r.map(x=>`<dt>${e(x[0])}</dt><dd>${e(x[1])}</dd>`).join('')}</dl></section>`;async function l(){try{let s=await(await fetch('/api/status',{cache:'no-store'})).json(),g=s.gpu||{},m=g.memory||{},v=s.model.vision||{};version.textContent=`v${s.service.version} · uptime ${s.uptime_seconds}s`;phase.textContent=s.status;phase.className='badge '+s.status;cards.innerHTML=c('Model',[['ID',s.model.id],['State',s.status_detail||s.status],['Context',s.model.max_context_tokens+' tokens'],['Drafter',s.model.drafter],['Vision',v.enabled?`${v.device}, ${v.threads} threads`:'disabled']])+c('Worker',[['Target',s.endpoint.target+':'+s.endpoint.port],['Active',s.worker.active_request_id],['Queued',s.worker.queued_requests],['Completed',s.metrics.requests_ok],['Errors',s.metrics.requests_4xx+s.metrics.requests_5xx]])+c('GPU',[['Available',g.available],['Device',g.name],['Architecture',g.architecture],['VRAM used',z(m.used_bytes)],['VRAM free',z(m.free_bytes)],['VRAM total',z(m.total_bytes)]])+c('Tokens',[['Prompt',s.metrics.prompt_tokens],['Completion',s.metrics.completion_tokens],['Total',s.metrics.prompt_tokens+s.metrics.completion_tokens]])}catch(_){phase.textContent='unavailable';phase.className='badge error'}}l();setInterval(l,3000)</script></body></html>"#;
+
+pub const INDEX_HTML_V2: &str = r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ReInstinct flight recorder</title>
+<style>
+:root{color-scheme:dark;--ink:#e8efe9;--muted:#89958f;--panel:#111816;--line:#2a3731;--accent:#b7ff5a;--cyan:#62d9d1;--warn:#ffc857;--bad:#ff6b6b;--bg:#080d0b;font-family:"Aptos Mono","Cascadia Code","IBM Plex Mono",monospace;background:var(--bg);color:var(--ink)}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;background:linear-gradient(90deg,rgba(183,255,90,.035) 1px,transparent 1px),linear-gradient(rgba(183,255,90,.025) 1px,transparent 1px),radial-gradient(circle at 82% 4%,#17352b 0,transparent 32%);background-size:32px 32px,32px 32px,auto}
+body:before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.18;background:repeating-linear-gradient(0deg,transparent 0 3px,#000 4px)}
+main{position:relative;width:min(1480px,calc(100% - 36px));margin:auto;padding:30px 0 48px}header{display:flex;justify-content:space-between;align-items:flex-end;border-bottom:1px solid var(--line);padding:8px 0 20px;margin-bottom:18px}.eyebrow{color:var(--accent);letter-spacing:.18em;font-size:11px;text-transform:uppercase}.title{font-family:Bahnschrift,"DIN Condensed",sans-serif;font-size:clamp(34px,6vw,70px);line-height:.9;letter-spacing:-.035em;margin:6px 0 0;text-transform:uppercase}.sub{color:var(--muted);font-size:12px;margin-top:10px}.badge{border:1px solid var(--line);padding:9px 13px;text-transform:uppercase;font-size:11px;letter-spacing:.13em;background:#131c18}.badge.ready{border-color:#5c8d40;color:var(--accent);box-shadow:0 0 22px rgba(183,255,90,.12)}.badge.error,.badge.unavailable{border-color:#733;color:var(--bad)}
+.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.card{background:linear-gradient(145deg,rgba(20,29,25,.96),rgba(11,17,14,.96));border:1px solid var(--line);padding:15px;min-height:122px;position:relative;overflow:hidden}.card:after{content:attr(data-index);position:absolute;right:9px;top:7px;color:#34423b;font-size:10px}.card h2{font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);margin:0 0 14px}.metric{font-family:Bahnschrift,"DIN Condensed",sans-serif;font-size:30px;letter-spacing:-.02em}.metric small{font:11px "Aptos Mono",monospace;color:var(--muted)}dl{display:grid;grid-template-columns:1fr auto;gap:7px;margin:0;font-size:11px}dt{color:var(--muted)}dd{margin:0;text-align:right;overflow-wrap:anywhere}.accent{color:var(--accent)}.cyan{color:var(--cyan)}.bad{color:var(--bad)}
+.runs{margin-top:20px;border:1px solid var(--line);background:rgba(9,14,12,.94)}.runs-head{display:flex;align-items:center;justify-content:space-between;padding:15px 16px;border-bottom:1px solid var(--line)}.runs-head h2{font:20px Bahnschrift,sans-serif;text-transform:uppercase;letter-spacing:.04em;margin:0}.runs-head p{font-size:10px;color:var(--muted);margin:3px 0 0}.live{display:flex;align-items:center;gap:7px;color:var(--muted);font-size:10px;text-transform:uppercase}.live:before{content:"";width:7px;height:7px;border-radius:50%;background:var(--accent);box-shadow:0 0 12px var(--accent);animation:pulse 1.8s infinite}@keyframes pulse{50%{opacity:.35}}
+.table-wrap{overflow:auto;max-height:520px}table{width:100%;border-collapse:collapse;font-size:11px;white-space:nowrap}th{position:sticky;top:0;z-index:1;background:#121b17;text-align:left;color:var(--muted);font-weight:500;text-transform:uppercase;letter-spacing:.09em;padding:10px 12px;border-bottom:1px solid var(--line)}td{padding:11px 12px;border-bottom:1px solid #1c2822}tbody tr{cursor:pointer;transition:background .15s,color .15s}tbody tr:hover{background:#19251f;color:#fff}.state{display:inline-block;min-width:72px;padding:4px 7px;border:1px solid var(--line);text-align:center;text-transform:uppercase;font-size:9px;letter-spacing:.08em}.state.complete{color:var(--accent);border-color:#42622f}.state.active{color:var(--cyan);border-color:#2b6b67}.state.queued{color:var(--warn);border-color:#765f30}.state.errored{color:var(--bad);border-color:#713535}.empty{padding:34px;text-align:center;color:var(--muted)}
+nav{display:flex;gap:18px;flex-wrap:wrap;margin-top:15px;font-size:11px}a{color:var(--cyan);text-decoration:none;border-bottom:1px solid transparent}a:hover{border-color:currentColor}.privacy{margin-left:auto;color:var(--muted)}
+dialog{width:min(900px,calc(100% - 28px));max-height:88vh;border:1px solid #53675d;background:#0d1411;color:var(--ink);padding:0;box-shadow:0 32px 90px #000}dialog::backdrop{background:rgba(0,0,0,.78);backdrop-filter:blur(3px)}.detail-head{position:sticky;top:0;display:flex;justify-content:space-between;align-items:center;background:#121b17;border-bottom:1px solid var(--line);padding:15px 18px;z-index:2}.detail-head h2{margin:0;font:22px Bahnschrift,sans-serif;text-transform:uppercase}.close{background:transparent;border:1px solid var(--line);color:var(--ink);padding:7px 10px;cursor:pointer}.detail-body{padding:18px}.detail-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:16px}.detail-grid div{border:1px solid var(--line);padding:10px}.detail-grid span{display:block;color:var(--muted);font-size:9px;text-transform:uppercase;margin-bottom:5px}.payload{margin-top:13px}.payload h3{font-size:10px;color:var(--muted);letter-spacing:.14em;text-transform:uppercase}pre{margin:0;max-height:310px;overflow:auto;background:#080c0a;border:1px solid var(--line);padding:14px;font:11px/1.55 "Cascadia Code",monospace;white-space:pre-wrap;overflow-wrap:anywhere}
+@media(max-width:900px){.grid{grid-template-columns:repeat(2,1fr)}.detail-grid{grid-template-columns:repeat(2,1fr)}header{align-items:flex-start}.badge{margin-top:4px}}@media(max-width:520px){main{width:min(100% - 20px,1480px);padding-top:18px}.grid{grid-template-columns:1fr}.title{font-size:42px}.privacy{margin-left:0}.runs-head{align-items:flex-start;gap:12px}}
+</style></head>
+<body><main><header><div><div class="eyebrow">gfx906 / inference telemetry</div><h1 class="title">ReInstinct</h1><div id="version" class="sub">Connecting to flight recorder…</div></div><span id="phase" class="badge">connecting</span></header>
+<section id="cards" class="grid"></section>
+<section class="runs"><div class="runs-head"><div><h2>Recent runs</h2><p>Newest first · click any row for captured request, response, and stage timings</p></div><div class="live">live refresh</div></div><div class="table-wrap"><table><thead><tr><th>ID / time</th><th>Client</th><th>Type</th><th>State</th><th>Tokens p / g</th><th>Prompt tok/s</th><th>Gen tok/s</th><th>TTFT</th><th>Total</th></tr></thead><tbody id="runRows"><tr><td colspan="9" class="empty">No inference runs retained yet.</td></tr></tbody></table></div></section>
+<nav><a href="/docs">API docs</a><a href="/openapi.json">OpenAPI 3.1</a><a href="/metrics">Prometheus</a><a href="/v1/models">Models</a><a href="/api/runs">Run JSON</a><span class="privacy">128-run memory buffer · image bytes redacted · clears on restart</span></nav>
+</main>
+<dialog id="detail"><div class="detail-head"><h2 id="detailTitle">Run detail</h2><button class="close" type="button" onclick="detail.close()">Close</button></div><div class="detail-body"><div id="detailGrid" class="detail-grid"></div><div class="payload"><h3>Request</h3><pre id="requestPayload"></pre></div><div class="payload"><h3>Response</h3><pre id="responsePayload"></pre></div></div></dialog>
+<script>
+const phase=document.getElementById('phase'),version=document.getElementById('version'),cards=document.getElementById('cards'),runRows=document.getElementById('runRows'),detail=document.getElementById('detail'),detailTitle=document.getElementById('detailTitle'),detailGrid=document.getElementById('detailGrid'),requestPayload=document.getElementById('requestPayload'),responsePayload=document.getElementById('responsePayload');
+const e=x=>String(x??'—').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const rate=n=>n==null?'—':Number(n).toFixed(1);const ms=n=>n==null?'—':Number(n)<1000?Number(n).toFixed(0)+' ms':(Number(n)/1000).toFixed(2)+' s';const gib=n=>n==null?'—':(n/1073741824).toFixed(1)+' GiB';
+const clock=n=>n?new Date(n).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'}):'—';
+const card=(i,t,hero,rows)=>`<article class="card" data-index="0${i}"><h2>${e(t)}</h2><div class="metric">${hero}</div><dl>${rows.map(r=>`<dt>${e(r[0])}</dt><dd>${r[1]}</dd>`).join('')}</dl></article>`;
+async function refresh(){try{const [s,h]=await Promise.all([fetch('/api/status',{cache:'no-store'}).then(r=>r.json()),fetch('/api/runs',{cache:'no-store'}).then(r=>r.json())]);renderStatus(s,h);renderRuns(h.runs||[])}catch(err){phase.textContent='unavailable';phase.className='badge unavailable'}}
+function renderStatus(s,h){const g=s.gpu||{},m=g.memory||{},v=s.model.vision||{},p=s.performance||{},a=p.aggregate||{},l=p.last||{},runs=h.runs||[],runErrors=runs.filter(r=>r.state==='errored').length;version.textContent=`v${s.service.version} · ${s.model.id} · uptime ${s.uptime_seconds}s`;phase.textContent=s.status;phase.className='badge '+s.status;cards.innerHTML=card(1,'Prompt throughput',`<span class="accent">${rate(a.prompt_tokens_per_second)}</span> <small>tok/s aggregate</small>`,[['Last run',`<span class="accent">${rate(l.prompt_tokens_per_second)} tok/s</span>`],['Prompt tokens',e(s.metrics.prompt_tokens)]])+card(2,'Generation throughput',`<span class="cyan">${rate(a.generation_tokens_per_second)}</span> <small>tok/s aggregate</small>`,[['Last run',`<span class="cyan">${rate(l.generation_tokens_per_second)} tok/s</span>`],['Generated tokens',e(s.metrics.completion_tokens)]])+card(3,'Worker',s.worker.active_request_id?`<span class="cyan">ACTIVE #${e(s.worker.active_request_id)}</span>`:`<span class="accent">IDLE</span>`,[['Queued',e(s.worker.queued_requests)],['Completed',e(s.metrics.requests_ok)],['Retained errors',`<span class="${runErrors?'bad':''}">${runErrors}</span>`],['HTTP 4xx / 5xx',`${e(s.metrics.requests_4xx)} / ${e(s.metrics.requests_5xx)}`]])+card(4,'GPU',`<span>${gib(m.used_bytes)}</span> <small>used</small>`,[['Device',e(g.name)],['Architecture',e(g.architecture)],['Free',gib(m.free_bytes)],['Vision',v.enabled?`${e(v.device)} / ${e(v.threads)} threads`:'disabled']]);}
+function renderRuns(runs){runRows.innerHTML=runs.length?runs.map(r=>{const x=r.stats||{};return `<tr data-id="${r.id}"><td><b>#${r.id}</b><br><span style="color:var(--muted)">${clock(r.queued_at_ms)}</span></td><td>${e(r.client_ip)}</td><td>${e(r.request_type)}${r.path.includes('chat')?'<br><span style="color:var(--muted)">chat</span>':''}</td><td><span class="state ${e(r.state)}">${e(r.state)}</span>${r.status_code?`<br><span style="color:var(--muted)">HTTP ${r.status_code}</span>`:''}</td><td>${e(x.prompt_tokens)} / ${e(x.completion_tokens)}</td><td class="accent">${rate(x.prompt_tokens_per_second)}</td><td class="cyan">${rate(x.generation_tokens_per_second)}</td><td>${ms(x.ttft_ms)}</td><td>${ms(x.total_ms)}</td></tr>`}).join(''):'<tr><td colspan="9" class="empty">No inference runs retained yet.</td></tr>';}
+runRows.addEventListener('click',async ev=>{const row=ev.target.closest('tr[data-id]');if(!row)return;const r=await fetch('/api/runs/'+row.dataset.id,{cache:'no-store'}).then(x=>x.json()),x=r.stats||{};detailTitle.textContent=`Run #${r.id} · ${r.state}`;detailGrid.innerHTML=[['Client',r.client_ip],['Route',r.method+' '+r.path],['State',r.state+(r.status_code?' / HTTP '+r.status_code:'')],['Queued',ms(x.queue_ms)],['Prompt',x.prompt_tokens+' tok / '+rate(x.prompt_tokens_per_second)+' tok/s'],['Generation',x.completion_tokens+' tok / '+rate(x.generation_tokens_per_second)+' tok/s'],['TTFT',ms(x.ttft_ms)],['Total',ms(x.total_ms)]].map(v=>`<div><span>${e(v[0])}</span>${e(v[1])}</div>`).join('');requestPayload.textContent=JSON.stringify(r.request,null,2);responsePayload.textContent=JSON.stringify(r.response,null,2);detail.showModal()});
+refresh();setInterval(refresh,2000);
+</script></body></html>"#;
+
+pub const INDEX_HTML_V3: &str = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ReInstinct operations</title><style>
+:root{color-scheme:dark;--bg:#080d0b;--panel:#101814;--line:#2a3931;--ink:#e8efe9;--muted:#8b9991;--lime:#b7ff5a;--cyan:#62d9d1;--red:#ff6b6b;--amber:#ffc857;font:13px "Cascadia Code",monospace;background:var(--bg);color:var(--ink)}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 85% 0,#17352b,transparent 32%),linear-gradient(90deg,#b7ff5a08 1px,transparent 1px),linear-gradient(#b7ff5a06 1px,transparent 1px);background-size:auto,32px 32px,32px 32px}main{width:min(1500px,calc(100% - 32px));margin:auto;padding:28px 0 44px}header,.row,.section-head{display:flex;align-items:center;justify-content:space-between;gap:14px}header{align-items:flex-end;border-bottom:1px solid var(--line);padding-bottom:18px}.eyebrow,summary,.label{color:var(--muted);text-transform:uppercase;letter-spacing:.13em;font-size:10px}h1{font:700 clamp(38px,6vw,68px)/.9 Bahnschrift,sans-serif;text-transform:uppercase;margin:6px 0}.sub{color:var(--muted);font-size:11px}.badge,.btn,input{border:1px solid var(--line);background:#131d18;color:var(--ink);padding:8px 11px}.badge{text-transform:uppercase;letter-spacing:.12em;font-size:10px}.ready{color:var(--lime);border-color:#567a3c}.loading{color:var(--amber)}.error,.bad{color:var(--red)}.grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:9px;margin:18px 0}.card,details{background:linear-gradient(145deg,#141d19f5,#0b110ef5);border:1px solid var(--line)}.card{min-height:118px;padding:14px}.card h2{margin:0 0 13px;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em}.hero{font:28px Bahnschrift,sans-serif;margin-bottom:10px}.lime{color:var(--lime)}.cyan{color:var(--cyan)}dl{display:grid;grid-template-columns:1fr auto;gap:6px;margin:0;font-size:10px}dt{color:var(--muted)}dd{margin:0;text-align:right;overflow-wrap:anywhere}details{margin-top:12px}summary{cursor:pointer;padding:14px 16px;list-style:none;display:flex;justify-content:space-between}summary::-webkit-details-marker{display:none}summary:after{content:"+";color:var(--lime)}details[open]>summary{border-bottom:1px solid var(--line)}details[open]>summary:after{content:"−"}.summary-meta{margin-left:auto;margin-right:14px;color:var(--ink);letter-spacing:0;text-transform:none}.tools{padding:10px 14px;border-bottom:1px solid var(--line);display:flex;gap:9px;align-items:center;flex-wrap:wrap}.btn{cursor:pointer;font:11px inherit}.btn:hover{border-color:var(--cyan);color:var(--cyan)}input{min-width:260px;font:11px inherit}.progress{height:10px;border:1px solid var(--line);background:#070b09;overflow:hidden;margin-top:9px}.progress i{display:block;height:100%;background:linear-gradient(90deg,var(--cyan),var(--lime));transition:width .4s}.table-wrap{overflow:auto;max-height:500px}table{width:100%;border-collapse:collapse;white-space:nowrap;font-size:10px}th{position:sticky;top:0;background:#121b17;color:var(--muted);text-align:left;text-transform:uppercase;letter-spacing:.08em;padding:9px 11px}td{padding:10px 11px;border-top:1px solid #1c2822}tbody tr{cursor:pointer}tbody tr:hover{background:#19251f}.state{padding:3px 6px;border:1px solid var(--line);text-transform:uppercase}.state.complete{color:var(--lime)}.state.active{color:var(--cyan)}.state.errored{color:var(--red)}#logLines{height:360px;overflow:auto;margin:0;padding:14px;background:#060a08;white-space:pre-wrap;font:11px/1.55 "Cascadia Code",monospace;color:#b9c8bf}.model-list{padding:12px;display:grid;gap:8px}.model{border:1px solid var(--line);padding:11px;display:grid;grid-template-columns:1fr auto;gap:5px 15px}.model .path{color:var(--muted);font-size:10px;overflow-wrap:anywhere}.model.active-model{border-color:#567a3c}.model button{grid-row:1/4;grid-column:2;align-self:center}nav{display:flex;gap:16px;flex-wrap:wrap;margin-top:14px;font-size:10px}a{color:var(--cyan);text-decoration:none}.privacy{margin-left:auto;color:var(--muted)}dialog{width:min(900px,calc(100% - 24px));max-height:88vh;border:1px solid #53675d;background:#0d1411;color:var(--ink);padding:0}dialog::backdrop{background:#000c}.dialog-head{position:sticky;top:0;background:#121b17;border-bottom:1px solid var(--line);padding:13px 16px;display:flex;justify-content:space-between}.dialog-body{padding:16px}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:7px}.stats div{border:1px solid var(--line);padding:9px}.stats span{display:block;color:var(--muted);font-size:9px}pre.payload{max-height:280px;overflow:auto;background:#060a08;border:1px solid var(--line);padding:12px;white-space:pre-wrap;overflow-wrap:anywhere}@media(max-width:1050px){.grid{grid-template-columns:repeat(2,1fr)}}@media(max-width:580px){.grid{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,1fr)}header{align-items:flex-start}.privacy{margin-left:0}}
+</style></head><body><main><header><div><div class="eyebrow">gfx906 / operations console</div><h1>ReInstinct</h1><div id="version" class="sub">Connecting…</div></div><span id="phase" class="badge">connecting</span></header><section id="cards" class="grid"></section><section id="loadPanel" class="card" style="display:none"><div class="row"><div><div class="label">Model loading estimate</div><strong id="loadText"></strong></div><strong id="loadPct" class="cyan"></strong></div><div class="progress"><i id="loadBar"></i></div><div id="loadHint" class="sub" style="margin-top:8px"></div></section>
+<details id="modelsPanel"><summary>Model catalog <span id="modelSummary" class="summary-meta">not scanned</span></summary><div class="tools"><button id="scanModels" class="btn">Refresh models</button><input id="modelFilter" type="search" placeholder="Filter models or paths…"><span class="sub">NFS scan is cached until refreshed. Switching waits for an idle worker.</span></div><div id="modelList" class="model-list"></div></details>
+<details id="runsPanel" open><summary>Recent runs <span id="runSummary" class="summary-meta">0 retained</span></summary><div class="tools"><input id="runFilter" type="search" placeholder="Filter runs by IP, route, state…"></div><div class="table-wrap"><table><thead><tr><th>ID / time</th><th>Client</th><th>Type</th><th>State</th><th>Tokens p/g</th><th>Prompt tok/s</th><th>Gen tok/s</th><th>TTFT</th><th>Total</th></tr></thead><tbody id="runRows"></tbody></table></div></details>
+<details id="logsPanel"><summary>Engine logs <span id="logSummary" class="summary-meta">0 retained</span></summary><div class="tools"><input id="logFilter" type="search" placeholder="Filter logs (text or level)…"><button id="logTail" class="btn">Jump to latest</button></div><pre id="logLines">Open this panel to load captured logs.</pre></details>
+<nav><a href="/docs">API docs</a><a href="/openapi.json">OpenAPI</a><a href="/metrics">Prometheus</a><a href="/api/runs">Run JSON</a><a href="/api/logs">Log JSON</a><span class="privacy">memory-only telemetry · clears on restart</span></nav></main>
+<dialog id="detail"><div class="dialog-head"><strong id="detailTitle">Run detail</strong><button class="btn" onclick="detail.close()">Close</button></div><div class="dialog-body"><div id="detailStats" class="stats"></div><h3 class="label">Request</h3><pre id="requestPayload" class="payload"></pre><h3 class="label">Response</h3><pre id="responsePayload" class="payload"></pre></div></dialog>
+<script>
+const $=id=>document.getElementById(id),esc=x=>String(x??'—').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])),rate=n=>n==null?'—':Number(n).toFixed(1),ms=n=>n==null?'—':n<1000?Number(n).toFixed(0)+' ms':(n/1000).toFixed(2)+' s',gib=n=>n==null?'—':(n/1073741824).toFixed(1)+' GiB',net=n=>n==null?'—':n>=1000?(n/1000).toFixed(2)+' Gbps':Number(n).toFixed(1)+' Mbps',clock=n=>n?new Date(n).toLocaleTimeString():'—';let cachedLogs=[],cachedRuns=[],lastHistory={};
+const card=(t,h,rows)=>`<article class="card"><h2>${esc(t)}</h2><div class="hero">${h}</div><dl>${rows.map(r=>`<dt>${esc(r[0])}</dt><dd>${r[1]}</dd>`).join('')}</dl></article>`;
+async function refresh(){try{const s=await fetch('/api/status',{cache:'no-store'}).then(r=>r.json());renderStatus(s);if($('runsPanel').open){const h=await fetch('/api/runs',{cache:'no-store'}).then(r=>r.json());cachedRuns=h.runs||[];lastHistory=h;renderRuns(h)}else{lastHistory=s.run_history||{};renderRunSummary(lastHistory)}if($('logsPanel').open){const l=await fetch('/api/logs',{cache:'no-store'}).then(r=>r.json());cachedLogs=l.lines||[];renderLogs();$('logSummary').textContent=`${l.retained||0} / ${l.capacity||0} retained`}else{$('logSummary').textContent=`${(s.logs||{}).retained||0} / ${(s.logs||{}).capacity||0} retained`}}catch(e){$('phase').textContent='unavailable';$('phase').className='badge error'}}
+function renderStatus(s){window.currentModel=s.model.id;const p=s.performance||{},a=p.aggregate||{},last=p.last||{},g=s.gpu||{},m=g.memory||{},n=s.network||{},v=s.model.vision||{},rh=s.run_history||{},sw=s.management?.model_switch||{};$('version').textContent=`v${s.service.version} · ${s.model.id} · uptime ${s.uptime_seconds}s`;$('phase').textContent=s.status;$('phase').className='badge '+s.status;if(sw.state==='queued'||sw.state==='loading')$('version').textContent+=` · model switch ${sw.state} #${sw.id}`;if(sw.state==='failed')$('version').textContent+=` · switch failed: ${sw.error||'unknown error'}`;$('cards').innerHTML=card('Prompt throughput',`<span class="lime">${rate(a.prompt_tokens_per_second)}</span> <small>tok/s</small>`,[['Last run',rate(last.prompt_tokens_per_second)],['Prompt tokens',s.metrics.prompt_tokens]])+card('Generation throughput',`<span class="cyan">${rate(a.generation_tokens_per_second)}</span> <small>tok/s</small>`,[['Last run',rate(last.generation_tokens_per_second)],['Generated',s.metrics.completion_tokens]])+card('Worker',s.worker.active_request_id?`<span class="cyan">ACTIVE #${s.worker.active_request_id}</span>`:'<span class="lime">IDLE</span>',[['Queued',s.worker.queued_requests],['Complete / errors',`${s.metrics.requests_ok} / ${rh.errored||0}`]])+card('GPU',gib(m.used_bytes),[['Free',gib(m.free_bytes)],['Vision',v.enabled?`yes · ${esc(v.device)}`:'no']])+card('Network',`<span class="cyan">${net(n.receive_mbps)}</span>`,[['Transmit',net(n.transmit_mbps)],['Scope',esc(n.scope)]]);const x=s.loading;if(x){$('loadPanel').style.display='block';const pct=Math.min(98,(x.estimated_fraction||0)*100);$('loadBar').style.width=pct+'%';$('loadPct').textContent=pct.toFixed(1)+'%';$('loadText').textContent=`${x.elapsed_seconds.toFixed(0)}s elapsed · ${x.stage==='finalizing_gpu'?'finalizing GPU setup':x.estimated_eta_seconds==null?'ETA calculating':Math.ceil(x.estimated_eta_seconds)+'s estimated remaining'}`;$('loadHint').textContent=`${gib(x.observed_network_bytes)} observed / ${gib(x.expected_bytes)} model · ${x.estimate_basis}`}else $('loadPanel').style.display='none';document.querySelectorAll('#modelList button[data-path]').forEach(b=>b.disabled=sw.state==='queued'||sw.state==='loading');renderRunSummary(rh)}
+function renderRunSummary(h){$('runSummary').textContent=`${h.retained||0} retained · ${h.active?'1 active':'0 active'} · ${h.errored||0} errors`}
+function renderRuns(h){const q=$('runFilter').value.toLowerCase(),runs=(h.runs||[]).filter(r=>!q||[r.client_ip,r.path,r.request_type,r.state,String(r.status_code||'')].join(' ').toLowerCase().includes(q));renderRunSummary(h);$('runRows').innerHTML=runs.length?runs.map(r=>{const x=r.stats||{};return `<tr data-id="${r.id}"><td><b>#${r.id}</b><br>${clock(r.queued_at_ms)}</td><td>${esc(r.client_ip)}</td><td>${esc(r.request_type)}</td><td><span class="state ${esc(r.state)}">${esc(r.state)}</span></td><td>${x.prompt_tokens||0}/${x.completion_tokens||0}</td><td class="lime">${rate(x.prompt_tokens_per_second)}</td><td class="cyan">${rate(x.generation_tokens_per_second)}</td><td>${ms(x.ttft_ms)}</td><td>${ms(x.total_ms)}</td></tr>`}).join(''):'<tr><td colspan="9">No matching retained runs.</td></tr>'}
+function renderLogs(){const q=$('logFilter').value.toLowerCase(),lines=cachedLogs.filter(x=>x.toLowerCase().includes(q));$('logLines').textContent=lines.join('\n')||'No matching logs.'}
+ $('logFilter').addEventListener('input',renderLogs);$('runFilter').addEventListener('input',()=>renderRuns(Object.assign({runs:cachedRuns},lastHistory)));$('modelFilter').addEventListener('input',()=>filterModels());$('logTail').onclick=()=>{$('logLines').scrollTop=$('logLines').scrollHeight};$('logsPanel').addEventListener('toggle',()=>{if($('logsPanel').open)refresh()});$('runsPanel').addEventListener('toggle',()=>{if($('runsPanel').open)refresh()});$('runRows').onclick=async e=>{const row=e.target.closest('tr[data-id]');if(!row)return;const r=await fetch('/api/runs/'+row.dataset.id).then(x=>x.json()),x=r.stats||{};$('detailTitle').textContent=`Run #${r.id} · ${r.state}`;$('detailStats').innerHTML=[['Client',r.client_ip],['Route',r.method+' '+r.path],['Prompt',`${x.prompt_tokens} · ${rate(x.prompt_tokens_per_second)} tok/s`],['Generation',`${x.completion_tokens} · ${rate(x.generation_tokens_per_second)} tok/s`],['TTFT',ms(x.ttft_ms)],['Total',ms(x.total_ms)]].map(v=>`<div><span>${esc(v[0])}</span>${esc(v[1])}</div>`).join('');$('requestPayload').textContent=JSON.stringify(r.request,null,2);$('responsePayload').textContent=JSON.stringify(r.response,null,2);$('detail').showModal()};
+function filterModels(){const q=$('modelFilter').value.toLowerCase();document.querySelectorAll('.model').forEach(row=>row.hidden=!!q&&!row.textContent.toLowerCase().includes(q))}
+$('scanModels').onclick=async()=>{const b=$('scanModels');b.disabled=true;b.textContent='Refreshing…';try{const c=await fetch('/api/models?refresh=1',{cache:'no-store'}).then(r=>r.json());$('modelSummary').textContent=`${c.count} models · ${c.root} · ${c.scan_duration_ms} ms`;$('modelList').innerHTML=c.models.map(m=>`<div class="model ${m.id===window.currentModel?'active-model':''}"><strong>${esc(m.id)}</strong><button class="btn" data-path="${esc(m.path)}" ${m.id===window.currentModel?'disabled':''}>${m.id===window.currentModel?'Loaded':'Load model'}</button><span>${Number(m.size_gib).toFixed(2)} GiB · ${m.vision_capable?'image projector found':'text only'}</span><span class="path">${esc(m.path)}${m.image_projector?'<br>projector: '+esc(m.image_projector):''}</span></div>`).join('');filterModels()}catch(e){$('modelList').textContent='Catalog scan failed: '+e}finally{b.disabled=false;b.textContent='Refresh models'}};
+$('modelList').onclick=async e=>{const b=e.target.closest('button[data-path]');if(!b)return;const path=b.dataset.path;if(!confirm(`Unload the current model and load:\n${path}\n\nInference will pause during loading.`))return;b.disabled=true;b.textContent='Queued…';try{const r=await fetch('/api/models/switch',{method:'POST',headers:{'Content-Type':'application/json','X-ReInstinct-Action':'switch-model'},body:JSON.stringify({path})}),j=await r.json();if(!r.ok)throw new Error(j.error?.message||'switch failed');$('modelSummary').textContent=`switch #${j.id} queued`;refresh()}catch(e){alert(e.message)}finally{b.disabled=false}};
+refresh();setInterval(refresh,2000);
+</script></body></html>"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_openapi() {
+        let v: serde_json::Value = serde_json::from_str(&openapi_json()).unwrap();
+        assert_eq!(v["openapi"], "3.1.0");
+        assert!(v["paths"]["/v1/chat/completions"].is_object());
+        assert!(v["paths"]["/api/runs"].is_object());
+        assert!(v["paths"]["/api/runs/{id}"].is_object());
+    }
+
+    #[test]
+    fn capture_redacts_image_data_but_keeps_prompt() {
+        let captured = capture_json(r#"{"messages":[{"content":[{"type":"text","text":"describe"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}]}"#);
+        let text = captured.to_string();
+        assert!(text.contains("describe"));
+        assert!(text.contains("image data URL redacted"));
+        assert!(!text.contains("base64,AAAA"));
+    }
+
+    #[test]
+    fn run_history_evicts_oldest_at_capacity() {
+        let mut history = RunHistory::new();
+        for id in 1..=(RUN_HISTORY_CAPACITY as u64 + 1) {
+            history.push(RunRecord { id, client_ip: "127.0.0.1".into(),
+                method: "POST".into(), path: "/v1/chat/completions".into(),
+                request_type: "chat".into(), state: "complete", queued_at_ms: id,
+                started_at_ms: Some(id), completed_at_ms: Some(id), status_code: Some(200),
+                request: Value::Null, response: Some(Value::Null), error: None,
+                stats: RunStats::default() });
+        }
+        assert_eq!(history.entries.len(), RUN_HISTORY_CAPACITY);
+        assert!(history.find(1).is_none());
+        assert!(history.find(RUN_HISTORY_CAPACITY as u64 + 1).is_some());
+    }
+}

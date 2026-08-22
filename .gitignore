@@ -3,6 +3,10 @@
 Cargo.lock.bak
 **/*.rs.bk
 
+# .NET
+**/bin/
+**/obj/
+
 # Compiled HIP kernel cache (per-host, regenerated on demand)
 /.cache
 *.hsaco

@@ -331,6 +331,7 @@ runs the target model, and replies. Models never run concurrently
 | Option | Default | Meaning |
 |---|---|---|
 | `--big <PATH>` | required | Big-model GGUF (~30B dense — Qwen 3.x or Gemma 4 31B). |
+| `--model-dir <PATH>` | big-model parent | Trusted root recursively scanned by the dashboard model catalog. Dashboard switching accepts only canonical GGUF paths inside this root. |
 | `--big-drafter <PATH>` | — | Optional MTP drafter for the big model (Gemma 4 only). When present, the big port accepts `use_speculative: bool` on requests; default-on. |
 | `--small <PATH>` | required | Small-model GGUF (Qwen 3.5 4B or Gemma E4B). |
 | `--embed <PATH>` | — | Embedder GGUF (nomic-embed). Accepted but deferred — the port answers 503 until the encoder runtime lands. |
@@ -537,6 +538,62 @@ compare against the CPU baseline.
 OpenAI-shaped JSON HTTP, exposed by the `serve` command. Two endpoints
 on each LLM port:
 
+### API discovery and server status
+
+Every enabled serve port exposes a browser dashboard at `GET /`. Its live
+data comes from `GET /api/status`, which reports the loaded model and context
+settings, startup/ready/error state, active and queued requests, request/token
+counters, aggregate and last-run prompt/generation throughput, vision
+configuration, and HIP device/VRAM information. The page refreshes every two
+seconds without placing work on the GPU queue.
+
+The dashboard also exposes a short server-local flight recorder. `GET
+/api/runs` returns summaries for the newest 128 requests, including client IP,
+queued/active/completed/error state, token counts, stage timings, and
+prompt/generation tokens per second. Select a dashboard row, or request `GET
+/api/runs/{id}`, for the captured request and response. This history is held
+only in memory and clears on restart. Captures are truncated at 64 KiB and
+base64 image data URL bytes are replaced with a redaction marker; they should
+still be treated as operationally sensitive prompt data. HTTP errors rejected
+before a valid API request can be identified may appear in the HTTP counters
+without a corresponding history row.
+
+The operations console also includes collapsible engine-log and run-history
+panels. `GET /api/logs` retains the latest 1,000 tracing lines in process
+memory and the UI can filter them without changing the server log level.
+Network receive/transmit rates are sampled from the sum of non-loopback Linux
+interfaces. During startup or a dashboard model switch, `/api/status.loading`
+estimates progress and ETA from model size and network bytes received since
+loading began; this is an operational estimate, not an exact parser-stage
+percentage, and can be distorted by page cache or unrelated traffic.
+
+`GET /healthz` is a liveness probe. `GET /readyz` returns `200 ready` only
+when the target model is loaded and able to accept inference; it returns 503
+while loading or during a model switch.
+
+`GET /api/models` recursively scans `--model-dir`, returning canonical paths,
+file sizes, and a same-directory `mmproj*.gguf` association where present.
+The first scan is cached in memory; add `?refresh=1` to force a new NFS scan.
+`POST /api/models/switch` accepts `{"path":"..."}` only for a catalog model
+and requires `X-ReInstinct-Action: switch-model`. It returns 202 immediately
+with a switch ID; poll `GET /api/models/switch` or `/api/status` for queued,
+loading, complete, or failed state. Switching is only accepted while the
+worker and queue are idle. The worker unloads the current model before loading
+the selected one, automatically enables its associated projector when
+available, and attempts to restore the previous model if loading fails. This
+administrative endpoint has no built-in authentication; expose the dashboard
+only on a trusted network or protect it with an authenticated reverse proxy.
+
+The implemented HTTP contract is published as OpenAPI 3.1 at
+`GET /openapi.json`. Interactive Swagger UI is available at `GET /docs`
+(the UI assets load from unpkg; the JSON contract and status page have no
+external runtime dependency). The specification intentionally documents only
+implemented routes and does not claim Responses or Conversations API support.
+
+`GET /v1/models/{model}` retrieves the exact model advertised by the current
+port. It is provided for SDKs that probe an individual model; unknown IDs
+return an OpenAI-shaped `model_not_found` error.
+
 ### POST /v1/completions
 
 Raw-prompt text completion. The server does **no** chat templating —
@@ -630,7 +687,11 @@ enabled unless both vision options are supplied at server startup.
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `prompt` / `messages` | string / array | — | One required, depending on endpoint. |
-| `max_tokens` | int | 256 | Decode-token budget. Clamped to `[1, 4096]`. |
+| `max_tokens` | int | 256 | Decode-token budget. Clamped to `[1, 4096]`. Mutually exclusive with `max_completion_tokens`. |
+| `max_completion_tokens` | int | — | OpenAI-compatible alias for `max_tokens`; sending both is a 400 error. |
+| `stop` | string / up to 4 strings | — | Stop after the first decoded occurrence and omit the matched suffix, including when it crosses token boundaries. |
+| `n` | int | 1 | Only omitted or `1` is supported; larger values return a 400 error rather than pretending to return multiple choices. |
+| `user` / `metadata` | string / object | — | Accepted for client attribution and ignored by local inference. |
 | `temperature` | float | 0.8 | `0` ⇒ greedy (skip the sampler chain). |
 | `top_k` | int | 40 | Keep the K largest logits. `0` ⇒ no filter. |
 | `top_p` | float | 1.0 | Nucleus filter: keep smallest prefix covering P of the softmax mass. `1.0` ⇒ no filter. |
@@ -704,11 +765,17 @@ qwen target.
 OpenAI-shaped error body on non-2xx:
 
 ```json
-{"error": {"message": "...", "type": "invalid_request_error"}}
+{"error": {"message": "...", "type": "invalid_request_error", "param": null, "code": null}}
 ```
 
 - `400` for malformed JSON, missing required fields, `use_speculative=true`
   with no drafter loaded, or a wrong role in `messages[].role`.
+- A supplied `model` must exactly match the ID returned by `GET /v1/models`;
+  mismatches return `404` with `error.param="model"` and
+  `error.code="model_not_found"`.
+- `tools`, `tool_choice`, legacy `functions`/`function_call`,
+  `parallel_tool_calls`, and `response_format` are rejected with a clear 400
+  until their compatibility work packages are implemented.
 - `404` for any path other than `/v1/{completions,chat/completions,embeddings}`.
 - `503` for `/v1/embeddings` (deferred), or when the GPU worker has
   crashed / the model failed to load at startup.

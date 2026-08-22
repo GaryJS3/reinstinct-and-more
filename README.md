@@ -96,7 +96,8 @@ the drafter is likely to land.
 > LLM backend. The server
 > accepts one local `data:image/jpeg|png;base64,...` input when started with
 > `--mmproj` and `--mtmd-bridge`; remote image URLs remain unsupported. See
-> [the plan](docs/MULTIMODAL_PLAN.md) and [current progress](docs/MULTIMODAL_PROGRESS.md).
+> [the plan](docs/MULTIMODAL_PLAN.md), [current progress](docs/MULTIMODAL_PROGRESS.md),
+> and [API compatibility goals](docs/API_COMPATIBILITY_PLAN.md).
 
 - **Dense + MoE model support**: Gemma 4 (E4B, 26B MoE, 31B), Qwen 3.5 (0.8B-35B), Qwen 3.6 (27B, 35B MoE)
 - **Unsloth Dynamic GGUF**: Native support for UD-Q4_K_XL and UD-Q6_K_XL
@@ -104,7 +105,7 @@ the drafter is likely to land.
 - **Q8 KV cache**: INT8 key/value cache with dp4a FlashAttention (default)
 - **SuperQuant tiered KV cache**: Opt-in 2-tier (int8 + turbo3) cache that extends context capacity ~1.7× vs int8 / ~3.3× vs fp16. Capacity feature, not a perf feature — trade ~30% decode tok/s for room to attend over longer contexts. Gemma 4 only today; see [docs/SUPERQUANT.md](docs/SUPERQUANT.md).
 - **MTP speculative decoding**: Multi-Token Prediction with per-request control
-- **OpenAI-compatible serve endpoint**: /v1/chat/completions with streaming, logprobs, prefix cache
+- **OpenAI-compatible serve endpoint**: `/v1/chat/completions` with streaming, logprobs, prefix cache, an OpenAPI 3.1 contract, and a live status dashboard
 - **HIP graph capture**: Entire decode step as a single GPU submission
 - **Fused kernels**: RMSNorm+projection, RoPE+KV write, SwiGLU, dequant+GEMV, attention
 - **Wave64-native**: All kernels designed for GCN5.1 64-lane wavefronts with DPP reductions

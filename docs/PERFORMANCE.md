@@ -1,10 +1,15 @@
 # Multimodal performance
 
-Last updated: 2026-08-18
+Last updated: 2026-08-19
 
 This is the canonical ledger for ReInstinct image-path speed, bottlenecks, and
 thermal constraints. Keep correctness and deployment status in
 `MULTIMODAL_PROGRESS.md`; put every comparable performance result here.
+
+API compatibility is the immediate project priority. The engine optimization
+queue below remains valid, but resumes after the contract suite and isolated
+deployment gates in `API_COMPATIBILITY_PLAN.md` unless compatibility testing
+finds a performance blocker.
 
 ## Reference configuration
 

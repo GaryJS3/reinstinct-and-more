@@ -1,6 +1,6 @@
 # Multimodal progress
 
-Last updated: 2026-08-18
+Last updated: 2026-08-19
 
 Canonical speed results and the active bottleneck queue are tracked in
 [`PERFORMANCE.md`](PERFORMANCE.md).
@@ -49,6 +49,27 @@ Server-side OpenAI structured content accepts one finite `data:` JPEG/PNG
 image, with a 6 MiB decoded-image cap and no remote URLs. It requires
 `--mmproj` plus `--mtmd-bridge`. The smoke request returned HTTP 200 with a
 coherent description; the managed Furnace service was kept stopped throughout.
+
+The next gate is service compatibility rather than another engine-only image
+optimization. The planned C# black-box suite must validate discovery, text and
+image chat, non-streaming and SSE response shapes, usage, stable errors,
+request limits, timeouts, and client disconnects. It must also exercise at
+least one named real service or SDK. An isolated deployment rehearsal must
+pass before production rollout is considered. Full scope and acceptance
+criteria are in [`API_COMPATIBILITY_PLAN.md`](API_COMPATIBILITY_PLAN.md).
+
+The standalone C#/.NET 8 HTTP contract suite is now implemented at
+`tests/api-contract`. It is dependency-free, uses deterministic JPEG/PNG
+fixtures, and validates the declared wire shapes plus error, limit, timeout,
+and disconnect-recovery behavior. It has passed a clean local Release build;
+the live isolated-server run, named reference service/SDK run, and deployment
+rehearsal are now complete for the isolated server. The service is
+`reinstinct-server.service` on `ai@10.0.0.41:8006`, enabled at boot, with the
+Qwen3.6-35B-A3B model/projector and 32k context. The C# suite passed all 11
+checks, restart recovery returned HTTP 200, and guarded junction temperature
+peaked at 56 C. The managed Furnace service remains enabled but intentionally
+inactive and was not changed. Public exposure is still gated on a reverse
+proxy for authentication, TLS, CORS, rate limiting, and request-size policy.
 
 ## Latest validation
 

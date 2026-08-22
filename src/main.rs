@@ -214,6 +214,9 @@ enum Command {
         /// Big model GGUF (~30B dense — Qwen 3.x or Gemma 4 31B).
         #[arg(long)]
         big: PathBuf,
+        /// Root directory recursively scanned by the dashboard model catalog.
+        #[arg(long)]
+        model_dir: Option<PathBuf>,
         /// Optional MTP drafter for the big model (Gemma 4 only).
         /// When present, /v1/completions on the big port accepts a
         /// `use_speculative: bool` JSON field (default: true). Set false
@@ -377,9 +380,10 @@ fn main() -> anyhow::Result<()> {
     // RUST_LOG=reinstinct_engine::serve=debug); default `info` keeps the
     // pre-tracing stderr behaviour.
     tracing_subscriber::fmt()
+        .with_ansi(false)
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")))
-        .with_writer(std::io::stderr)
+        .with_writer(reinstinct_engine::serve::dashboard_log_writer)
         .init();
 
     match Cli::parse().cmd {
@@ -396,10 +400,10 @@ fn main() -> anyhow::Result<()> {
         Command::Bench { path, iters, token } => bench(&path, iters, token),
         Command::HipInfo { mb, iters } => hip_info(mb, iters),
         Command::GpuBench { path, iters, token } => gpu_bench(&path, iters, token),
-        Command::Serve { big, big_drafter, small, embed,
+        Command::Serve { big, model_dir, big_drafter, small, embed,
                          big_port, small_port, embed_port, max_seq,
                          mmproj, mtmd_bridge, vision_threads, vision_min_tokens, vision_max_tokens, cpu_vision } =>
-            reinstinct_engine::serve::run(big, big_drafter, small, embed,
+            reinstinct_engine::serve::run(big, model_dir, big_drafter, small, embed,
                                           big_port, small_port, embed_port, max_seq,
                                           mmproj, mtmd_bridge, vision_threads, vision_min_tokens, vision_max_tokens, !cpu_vision)
                 .map_err(anyhow::Error::msg),

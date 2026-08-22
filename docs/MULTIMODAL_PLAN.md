@@ -2,6 +2,8 @@
 
 Measured baselines, stage breakdowns, and the ranked optimization queue live in
 [`PERFORMANCE.md`](PERFORMANCE.md).
+The immediate service-integration phase and its acceptance gates live in
+[`API_COMPATIBILITY_PLAN.md`](API_COMPATIBILITY_PLAN.md).
 
 ## Objective
 
@@ -56,6 +58,24 @@ The image path is available when a Qwen server is explicitly started with
 `--mmproj` and `--mtmd-bridge`. The managed Furnace service remains stopped
 for development; production rollout, multi-image input, and remote image
 fetching are separate decisions.
+
+## Immediate next phase: service compatibility
+
+Engine correctness and the v1 image endpoint are sufficiently validated to
+make black-box API compatibility the next project goal. Before further image
+performance work, add a C# HTTP contract suite covering discovery, text and
+image chat, SSE streaming, usage, errors, limits, timeouts, and disconnects.
+Run it against an isolated ReInstinct server and at least one real target
+service or SDK.
+
+The compatibility target is the declared OpenAI Chat Completions surface, not
+the full OpenAI API. Responses API, tools, structured outputs, remote images,
+multipart uploads, and multi-image turns remain separate scope decisions. An
+isolated deployment rehearsal behind a reverse proxy is the completion gate;
+do not restart or replace the managed Furnace service as part of this phase.
+
+See [`API_COMPATIBILITY_PLAN.md`](API_COMPATIBILITY_PLAN.md) for the ordered
+implementation work and acceptance criteria.
 
 ## Next performance and thermal work
 

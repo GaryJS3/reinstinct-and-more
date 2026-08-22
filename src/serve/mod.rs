@@ -14,6 +14,11 @@
 
 mod http;
 mod json;
+mod api;
+
+pub use api::DashboardLogWriter;
+
+pub fn dashboard_log_writer() -> DashboardLogWriter { DashboardLogWriter }
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,12 +37,16 @@ use crate::runtime::KernelCache;
 #[derive(Default)]
 struct Metrics {
     requests_total:    AtomicU64,    // every HTTP request reaching a route
+    inference_runs_total: AtomicU64, // POST /v1 requests admitted to run history
+    next_run_id: AtomicU64,          // dense inference-only flight-recorder IDs
     requests_ok:       AtomicU64,    // 2xx replies
     requests_4xx:      AtomicU64,
     requests_5xx:      AtomicU64,
     prompt_tokens:     AtomicU64,    // total across all completed requests
     completion_tokens: AtomicU64,
-    decode_us_total:   AtomicU64,    // sum of decode wall times (microseconds)
+    prefill_us_total:  AtomicU64,    // sum of model/image prefill time
+    decode_us_total:   AtomicU64,    // sum of generation-only wall time
+    ttft_us_total:     AtomicU64,
     requests_eos:      AtomicU64,    // finish_reason == stop
     requests_length:   AtomicU64,    // finish_reason == length
     panics_recovered:  AtomicU64,    // catch_unwind hits in the worker
@@ -62,6 +71,8 @@ impl Metrics {
         };
         metric(&mut s, "requests_total", "total HTTP requests reaching a route",
                self.requests_total.load(Ordering::Relaxed));
+        metric(&mut s, "inference_runs_total", "POST /v1 requests admitted to inference history",
+               self.inference_runs_total.load(Ordering::Relaxed));
         metric(&mut s, "requests_ok_total", "requests with a 2xx reply",
                self.requests_ok.load(Ordering::Relaxed));
         metric(&mut s, "requests_4xx_total", "requests with a 4xx reply",
@@ -72,8 +83,12 @@ impl Metrics {
                self.prompt_tokens.load(Ordering::Relaxed));
         metric(&mut s, "completion_tokens_total", "sum of completion_tokens",
                self.completion_tokens.load(Ordering::Relaxed));
+        metric(&mut s, "prefill_us_total", "sum of prefill wall time (microseconds)",
+               self.prefill_us_total.load(Ordering::Relaxed));
         metric(&mut s, "decode_us_total", "sum of decode wall time (microseconds)",
                self.decode_us_total.load(Ordering::Relaxed));
+        metric(&mut s, "ttft_us_total", "sum of time-to-first-token wall time (microseconds)",
+               self.ttft_us_total.load(Ordering::Relaxed));
         metric(&mut s, "requests_eos_total", "requests that ended at EOS",
                self.requests_eos.load(Ordering::Relaxed));
         metric(&mut s, "requests_length_total", "requests stopped by max_tokens or timeout",
@@ -115,7 +130,13 @@ enum PromptInput {
 /// A parsed `/v1/completions` or `/v1/chat/completions` request.
 struct GenReq {
     prompt: PromptInput,
+    /// Optional client-supplied model ID. The connection handler validates it
+    /// against the one model advertised by this port before queueing work.
+    model: Option<String>,
     max_tokens: usize,
+    /// Up to four OpenAI stop strings. Matching is done against the decoded
+    /// UTF-8 stream so a sequence split across token boundaries is handled.
+    stop: Vec<String>,
     sampler: crate::sampling::SamplerParams,
     /// MTP spec-decode opt-in/opt-out. `None` ⇒ use the server default
     /// (true if the target has a drafter loaded, false otherwise).
@@ -187,6 +208,17 @@ impl GenReq {
     fn is_chat(&self) -> bool { matches!(self.prompt, PromptInput::Chat(_) | PromptInput::ChatVision { .. }) }
 }
 
+struct GenerationOutput {
+    text: String,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    hit_stop: bool,
+    logprobs: Vec<TokenLogprob>,
+    prefill_ms: f64,
+    ttft_ms: f64,
+    generation_ms: f64,
+}
+
 /// A unit of work handed from a connection thread to the GPU worker.
 struct Job {
     /// Monotonic id for log + metric correlation.
@@ -249,12 +281,55 @@ const CHAT_DEFAULTS: SamplerDefaults = SamplerDefaults {
 };
 
 fn parse_common_fields(j: &Json, defaults: SamplerDefaults)
-    -> (usize, crate::sampling::SamplerParams, Option<bool>, Option<usize>, f32,
-        Option<std::time::Duration>, bool, bool, usize)
+    -> Result<(usize, Vec<String>, crate::sampling::SamplerParams, Option<bool>, Option<usize>, f32,
+        Option<std::time::Duration>, bool, bool, usize), String>
 {
     use crate::sampling::{SamplerParams, MirostatV2};
-    let max_tokens = j.get("max_tokens").and_then(Json::as_f64)
-        .map(|n| n as usize).unwrap_or(256).clamp(1, 4096);
+    let parse_integer = |key: &str| -> Result<Option<usize>, String> {
+        match j.get(key) {
+            None => Ok(None),
+            Some(Json::Num(n)) if n.is_finite() && n.fract() == 0.0 && *n >= 0.0 =>
+                Ok(Some(*n as usize)),
+            Some(_) => Err(format!("field '{key}' must be a non-negative integer")),
+        }
+    };
+    let max_tokens_value = parse_integer("max_tokens")?;
+    let max_completion_value = parse_integer("max_completion_tokens")?;
+    if max_tokens_value.is_some() && max_completion_value.is_some() {
+        return Err("provide only one of 'max_tokens' and 'max_completion_tokens'".into());
+    }
+    let max_tokens = max_tokens_value.or(max_completion_value).unwrap_or(256).clamp(1, 4096);
+
+    let stop = match j.get("stop") {
+        None => Vec::new(),
+        Some(Json::Str(s)) if !s.is_empty() => vec![s.clone()],
+        Some(Json::Arr(a)) => {
+            if a.len() > 4 { return Err("'stop' supports at most four strings".into()); }
+            let mut values = Vec::with_capacity(a.len());
+            for (i, item) in a.iter().enumerate() {
+                match item {
+                    Json::Str(s) if !s.is_empty() => values.push(s.clone()),
+                    Json::Str(_) => return Err(format!("stop[{i}] must not be empty")),
+                    _ => return Err(format!("stop[{i}] must be a string")),
+                }
+            }
+            values
+        }
+        Some(_) => return Err("'stop' must be a string or an array of up to four strings".into()),
+    };
+    if let Some(Json::Num(n)) = j.get("n") {
+        if !n.is_finite() || n.fract() != 0.0 || *n != 1.0 {
+            return Err("only n=1 is supported; multiple choices are not implemented".into());
+        }
+    } else if j.get("n").is_some() {
+        return Err("field 'n' must be the integer 1".into());
+    }
+    for key in ["tools", "tool_choice", "functions", "function_call",
+                "parallel_tool_calls", "response_format"] {
+        if j.get(key).is_some() {
+            return Err(format!("field '{key}' is not supported yet"));
+        }
+    }
 
     let mut sp = SamplerParams::default();
     sp.temperature = j.get("temperature").and_then(Json::as_f64)
@@ -317,8 +392,19 @@ fn parse_common_fields(j: &Json, defaults: SamplerDefaults)
             _ => 0,
         },
     };
-    (max_tokens, sp, use_speculative, speculative_k, speculative_p_min,
-     request_timeout, stream, stream_include_usage, top_logprobs_n)
+    Ok((max_tokens, stop, sp, use_speculative, speculative_k, speculative_p_min,
+        request_timeout, stream, stream_include_usage, top_logprobs_n))
+}
+
+struct ModelSwitch {
+    id: u64,
+    path: PathBuf,
+    projector: Option<PathBuf>,
+}
+
+enum WorkerCommand {
+    Generate(Job),
+    Switch(ModelSwitch),
 }
 
 // --- streaming helpers (SSE) --------------------------------------------
@@ -446,15 +532,24 @@ fn render_text_logprobs(lp: &[TokenLogprob]) -> Json {
 fn parse_completions(body: &str) -> Result<GenReq, (u16, &'static str, String)> {
     let bad = |m: String| (400u16, "Bad Request", m);
     let j = Json::parse(body).map_err(|e| bad(format!("invalid JSON: {e}")))?;
+    let model = parse_model(&j).map_err(&bad)?;
     let prompt = j.get("prompt").and_then(Json::as_str)
         .ok_or_else(|| bad("missing string field 'prompt'".into()))?
         .to_string();
-    let (max_tokens, sampler, use_speculative, speculative_k, speculative_p_min,
+    let (max_tokens, stop, sampler, use_speculative, speculative_k, speculative_p_min,
          request_timeout, stream, stream_include_usage, top_logprobs_n) =
-        parse_common_fields(&j, COMPLETION_DEFAULTS);
-    Ok(GenReq { prompt: PromptInput::Raw(prompt), max_tokens, sampler,
+        parse_common_fields(&j, COMPLETION_DEFAULTS).map_err(&bad)?;
+    Ok(GenReq { prompt: PromptInput::Raw(prompt), model, max_tokens, stop, sampler,
                 use_speculative, speculative_k, speculative_p_min,
                 request_timeout, stream, stream_include_usage, top_logprobs_n })
+}
+
+fn parse_model(j: &Json) -> Result<Option<String>, String> {
+    match j.get("model") {
+        None => Ok(None),
+        Some(Json::Str(s)) if !s.is_empty() => Ok(Some(s.clone())),
+        Some(_) => Err("field 'model' must be a non-empty string".into()),
+    }
 }
 
 /// Parse an OpenAI `/v1/chat/completions` body into a `GenReq`. The
@@ -464,6 +559,7 @@ fn parse_chat_completions(body: &str) -> Result<GenReq, (u16, &'static str, Stri
     use crate::chat::{ChatMessage, Role};
     let bad = |m: String| (400u16, "Bad Request", m);
     let j = Json::parse(body).map_err(|e| bad(format!("invalid JSON: {e}")))?;
+    let model = parse_model(&j).map_err(&bad)?;
     let messages_arr = j.get("messages")
         .ok_or_else(|| bad("missing array field 'messages'".into()))?;
     let arr = match messages_arr {
@@ -518,13 +614,33 @@ fn parse_chat_completions(body: &str) -> Result<GenReq, (u16, &'static str, Stri
     if media_markers != usize::from(image.is_some()) {
         return Err(bad("reserved media marker is not allowed in text".into()));
     }
-    let (max_tokens, sampler, use_speculative, speculative_k, speculative_p_min,
+    let (max_tokens, stop, sampler, use_speculative, speculative_k, speculative_p_min,
          request_timeout, stream, stream_include_usage, top_logprobs_n) =
-        parse_common_fields(&j, CHAT_DEFAULTS);
+        parse_common_fields(&j, CHAT_DEFAULTS).map_err(&bad)?;
     let prompt = match image { Some(image) => PromptInput::ChatVision { messages, image }, None => PromptInput::Chat(messages) };
-    Ok(GenReq { prompt, max_tokens, sampler,
+    Ok(GenReq { prompt, model, max_tokens, stop, sampler,
                 use_speculative, speculative_k, speculative_p_min,
                 request_timeout, stream, stream_include_usage, top_logprobs_n })
+}
+
+/// Return the visible byte end and whether a stop string has completed.
+/// Before a match exists, retain a trailing prefix of any stop string so a
+/// sequence split across decoded token callbacks is never leaked to a stream.
+fn stop_visible_end(text: &str, stops: &[String]) -> (usize, bool) {
+    if stops.is_empty() { return (text.len(), false); }
+    if let Some(end) = stops.iter().filter_map(|s| text.find(s)).min() {
+        return (end, true);
+    }
+    let mut pending = 0;
+    for stop in stops {
+        let bytes = stop.as_bytes();
+        for len in 1..bytes.len() {
+            if text.as_bytes().ends_with(&bytes[..len]) {
+                pending = pending.max(len);
+            }
+        }
+    }
+    (text.len().saturating_sub(pending), false)
 }
 
 const MAX_IMAGE_BYTES: usize = 6 * 1024 * 1024;
@@ -751,10 +867,17 @@ fn chat_completion_response(model: &str, text: &str, n_prompt: usize,
 }
 
 fn error_body(message: &str, kind: &str) -> String {
+    error_body_with_details(message, kind, None, None)
+}
+
+fn error_body_with_details(message: &str, kind: &str,
+                           param: Option<&str>, code: Option<&str>) -> String {
     Json::Obj(vec![
         ("error".into(), Json::Obj(vec![
             ("message".into(), Json::Str(message.to_string())),
             ("type".into(),    Json::Str(kind.to_string())),
+            ("param".into(),   param.map(|v| Json::Str(v.to_string())).unwrap_or(Json::Null)),
+            ("code".into(),    code.map(|v| Json::Str(v.to_string())).unwrap_or(Json::Null)),
         ])),
     ]).to_string()
 }
@@ -998,8 +1121,8 @@ impl ServerModel {
         match self { ServerModel::Qwen { name, .. } | ServerModel::Gemma { name, .. } => name }
     }
 
-    /// Run one completion. Returns (text, prompt_tokens, completion_tokens,
-    /// hit_eos, per_token_logprobs). `on_token`, if Some, receives the
+    /// Run one completion. Returns generated text, token counts, finish state,
+    /// per-token logprobs, and stage timings. `on_token` receives the
     /// decoded text DELTA for each emitted token plus an optional
     /// `TokenLogprob` when the request asked for logprobs. Returning
     /// `false` from it (e.g. because the streaming channel closed —
@@ -1012,7 +1135,7 @@ impl ServerModel {
     /// decode path (which doesn't surface per-token softmax probs today).
     fn generate(&mut self, req: &GenReq,
                 mut on_token: impl FnMut(&str, Option<&TokenLogprob>) -> bool)
-        -> Result<(String, usize, usize, bool, Vec<TokenLogprob>), String>
+        -> Result<GenerationOutput, String>
     {
         use crate::sampling::{Rng, sample_chain_lp};
         let mut sp = req.sampler.clone();
@@ -1095,6 +1218,7 @@ impl ServerModel {
                 let mut prev_text_len: usize = 0;
                 let mut full_text = String::new();
                 let mut all_lp: Vec<TokenLogprob> = Vec::new();
+                let mut client_open = true;
                 let decode_started = std::time::Instant::now();
                 let mut first_token_ms = None;
                 for _ in 0..req.max_tokens {
@@ -1118,29 +1242,42 @@ impl ServerModel {
                     let tlp = if want_lp > 0 {
                         Some(decode_token_logprob(|ids| tok.decode(ids), t, &res))
                     } else { None };
-                    if full_text.len() > prev_text_len {
-                        let delta = &full_text[prev_text_len..];
+                    let (visible_end, matched_stop) = stop_visible_end(&full_text, &req.stop);
+                    if visible_end > prev_text_len {
+                        let delta = &full_text[prev_text_len..visible_end];
                         let ok = on_token(delta, tlp.as_ref());
                         if let Some(t) = tlp { all_lp.push(t); }
                         if !ok {
                             // Channel closed (client disconnected). Stop
                             // generating; return what we have.
+                            client_open = false;
                             break;
                         }
-                        prev_text_len = full_text.len();
+                        prev_text_len = visible_end;
                     } else if let Some(t) = tlp {
                         all_lp.push(t);
                     }
+                    if matched_stop {
+                        full_text.truncate(visible_end);
+                        hit_eos = true;
+                        break;
+                    }
                     logits = gpu.forward_token(t, state)?;
                 }
+                if client_open && prev_text_len < full_text.len() {
+                    let _ = on_token(&full_text[prev_text_len..], None);
+                }
+                let generation_ms = decode_started.elapsed().as_secs_f64() * 1e3;
+                let ttft_ms = first_token_ms.unwrap_or(prefill_ms);
                 if let Some((mtmd_ms, mtmd)) = vision_profile {
-                    let decode_ms = decode_started.elapsed().as_secs_f64() * 1e3;
                     info!("vision profile rows={} logical_pos={} decode_image_ms={:.1} tokenize_ms={:.1} projector_ms={:.1} copy_ms={:.1} mtmd_ms={:.1} prefill_ms={:.1} ttft_ms={:.1} decode_ms={:.1} generated={}",
                         prompt_rows, prefill_logical_pos, mtmd.decode_ms, mtmd.tokenize_ms,
                         mtmd.encode_ms, mtmd.copy_ms, mtmd_ms, prefill_ms,
-                        first_token_ms.unwrap_or(prefill_ms), decode_ms, out.len());
+                        ttft_ms, generation_ms, out.len());
                 }
-                Ok((full_text, prompt_rows, out.len(), hit_eos, all_lp))
+                Ok(GenerationOutput { text: full_text, prompt_tokens: prompt_rows,
+                    completion_tokens: out.len(), hit_stop: hit_eos, logprobs: all_lp,
+                    prefill_ms, ttft_ms, generation_ms })
             }
             ServerModel::Gemma { gpu, state, tok, eos, bos, max_seq, drafter, prefix_cache, .. } => {
                 let prompt = match &req.prompt {
@@ -1205,6 +1342,7 @@ impl ServerModel {
                 if !do_spec {
                     // Plain prefill + decode. If we hit the prefix cache,
                     // prefill only the suffix; otherwise full prompt.
+                    let prefill_started = std::time::Instant::now();
                     let mut logits = if restored {
                         let suffix = &prompt[overlap..];
                         info!("req kv-cache hit: \
@@ -1214,6 +1352,7 @@ impl ServerModel {
                     } else {
                         gpu.prefill_forward(&prompt, state)?
                     };
+                    let prefill_ms = prefill_started.elapsed().as_secs_f64() * 1e3;
                     // Snapshot the post-prompt state for future requests
                     // that share a prefix. Best-effort — a snapshot
                     // allocation failure shouldn't abort the request,
@@ -1233,6 +1372,9 @@ impl ServerModel {
                     let mut prev_text_len: usize = 0;
                     let mut full_text = String::new();
                     let mut all_lp: Vec<TokenLogprob> = Vec::new();
+                    let mut client_open = true;
+                    let decode_started = std::time::Instant::now();
+                    let mut ttft_ms = None;
                     for _ in 0..req.max_tokens {
                         if let Some(d) = deadline {
                             if std::time::Instant::now() >= d { break; }
@@ -1241,6 +1383,9 @@ impl ServerModel {
                         let t = res.token;
                         if t == *eos { hit_eos = true; break; }
                         out.push(t);
+                        if ttft_ms.is_none() {
+                            ttft_ms = Some(prefill_ms + decode_started.elapsed().as_secs_f64() * 1e3);
+                        }
                         if !counts.is_empty() {
                             counts[t as usize] = counts[t as usize].saturating_add(1);
                         }
@@ -1248,18 +1393,33 @@ impl ServerModel {
                         let tlp = if want_lp > 0 {
                             Some(decode_token_logprob(|ids| tok.decode(ids), t, &res))
                         } else { None };
-                        if full_text.len() > prev_text_len {
-                            let delta = &full_text[prev_text_len..];
+                        let (visible_end, matched_stop) = stop_visible_end(&full_text, &req.stop);
+                        if visible_end > prev_text_len {
+                            let delta = &full_text[prev_text_len..visible_end];
                             let ok = on_token(delta, tlp.as_ref());
                             if let Some(t) = tlp { all_lp.push(t); }
-                            if !ok { break; }
-                            prev_text_len = full_text.len();
+                            if !ok {
+                                client_open = false;
+                                break;
+                            }
+                            prev_text_len = visible_end;
                         } else if let Some(t) = tlp {
                             all_lp.push(t);
                         }
+                        if matched_stop {
+                            full_text.truncate(visible_end);
+                            hit_eos = true;
+                            break;
+                        }
                         logits = gpu.forward_token(t, state)?;
                     }
-                    return Ok((full_text, prompt.len(), out.len(), hit_eos, all_lp));
+                    if client_open && prev_text_len < full_text.len() {
+                        let _ = on_token(&full_text[prev_text_len..], None);
+                    }
+                    let generation_ms = decode_started.elapsed().as_secs_f64() * 1e3;
+                    return Ok(GenerationOutput { text: full_text, prompt_tokens: prompt.len(),
+                        completion_tokens: out.len(), hit_stop: hit_eos, logprobs: all_lp,
+                        prefill_ms, ttft_ms: ttft_ms.unwrap_or(prefill_ms), generation_ms });
                 }
 
                 // Spec-decode path: prefill, then K=req.speculative_k
@@ -1270,8 +1430,10 @@ impl ServerModel {
                 // Prefill all but the last token — its logits aren't
                 // useful; the verify path immediately re-forwards it
                 // through `forward_token` to seed the chain.
+                let prefill_started = std::time::Instant::now();
                 let _ = gpu.prefill_forward(&prompt[..prompt.len() - 1], state)?;
                 let verify_logits = gpu.forward_token(*prompt.last().unwrap(), state)?;
+                let prefill_ms = prefill_started.elapsed().as_secs_f64() * 1e3;
                 if d.verify_graphs[k].is_none() && !gpu.is_moe() {
                     d.verify_graphs[k] = Some(gpu.capture_verify_graph(state, k)?);
                 }
@@ -1285,6 +1447,7 @@ impl ServerModel {
                     .and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.55);
                 let adaptive_window = std::env::var("REINSTINCT_MTP_WINDOW").ok()
                     .and_then(|s| s.parse::<usize>().ok()).unwrap_or(8);
+                let decode_started = std::time::Instant::now();
                 let (gen_toks, stats) = crate::runtime::spec_decode::spec_decode_generate(
                     gpu, &d.runtime, state,
                     d.verify_graphs[k].as_ref(), k,
@@ -1295,6 +1458,7 @@ impl ServerModel {
                     req.speculative_p_min,
                     adaptive_alpha, adaptive_window,
                 )?;
+                let generation_ms = decode_started.elapsed().as_secs_f64() * 1e3;
                 info!("spec-decode K={k}: {}/{} accept ({:.0}%){}",
                     stats.n_accepted, stats.n_drafted, 100.0 * stats.accept_rate(),
                     if stats.adaptive_disabled { " [adaptive: MTP off]" } else { "" });
@@ -1304,8 +1468,9 @@ impl ServerModel {
                 }
                 // No per-token logprobs from spec-decode today; the response
                 // shaper renders `logprobs: null` when the vec is empty.
-                Ok((tok.decode(&gen_toks), prompt.len(), gen_toks.len(),
-                    stats.hit_eos, Vec::new()))
+                Ok(GenerationOutput { text: tok.decode(&gen_toks), prompt_tokens: prompt.len(),
+                    completion_tokens: gen_toks.len(), hit_stop: stats.hit_eos,
+                    logprobs: Vec::new(), prefill_ms, ttft_ms: prefill_ms, generation_ms })
             }
         }
     }
@@ -1313,9 +1478,13 @@ impl ServerModel {
 
 // --- the GPU worker ----------------------------------------------------
 
-fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
-          small: Option<PathBuf>, max_seq: usize, vision: Option<VisionConfig>, metrics: Arc<Metrics>)
+fn worker(rx: mpsc::Receiver<WorkerCommand>, big: PathBuf, big_drafter: Option<PathBuf>,
+          small: Option<PathBuf>, max_seq: usize, vision: Option<VisionConfig>, metrics: Arc<Metrics>,
+          statuses: Vec<Arc<api::ApiStatus>>)
 {
+    for status in &statuses {
+        if status.target != "embed" { status.begin_loading(if status.target == "big" { &big } else { small.as_ref().unwrap_or(&big) }); }
+    }
     let setup = (|| -> Result<(KernelCache, ServerModel, Option<ServerModel>), String> {
         crate::hip::Device::set(0)?;
         let cache = KernelCache::new()?;
@@ -1351,23 +1520,98 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
         Ok((cache, big_m, small_m))
     })();
 
-    let (_cache, mut big_m, mut small_m) = match setup {
+    let (cache, big_loaded, mut small_m) = match setup {
         Ok(v) => v,
         Err(e) => {
             error!("FATAL: model load failed: {e}");
+            for status in &statuses { status.set_phase("error", Some(e.clone())); }
             // Drain the queue with 503s so clients don't hang forever.
-            for job in rx {
-                let _ = job.reply.send(StreamMsg::Done(HttpReply {
-                    status: 503, status_text: "Service Unavailable",
-                    body: error_body(&format!("model load failed: {e}"), "server_error"),
-                }));
+            for command in rx {
+                match command {
+                    WorkerCommand::Generate(job) => { let _ = job.reply.send(StreamMsg::Done(HttpReply {
+                        status: 503, status_text: "Service Unavailable",
+                        body: error_body(&format!("model load failed: {e}"), "server_error"),
+                    })); }
+                    WorkerCommand::Switch(switch) => {
+                        for status in &statuses {
+                            if status.target == "big" { status.fail_model_switch(switch.id, format!("model load failed: {e}"), false); }
+                        }
+                    }
+                }
             }
             return;
         }
     };
+    let mut big_m = Some(big_loaded);
+    for status in &statuses {
+        if status.target == "embed" {
+            status.set_phase("unavailable", Some("Embedding runtime is not implemented".into()));
+        } else {
+            if let Ok(mut loading) = status.loading.lock() { *loading = None; }
+            status.set_phase("ready", None);
+        }
+    }
     info!("ready — serving requests.");
 
-    for job in rx {
+    for command in rx {
+        let job = match command {
+            WorkerCommand::Generate(job) => job,
+            WorkerCommand::Switch(switch) => {
+                let Some(status) = statuses.iter().find(|s| s.target == "big").cloned() else {
+                    continue;
+                };
+                let previous = status.model.lock().map(|m| m.clone()).unwrap_or(api::ModelStatus {
+                    id: "unknown".into(), path: big.clone(), drafter: big_drafter.clone(), vision: None });
+                let make_vision = |projector: Option<PathBuf>| projector.and_then(|mmproj| vision.as_ref().map(|base| VisionConfig {
+                    mmproj, bridge: base.bridge.clone(), threads: base.threads,
+                    image_min_tokens: base.image_min_tokens, image_max_tokens: base.image_max_tokens,
+                    use_gpu: base.use_gpu,
+                }));
+                let selected_vision = make_vision(switch.projector.clone());
+                status.start_model_switch(switch.id, &switch.path);
+                info!("dashboard model switch: unloading {} and loading {}", previous.path.display(), switch.path.display());
+                drop(big_m.take());
+                match ServerModel::load(&switch.path, None, &cache, max_seq, selected_vision.as_ref()) {
+                    Ok(loaded) => {
+                        let id = loaded.name().to_string();
+                        big_m = Some(loaded);
+                        status.complete_model_switch(switch.id, api::ModelStatus { id: id.clone(), path: switch.path,
+                            drafter: None, vision: selected_vision.as_ref().map(|v| api::VisionStatus {
+                                projector: v.mmproj.clone(), threads: v.threads,
+                                min_tokens: v.image_min_tokens, max_tokens: v.image_max_tokens,
+                                device: if v.use_gpu { "gpu" } else { "cpu" },
+                            }) });
+                        info!("dashboard model switch complete: {id}");
+                    }
+                    Err(load_error) => {
+                        error!("dashboard model switch failed: {load_error}; attempting rollback");
+                        let rollback_vision = make_vision(previous.vision.as_ref().map(|v| v.projector.clone()));
+                        match ServerModel::load(&previous.path, previous.drafter.as_ref(), &cache, max_seq, rollback_vision.as_ref()) {
+                            Ok(loaded) => {
+                                big_m = Some(loaded);
+                                if let Ok(mut current) = status.model.lock() { *current = previous; }
+                                status.fail_model_switch(switch.id,
+                                    format!("selected model failed to load; previous model restored: {load_error}"), true);
+                            }
+                            Err(rollback_error) => {
+                                status.fail_model_switch(switch.id,
+                                    format!("model switch failed and rollback failed: {load_error}; {rollback_error}"), false);
+                                return;
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+        };
+        let job_status = statuses.iter().find(|s| s.target == job.target.label()).cloned();
+        if let Some(status) = job_status.as_ref() {
+            status.queued.fetch_sub(1, Ordering::Relaxed);
+            status.active_request.store(job.request_id, Ordering::Relaxed);
+            status.activate_run(job.request_id);
+        }
+        let mut captured_response: Option<String> = None;
+        let mut captured_stats: Option<api::RunStats> = None;
         let reply = match job.req {
             Err((status, status_text, msg)) => {
                 warn!("req={} target={} status={} reason={:?} msg={}",
@@ -1391,7 +1635,7 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                 }
                 Target::Big | Target::Small => {
                     let model: &mut ServerModel = if job.target == Target::Big {
-                        &mut big_m
+                        big_m.as_mut().expect("worker invariant: big model loaded")
                     } else if let Some(ref mut sm) = small_m {
                         sm
                     } else {
@@ -1442,7 +1686,17 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                     let stripper = std::rc::Rc::new(std::cell::RefCell::new(
                         ThinkingStripStream::new()));
                     let stripper_cb = std::rc::Rc::clone(&stripper);
+                    let progress_status = job_status.clone();
+                    let progress_id = job.request_id;
+                    let mut progress_tokens = 0usize;
+                    let mut progress_started: Option<std::time::Instant> = None;
                     let on_token = move |delta: &str, lp: Option<&TokenLogprob>| -> bool {
+                        progress_tokens += 1;
+                        let started = progress_started.get_or_insert_with(std::time::Instant::now);
+                        if let Some(status) = progress_status.as_ref() {
+                            status.update_generation_progress(progress_id, progress_tokens,
+                                started.elapsed().as_secs_f64() * 1e3);
+                        }
                         if !is_stream { return true; }
                         let clean = stripper_cb.borrow_mut().push(delta);
                         if clean.is_empty() {
@@ -1462,22 +1716,39 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                     let result = std::panic::catch_unwind(
                         std::panic::AssertUnwindSafe(|| model.generate(&req, on_token)));
                     match result {
-                        Ok(Ok((text, n_p, n_c, eos, lp))) => {
+                        Ok(Ok(output)) => {
+                            let GenerationOutput { text, prompt_tokens: n_p,
+                                completion_tokens: n_c, hit_stop: eos, logprobs: lp,
+                                prefill_ms, ttft_ms, generation_ms } = output;
                             let wall_us = t.elapsed().as_micros() as u64;
                             metrics.requests_ok.fetch_add(1, Ordering::Relaxed);
                             metrics.prompt_tokens.fetch_add(n_p as u64, Ordering::Relaxed);
                             metrics.completion_tokens.fetch_add(n_c as u64, Ordering::Relaxed);
-                            metrics.decode_us_total.fetch_add(wall_us, Ordering::Relaxed);
+                            metrics.prefill_us_total.fetch_add((prefill_ms * 1000.0) as u64, Ordering::Relaxed);
+                            metrics.decode_us_total.fetch_add((generation_ms * 1000.0) as u64, Ordering::Relaxed);
+                            metrics.ttft_us_total.fetch_add((ttft_ms * 1000.0) as u64, Ordering::Relaxed);
                             if eos { metrics.requests_eos.fetch_add(1, Ordering::Relaxed); }
                             else   { metrics.requests_length.fetch_add(1, Ordering::Relaxed); }
-                            let tok_per_s = if n_c > 0 && wall_us > 0 {
-                                n_c as f64 * 1_000_000.0 / wall_us as f64
+                            let tok_per_s = if n_c > 0 && generation_ms > 0.0 {
+                                n_c as f64 * 1000.0 / generation_ms
                             } else { 0.0 };
+                            let prompt_tok_per_s = if n_p > 0 && prefill_ms > 0.0 {
+                                n_p as f64 * 1000.0 / prefill_ms
+                            } else { 0.0 };
+                            captured_stats = Some(api::RunStats {
+                                prompt_tokens: n_p, completion_tokens: n_c,
+                                queue_ms: 0.0, prefill_ms, ttft_ms, generation_ms,
+                                total_ms: wall_us as f64 / 1000.0,
+                                prompt_tokens_per_second: prompt_tok_per_s,
+                                generation_tokens_per_second: tok_per_s,
+                            });
                             info!("req={} target={} type={} status=200 \
-                                   n_p={} n_c={} wall_ms={:.1} tok_s={:.1} finish={} stream={}",
+                                   n_p={} n_c={} wall_ms={:.1} prefill_ms={:.1} ttft_ms={:.1} \
+                                   prompt_tok_s={:.1} gen_tok_s={:.1} finish={} stream={}",
                                 job.request_id, job.target.label(),
                                 if is_chat { "chat" } else { "completion" },
-                                n_p, n_c, wall_us as f64 / 1000.0, tok_per_s,
+                                n_p, n_c, wall_us as f64 / 1000.0, prefill_ms, ttft_ms,
+                                prompt_tok_per_s, tok_per_s,
                                 if eos { "stop" } else { "length" }, is_stream);
                             if is_stream {
                                 // Flush any text still buffered by the
@@ -1519,11 +1790,9 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                                     //     pre-computed) — OWUI specifically
                                     //     merges this into the usage object
                                     //     in its stream handler.
-                                    let wall_ns = (wall_us as u64).saturating_mul(1_000);
-                                    let wall_ms = wall_us as f64 / 1000.0;
-                                    let tok_per_s_f = if n_c > 0 && wall_us > 0 {
-                                        n_c as f64 * 1_000_000.0 / wall_us as f64
-                                    } else { 0.0 };
+                                    let wall_ns = wall_us.saturating_mul(1_000);
+                                    let prefill_ns = (prefill_ms * 1_000_000.0) as u64;
+                                    let generation_ns = (generation_ms * 1_000_000.0) as u64;
                                     let usage = Json::Obj(vec![
                                         ("id".into(),      Json::Str(stream_id.clone())),
                                         ("object".into(),  Json::Str(
@@ -1539,9 +1808,9 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                                             ("total_tokens".into(),      Json::Num((n_p + n_c) as f64)),
                                             // Ollama-compat
                                             ("prompt_eval_count".into(),    Json::Num(n_p as f64)),
-                                            ("prompt_eval_duration".into(), Json::Num(0.0)),
+                                            ("prompt_eval_duration".into(), Json::Num(prefill_ns as f64)),
                                             ("eval_count".into(),           Json::Num(n_c as f64)),
-                                            ("eval_duration".into(),        Json::Num(wall_ns as f64)),
+                                            ("eval_duration".into(),        Json::Num(generation_ns as f64)),
                                             ("total_duration".into(),       Json::Num(wall_ns as f64)),
                                         ])),
                                         // llama.cpp `timings` — top-level
@@ -1553,20 +1822,27 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                                         // drive the tok/s display.
                                         ("timings".into(),  Json::Obj(vec![
                                             ("prompt_n".into(),                Json::Num(n_p as f64)),
-                                            ("prompt_ms".into(),               Json::Num(0.0)),
-                                            ("prompt_per_token_ms".into(),     Json::Num(0.0)),
-                                            ("prompt_per_second".into(),       Json::Num(0.0)),
+                                            ("prompt_ms".into(),               Json::Num(prefill_ms)),
+                                            ("prompt_per_token_ms".into(),     Json::Num(
+                                                if n_p > 0 { prefill_ms / n_p as f64 } else { 0.0 })),
+                                            ("prompt_per_second".into(),       Json::Num(prompt_tok_per_s)),
                                             ("predicted_n".into(),             Json::Num(n_c as f64)),
-                                            ("predicted_ms".into(),            Json::Num(wall_ms)),
+                                            ("predicted_ms".into(),            Json::Num(generation_ms)),
                                             ("predicted_per_token_ms".into(),  Json::Num(
-                                                if n_c > 0 { wall_ms / n_c as f64 } else { 0.0 })),
-                                            ("predicted_per_second".into(),    Json::Num(tok_per_s_f)),
+                                                if n_c > 0 { generation_ms / n_c as f64 } else { 0.0 })),
+                                            ("predicted_per_second".into(),    Json::Num(tok_per_s)),
                                         ])),
                                     ]).to_string();
                                     let _ = reply_tx.send(StreamMsg::Chunk(usage));
                                 }
                                 // Done signals the connection handler to
                                 // write "data: [DONE]\n\n" and close.
+                                captured_response = Some(Json::Obj(vec![
+                                    ("stream".into(), Json::Bool(true)),
+                                    ("assembled_text".into(), Json::Str(text.clone())),
+                                    ("finish_reason".into(), Json::Str(
+                                        if eos { "stop" } else { "length" }.into())),
+                                ]).to_string());
                                 HttpReply { status: 200, status_text: "OK",
                                             body: String::new() }
                             } else {
@@ -1575,6 +1851,7 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                                 } else {
                                     completion_response(&model_name, &text, n_p, n_c, eos, &lp)
                                 };
+                                captured_response = Some(body.clone());
                                 HttpReply { status: 200, status_text: "OK", body }
                             }
                         }
@@ -1610,22 +1887,32 @@ fn worker(rx: mpsc::Receiver<Job>, big: PathBuf, big_drafter: Option<PathBuf>,
                 }
             },
         };
+        if let Some(status) = job_status.as_ref() {
+            let response = captured_response.as_deref().unwrap_or(&reply.body);
+            status.finish_run(job.request_id, reply.status, response, captured_stats);
+        }
         let _ = job.reply.send(StreamMsg::Done(reply));
+        if let Some(status) = job_status.as_ref() {
+            status.active_request.store(0, Ordering::Relaxed);
+        }
     }
 }
 
 // --- connection handling ----------------------------------------------
 
 fn handle_conn(mut stream: std::net::TcpStream, target: Target,
-               tx: mpsc::Sender<Job>, metrics: Arc<Metrics>,
-               model_name: Arc<String>)
+               tx: mpsc::Sender<WorkerCommand>, metrics: Arc<Metrics>,
+               status: Arc<api::ApiStatus>)
 {
-    let request_id = metrics.requests_total.fetch_add(1, Ordering::Relaxed) + 1;
+    let http_id = metrics.requests_total.fetch_add(1, Ordering::Relaxed) + 1;
+    let mut request_id = http_id;
+    let client_ip = stream.peer_addr().map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|_| "unknown".into());
     let request = match http::read_request(&stream) {
         Ok(r) => r,
         Err(e) => {
             metrics.requests_4xx.fetch_add(1, Ordering::Relaxed);
-            warn!("req={request_id} target={} status=400 reason=malformed-http err={e}",
+            warn!("http={http_id} target={} status=400 reason=malformed-http err={e}",
                   target.label());
             let _ = http::write_response(&mut stream, 400, "Bad Request",
                 &error_body(&format!("malformed HTTP request: {e}"), "invalid_request_error"));
@@ -1635,8 +1922,98 @@ fn handle_conn(mut stream: std::net::TcpStream, target: Target,
 
     // Plain GET /metrics on any port — serves Prometheus text. Cheap;
     // no GPU work. Operator point-of-entry for serving observability.
-    let path = request.path.trim_end_matches('/');
+    let (path, query) = request.path.split_once('?').unwrap_or((&request.path, ""));
+    let path = path.trim_end_matches('/');
     let is_get = request.method.eq_ignore_ascii_case("GET");
+    let model_name = status.model.lock().map(|model| model.id.clone()).unwrap_or_default();
+    if is_get && path.is_empty() {
+        let _ = http::write_typed_response(&mut stream, 200, "OK",
+            "text/html; charset=utf-8", api::INDEX_HTML_V3);
+        return;
+    }
+    if is_get && path == "/docs" {
+        let _ = http::write_typed_response(&mut stream, 200, "OK",
+            "text/html; charset=utf-8", api::DOCS_HTML);
+        return;
+    }
+    if is_get && path == "/openapi.json" {
+        let body = api::openapi_json();
+        let _ = http::write_typed_response(&mut stream, 200, "OK",
+            "application/vnd.oai.openapi+json;version=3.1", &body);
+        return;
+    }
+    if is_get && path == "/api/status" {
+        let body = status.json(&metrics);
+        let _ = http::write_response(&mut stream, 200, "OK", &body);
+        return;
+    }
+    if is_get && path == "/api/runs" {
+        let body = status.runs_json();
+        let _ = http::write_response(&mut stream, 200, "OK", &body);
+        return;
+    }
+    if is_get && path == "/api/logs" {
+        let body = api::logs_json();
+        let _ = http::write_response(&mut stream, 200, "OK", &body);
+        return;
+    }
+    if is_get && path == "/api/models/switch" {
+        let body = status.switch_json();
+        let _ = http::write_response(&mut stream, 200, "OK", &body);
+        return;
+    }
+    if is_get && path == "/api/models" {
+        let body = status.models_json(query.split('&').any(|part| part == "refresh=1"));
+        let _ = http::write_response(&mut stream, 200, "OK", &body);
+        return;
+    }
+    if request.method.eq_ignore_ascii_case("POST") && path == "/api/models/switch" {
+        if request.headers.get("x-reinstinct-action").map(String::as_str) != Some("switch-model") {
+            let body = error_body("model switching requires X-ReInstinct-Action: switch-model", "invalid_request_error");
+            let _ = http::write_response(&mut stream, 400, "Bad Request", &body);
+            return;
+        }
+        if target != Target::Big {
+            let body = error_body("model switching is available only on the big-model dashboard", "invalid_request_error");
+            let _ = http::write_response(&mut stream, 400, "Bad Request", &body);
+            return;
+        }
+        let requested = serde_json::from_str::<serde_json::Value>(&request.body).ok()
+            .and_then(|value| value.get("path")?.as_str().map(str::to_string));
+        let Some((model_path, projector)) = requested.as_deref()
+            .and_then(|path| api::resolve_catalog_model(&status.model_dir, path)) else {
+            let body = error_body("path must select a model GGUF inside the configured catalog root", "invalid_request_error");
+            let _ = http::write_response(&mut stream, 400, "Bad Request", &body);
+            return;
+        };
+        let switch_id = match status.queue_model_switch(&model_path) {
+            Ok(id) => id,
+            Err(message) => {
+                let _ = http::write_response(&mut stream, 409, "Conflict", &error_body(&message, "model_switch_error"));
+                return;
+            }
+        };
+        if tx.send(WorkerCommand::Switch(ModelSwitch { id: switch_id, path: model_path, projector })).is_err() {
+            status.fail_model_switch(switch_id, "server worker is gone".into(), false);
+            let body = error_body("server worker is gone", "server_error");
+            let _ = http::write_response(&mut stream, 503, "Service Unavailable", &body);
+            return;
+        }
+        let body = serde_json::json!({"id":switch_id,"state":"queued","status_url":"/api/models/switch"}).to_string();
+        let _ = http::write_response(&mut stream, 202, "Accepted", &body);
+        return;
+    }
+    if is_get && path.starts_with("/api/runs/") {
+        let id = path["/api/runs/".len()..].parse::<u64>().ok();
+        if let Some(body) = id.and_then(|id| status.run_json(id)) {
+            let _ = http::write_response(&mut stream, 200, "OK", &body);
+        } else {
+            let body = error_body_with_details("run history entry was not found",
+                "invalid_request_error", Some("id"), Some("run_not_found"));
+            let _ = http::write_response(&mut stream, 404, "Not Found", &body);
+        }
+        return;
+    }
     if is_get && path.ends_with("/metrics") {
         let body = metrics.render_prometheus();
         // Direct write — bypass JSON error_body shape.
@@ -1679,6 +2056,35 @@ fn handle_conn(mut stream: std::net::TcpStream, target: Target,
         let _ = std::io::Write::write_all(&mut stream, resp.as_bytes());
         return;
     }
+    if is_get && path.ends_with("/readyz") {
+        let phase = status.phase.lock().map(|p| p.name).unwrap_or("unknown");
+        let (code, text) = if phase == "ready" { (200, "ready\n") } else { (503, "not ready\n") };
+        let resp = format!(
+            "HTTP/1.1 {} {}\r\nContent-Type: text/plain\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            code, if code == 200 { "OK" } else { "Service Unavailable" }, text.len(), text);
+        let _ = std::io::Write::write_all(&mut stream, resp.as_bytes());
+        return;
+    }
+    // GET /v1/models/{model} — SDKs commonly probe the selected model after
+    // listing it. Return the same exact ID advertised by /v1/models and a
+    // stable OpenAI-shaped model_not_found error for anything else.
+    if is_get && path.starts_with("/v1/models/") {
+        let requested = &path["/v1/models/".len()..];
+        if requested.is_empty() || model_name.is_empty() || requested != model_name.as_str() {
+            metrics.requests_4xx.fetch_add(1, Ordering::Relaxed);
+            let body = error_body_with_details(
+                &format!("model '{requested}' was not found on this endpoint"),
+                "invalid_request_error", Some("model"), Some("model_not_found"));
+            let _ = http::write_response(&mut stream, 404, "Not Found", &body);
+            return;
+        }
+        let body = format!(
+            r#"{{"id":"{}","object":"model","created":{},"owned_by":"reinstinct"}}"#,
+            model_name, unix_now());
+        let _ = http::write_response(&mut stream, 200, "OK", &body);
+        return;
+    }
 
     // Route. LLM ports take /v1/completions (raw) or /v1/chat/completions
     // (messages, chat template applied server-side). Embed port takes
@@ -1694,6 +2100,23 @@ fn handle_conn(mut stream: std::net::TcpStream, target: Target,
         None
     };
 
+    if is_post && path.starts_with("/v1/") {
+        let phase = status.phase.lock().map(|p| p.name).unwrap_or("unknown");
+        if phase == "loading" || phase == "switching" {
+            metrics.requests_5xx.fetch_add(1, Ordering::Relaxed);
+            let body = error_body("model is loading; retry when /readyz returns 200", "server_error");
+            let _ = http::write_response(&mut stream, 503, "Service Unavailable", &body);
+            return;
+        }
+    }
+
+    if is_post && path.starts_with("/v1/") {
+        request_id = metrics.next_run_id.fetch_add(1, Ordering::Relaxed) + 1;
+        metrics.inference_runs_total.fetch_add(1, Ordering::Relaxed);
+        status.queue_run(request_id, client_ip, &request.method, path,
+            route.unwrap_or("unknown"), &request.body);
+    }
+
     let req = match route {
         None => Err((404u16, "Not Found",
             format!("no route for {} {} (expected POST /v1/completions or \
@@ -1703,7 +2126,9 @@ fn handle_conn(mut stream: std::net::TcpStream, target: Target,
             // Worker answers 503; keep the shape.
             Ok(GenReq {
                 prompt: PromptInput::Raw(String::new()),
+                model: None,
                 max_tokens: 0,
+                stop: Vec::new(),
                 sampler: crate::sampling::SamplerParams::default(),
                 use_speculative: None,
                 speculative_k: None,
@@ -1719,11 +2144,30 @@ fn handle_conn(mut stream: std::net::TcpStream, target: Target,
         Some(other) => unreachable!("unknown route tag {other}"),
     };
 
+    // A request may omit model for compatibility with older clients, but a
+    // supplied ID must select the model actually loaded on this port.
+    if let Ok(parsed) = &req {
+        if let Some(requested) = parsed.model.as_deref() {
+            if model_name.is_empty() || requested != model_name.as_str() {
+                metrics.requests_4xx.fetch_add(1, Ordering::Relaxed);
+                let body = error_body_with_details(
+                    &format!("model '{requested}' was not found on this endpoint"),
+                    "invalid_request_error", Some("model"), Some("model_not_found"));
+                status.finish_run(request_id, 404, &body, None);
+                let _ = http::write_response(&mut stream, 404, "Not Found", &body);
+                return;
+            }
+        }
+    }
+
     let (rtx, rrx) = mpsc::channel();
-    if tx.send(Job { request_id, target, req, reply: rtx }).is_err() {
+    status.queued.fetch_add(1, Ordering::Relaxed);
+    if tx.send(WorkerCommand::Generate(Job { request_id, target, req, reply: rtx })).is_err() {
+        status.queued.fetch_sub(1, Ordering::Relaxed);
         metrics.requests_5xx.fetch_add(1, Ordering::Relaxed);
-        let _ = http::write_response(&mut stream, 503, "Service Unavailable",
-            &error_body("server worker is gone", "server_error"));
+        let body = error_body("server worker is gone", "server_error");
+        status.finish_run(request_id, 503, &body, None);
+        let _ = http::write_response(&mut stream, 503, "Service Unavailable", &body);
         return;
     }
     // Receive the first message: if it's Done, plain response. If it's
@@ -1777,8 +2221,8 @@ fn handle_conn(mut stream: std::net::TcpStream, target: Target,
     }
 }
 
-fn acceptor(port: u16, target: Target, tx: mpsc::Sender<Job>,
-            metrics: Arc<Metrics>, model_name: Arc<String>) {
+fn acceptor(port: u16, target: Target, tx: mpsc::Sender<WorkerCommand>,
+            metrics: Arc<Metrics>, status: Arc<api::ApiStatus>) {
     let listener = match std::net::TcpListener::bind(("0.0.0.0", port)) {
         Ok(l) => l,
         Err(e) => { error!("FATAL: cannot bind port {port}: {e}"); return; }
@@ -1789,8 +2233,8 @@ fn acceptor(port: u16, target: Target, tx: mpsc::Sender<Job>,
             Ok(stream) => {
                 let tx = tx.clone();
                 let metrics = Arc::clone(&metrics);
-                let model_name = Arc::clone(&model_name);
-                thread::spawn(move || handle_conn(stream, target, tx, metrics, model_name));
+                let status = Arc::clone(&status);
+                thread::spawn(move || handle_conn(stream, target, tx, metrics, status));
             }
             Err(e) => warn!("accept error on :{port}: {e}"),
         }
@@ -1798,7 +2242,7 @@ fn acceptor(port: u16, target: Target, tx: mpsc::Sender<Job>,
 }
 
 /// Start the three-port multi-model server. Blocks forever.
-pub fn run(big: PathBuf, big_drafter: Option<PathBuf>,
+pub fn run(big: PathBuf, model_dir: Option<PathBuf>, big_drafter: Option<PathBuf>,
            small: Option<PathBuf>, embed: Option<PathBuf>,
            big_port: u16, small_port: u16, embed_port: u16, max_seq: usize,
            mmproj: Option<PathBuf>, mtmd_bridge: Option<PathBuf>, vision_threads: i32,
@@ -1806,6 +2250,7 @@ pub fn run(big: PathBuf, big_drafter: Option<PathBuf>,
            vision_use_gpu: bool)
     -> Result<(), String>
 {
+    let model_dir = model_dir.unwrap_or_else(|| big.parent().unwrap_or(std::path::Path::new(".")).to_path_buf());
     let vision = match (mmproj, mtmd_bridge) {
         (None, None) => None,
         (Some(mmproj), Some(bridge)) if vision_threads > 0 &&
@@ -1854,17 +2299,8 @@ pub fn run(big: PathBuf, big_drafter: Option<PathBuf>,
                nomic-bert encoder lands.", e.display());
     }
 
-    let (tx, rx) = mpsc::channel::<Job>();
+    let (tx, rx) = mpsc::channel::<WorkerCommand>();
     let metrics = Arc::new(Metrics::new());
-
-    let worker_handle = {
-        let (big, big_drafter, small, vision) =
-            (big.clone(), big_drafter.clone(), small.clone(), vision.clone());
-        let metrics = Arc::clone(&metrics);
-        thread::Builder::new().name("gpu-worker".into())
-            .spawn(move || worker(rx, big, big_drafter, small, max_seq, vision, metrics))
-            .map_err(|e| e.to_string())?
-    };
 
     // Derive each port's advertised model name from the GGUF filename
     // stem (same rule the worker uses for ServerModel.name). The embed
@@ -1873,29 +2309,58 @@ pub fn run(big: PathBuf, big_drafter: Option<PathBuf>,
     let stem = |p: &PathBuf| -> String {
         p.file_stem().and_then(|s| s.to_str()).unwrap_or("model").to_string()
     };
-    let big_name   = Arc::new(stem(&big));
-    let embed_name = Arc::new(String::new());
+    let mk_status = |port, target: Target, model: &PathBuf, drafter: Option<PathBuf>,
+                     vision: Option<&VisionConfig>| Arc::new(api::ApiStatus {
+        started_at: unix_now(), max_seq, target: target.label(), port,
+        model: std::sync::Mutex::new(api::ModelStatus { id: stem(model), path: model.clone(), drafter,
+        vision: vision.map(|v| api::VisionStatus {
+            projector: v.mmproj.clone(), threads: v.threads,
+            min_tokens: v.image_min_tokens, max_tokens: v.image_max_tokens,
+            device: if v.use_gpu { "gpu" } else { "cpu" },
+        }) }), model_dir: model_dir.clone(),
+        phase: std::sync::Mutex::new(api::Phase { name: "starting", detail: None }),
+        loading: std::sync::Mutex::new(None),
+        network: std::sync::Mutex::new(api::NetworkSample::default()),
+        catalog: std::sync::Mutex::new(None),
+        model_switch: std::sync::Mutex::new(api::ModelSwitchStatus::default()),
+        next_switch_id: AtomicU64::new(0),
+        queued: AtomicU64::new(0), active_request: AtomicU64::new(0),
+        history: std::sync::Mutex::new(api::RunHistory::new()),
+    });
+    let big_status = mk_status(big_port, Target::Big, &big, big_drafter.clone(), vision.as_ref());
+    let embed_path = embed.clone().unwrap_or_else(|| PathBuf::from("embedder-not-configured"));
+    let embed_status = mk_status(embed_port, Target::Embed, &embed_path, None, None);
 
-    let acceptors: Vec<(u16, Target, Arc<String>)> = if let Some(ref sp) = small {
-        let small_name = Arc::new(stem(sp));
+    let acceptors: Vec<(u16, Target, Arc<api::ApiStatus>)> = if let Some(ref sp) = small {
+        let small_status = mk_status(small_port, Target::Small, sp, None, None);
         vec![
-            (big_port,   Target::Big,   Arc::clone(&big_name)),
-            (small_port, Target::Small, Arc::clone(&small_name)),
-            (embed_port, Target::Embed, Arc::clone(&embed_name)),
+            (big_port, Target::Big, Arc::clone(&big_status)),
+            (small_port, Target::Small, small_status),
+            (embed_port, Target::Embed, Arc::clone(&embed_status)),
         ]
     } else {
         info!("--small not given — small-model port disabled (VRAM saved)");
         vec![
-            (big_port,   Target::Big,   Arc::clone(&big_name)),
-            (embed_port, Target::Embed, Arc::clone(&embed_name)),
+            (big_port, Target::Big, Arc::clone(&big_status)),
+            (embed_port, Target::Embed, Arc::clone(&embed_status)),
         ]
     };
 
-    for (port, target, name) in acceptors {
+    let statuses = acceptors.iter().map(|(_, _, s)| Arc::clone(s)).collect();
+    let worker_handle = {
+        let (big, big_drafter, small, vision) =
+            (big.clone(), big_drafter.clone(), small.clone(), vision.clone());
+        let metrics = Arc::clone(&metrics);
+        thread::Builder::new().name("gpu-worker".into())
+            .spawn(move || worker(rx, big, big_drafter, small, max_seq, vision, metrics, statuses))
+            .map_err(|e| e.to_string())?
+    };
+
+    for (port, target, status) in acceptors {
         let tx = tx.clone();
         let metrics = Arc::clone(&metrics);
         thread::Builder::new().name(format!("accept-{}", target.label()))
-            .spawn(move || acceptor(port, target, tx, metrics, name))
+            .spawn(move || acceptor(port, target, tx, metrics, status))
             .map_err(|e| e.to_string())?;
     }
     drop(tx);   // only the acceptors hold senders now
@@ -1912,7 +2377,7 @@ mod logprobs_tests {
         // tuple positions 0..8: max_tokens, sampler, use_speculative,
         // speculative_k, speculative_p_min, request_timeout, stream,
         // stream_include_usage, top_logprobs_n  (← .8)
-        parse_common_fields(&Json::parse(body).unwrap(), COMPLETION_DEFAULTS).8
+        parse_common_fields(&Json::parse(body).unwrap(), COMPLETION_DEFAULTS).unwrap().9
     }
 
     #[test]
@@ -2002,5 +2467,30 @@ mod logprobs_tests {
             {"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}}
         ]}]}"#;
         assert!(parse_chat_completions(two).is_err());
+    }
+
+    #[test]
+    fn common_fields_accept_max_completion_tokens_and_stop() {
+        let req = parse_completions(r#"{
+            "prompt":"hello", "max_completion_tokens":17,
+            "stop":["END", "DONE"], "n":1, "user":"test"
+        }"#).unwrap();
+        assert_eq!(req.max_tokens, 17);
+        assert_eq!(req.stop, ["END", "DONE"]);
+    }
+
+    #[test]
+    fn common_fields_reject_conflicting_or_unsupported_options() {
+        assert!(parse_completions(r#"{"prompt":"x","max_tokens":1,"max_completion_tokens":2}"#).is_err());
+        assert!(parse_completions(r#"{"prompt":"x","n":2}"#).is_err());
+        assert!(parse_completions(r#"{"prompt":"x","tools":[]}"#).is_err());
+    }
+
+    #[test]
+    fn stop_matching_handles_token_boundary_and_holds_prefixes() {
+        let stops = vec!["END".to_string()];
+        assert_eq!(stop_visible_end("answer EN", &stops), (7, false));
+        assert_eq!(stop_visible_end("answer END trailing", &stops), (7, true));
+        assert_eq!(stop_visible_end("answer", &stops), (6, false));
     }
 }

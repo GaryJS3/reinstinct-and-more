@@ -922,6 +922,94 @@ $('configPanel').addEventListener('toggle',()=>{if($('configPanel').open)loadCon
  $('amdPower').onclick=()=>amdMutation('power');$('amdTune').onclick=()=>amdMutation('tuning');$('amdReset').onclick=()=>amdMutation('reset');refresh();setInterval(refresh,2000);refreshGpus();refreshAmd();setInterval(refreshGpus,2000);setInterval(refreshAmd,5000);
 </script></body></html>"#;
 
+/// Add the driver-aware power-limit control without duplicating the large
+/// dashboard template in the API source. The base page remains a single
+/// self-contained document for the no-build deployment model.
+pub fn dashboard_html() -> String {
+    let mut html = INDEX_HTML_V3.replace(
+        "</style></head>",
+        r#"<style>
+  .power-control{flex:1 1 390px;min-width:280px;display:grid;grid-template-columns:1fr auto;gap:6px 12px;align-items:center}.power-control label{color:var(--muted);font-size:10px;letter-spacing:.1em;text-transform:uppercase}.power-control output{font:18px Bahnschrift,sans-serif;color:var(--lime);white-space:nowrap}.power-control input[type=range]{grid-column:1/-1;width:100%;min-width:220px;accent-color:var(--lime);cursor:pointer}.power-control input[type=range]:disabled{cursor:not-allowed;opacity:.4}.power-meta{grid-column:1/-1;display:flex;justify-content:space-between;gap:12px;color:var(--muted);font-size:10px}.power-meta strong{color:var(--ink);font-weight:400}
+  .thermal-body{padding:14px 16px}.thermal-settings{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1px;background:#26352e}.thermal-field{background:#0e1612;padding:12px;display:grid;gap:7px}.thermal-field label{color:#b7c4bd;font-size:10px;text-transform:uppercase;letter-spacing:.08em}.thermal-field input{width:100%;min-width:0;background:#0a100d;border-color:#34463d;padding:9px 10px;font:11px inherit}.thermal-field input:focus{outline:1px solid var(--cyan);outline-offset:1px}.thermal-field.checkbox{display:flex;align-items:center}.thermal-field.checkbox label{display:flex;align-items:center;gap:9px;text-transform:none;letter-spacing:0}.thermal-field.checkbox input{width:auto;accent-color:var(--lime)}.thermal-field.locked{opacity:.58}.thermal-actions{display:flex;align-items:center;gap:9px;margin-top:12px}.thermal-notice{color:var(--muted);font-size:10px}.thermal-notice.warn{color:var(--amber)}.thermal-notice.error{color:var(--red)}.gpu-meters{display:grid;gap:8px;margin-top:14px}.gpu-meter{display:grid;gap:4px}.meter-label{display:flex;justify-content:space-between;gap:10px;color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:.08em}.meter-label b{color:var(--ink);font-weight:400;letter-spacing:0;text-transform:none}.meter{height:7px;border:1px solid var(--line);background:#070b09;overflow:hidden}.meter i{display:block;height:100%;background:linear-gradient(90deg,var(--cyan),var(--lime));transition:width .4s}.meter i.warn{background:linear-gradient(90deg,var(--amber),#ff8f5a)}.meter i.bad{background:var(--red)}
+</style></head>"#,
+    );    html = html.replace(
+        r#"<details id="thermalPanel"><summary>Thermal guard <span id="thermalSummary" class="summary-meta">loading</span></summary><div class="tools"><span id="thermalDetail" class="sub">The inference GPU is monitored at one-second intervals.</span></div></details>"#,
+        r#"<details id="thermalPanel"><summary>Thermal guard <span id="thermalSummary" class="summary-meta">loading</span></summary><div class="thermal-body"><div class="tools"><span id="thermalDetail" class="sub">The inference GPU is monitored at one-second intervals.</span></div><div id="thermalForm" class="thermal-settings"></div><div class="thermal-actions"><button id="thermalSave" class="btn primary">Save thermal settings</button><button id="thermalReset" class="btn">Reset</button><span id="thermalNotice" class="thermal-notice" role="status"></span></div></div></details>"#,
+    );
+    html = html.replace(
+        r#"<details id="runsPanel" open>"#,
+        r#"<details id="runsPanel">"#,
+    );    html = html.replace(
+        r#"['cpu_vision','CPU vision','bool'],['gpu_thermal_guard_enabled','Thermal guard enabled','bool'],['gpu_max_temp_c','Maximum temperature °C','number'],['gpu_max_temp_seconds','Sustained duration seconds','number'],['gpu_resume_temp_c','Resume temperature °C','number']"#,
+        r#"['cpu_vision','CPU vision','bool']"#,
+    );
+    html = html.replace(
+        r#"const v=c.saved||c.effective||{};$('configForm').innerHTML="#,
+        r#"const v=c.saved||c.effective||{};renderThermalConfig(v,locked);$('configForm').innerHTML="#,
+    );
+    html = html.replace(
+        r#"['Vision',s.model?.vision?.enabled?'yes':'no'].map"#,
+        r#"['Vision',s.model?.vision?.enabled?'yes':'no']].map"#,
+    );
+    html = html.replace(" const baseDecorateGpuCard=decorateGpuCard;\n", "");
+    html = html.replace("gib(m.vramUsed??vramUsed)", "gib(vramUsed)");
+    html = html.replace(
+        r#"<input id="amdWatts" type="number" min="1" step="0.1" placeholder="Power limit (W)">"#,
+        r#"<input id="amdWatts" type="range" min="0" max="1" step="0.1" value="0" disabled aria-label="Power limit in watts">"#,
+    );
+    html = html.replace(
+        "</script></body></html>",
+         r#"</script><script> (() => {
+  const input = document.getElementById('amdWatts');
+  const select = document.getElementById('amdPci');
+  if (!input || !select) return;
+  input.type = 'range'; input.disabled = true; input.removeAttribute('placeholder');
+  const control = document.createElement('div'); control.className = 'power-control';
+  const label = document.createElement('label'); label.htmlFor = 'amdWatts'; label.textContent = 'Power limit';
+  const output = document.createElement('output'); output.id = 'amdWattsValue';
+  const meta = document.createElement('div'); meta.className = 'power-meta';
+  const current = document.createElement('span'); current.id = 'amdPowerCurrent';
+  const range = document.createElement('span'); range.id = 'amdPowerRange';
+  meta.append(current, range); input.replaceWith(control); control.append(label, output, input, meta);
+  const devices = {};
+  const finite = value => Number.isFinite(Number(value));
+  const watts = value => finite(value) ? `${Number(value).toFixed(1)} W` : '—';
+  const updateReadout = () => { output.textContent = watts(input.value); };
+  input.addEventListener('input', updateReadout);
+  select.addEventListener('change', () => { input.dataset.pci = ''; refreshPowerLimit(); });
+  async function refreshPowerLimit() {
+    try {
+      const payload = await fetch('/api/gpus', {cache:'no-store'}).then(response => response.json());
+      Object.keys(devices).forEach(key => delete devices[key]);
+      Object.values(payload.gpus || {}).filter(gpu => gpu.vendor === 'AMD' && gpu.controls?.helper_installed && gpu.controls?.power_limit_writable).forEach(gpu => { devices[gpu.pci_address] = gpu; });
+      const gpu = devices[select.value], power = gpu?.power || {};
+      const min = Number(power.minimum_watts), max = Number(power.maximum_watts), limit = Number(power.limit_watts);
+      const valid = [min, max, limit].every(Number.isFinite) && max > min;
+      input.disabled = !valid;
+      if (!valid) { output.textContent = '—'; current.innerHTML = 'Current limit <strong>—</strong>'; range.innerHTML = 'Driver range <strong>unavailable</strong>'; return; }
+      input.min = min; input.max = max; input.step = Math.max(.1, Math.round((max - min) / 100 * 10) / 10);
+      if (input.dataset.pci !== select.value || document.activeElement !== input) input.value = Math.min(max, Math.max(min, limit));
+      input.dataset.pci = select.value; updateReadout();
+      current.innerHTML = `Current limit <strong>${watts(limit)}</strong>`;
+      range.innerHTML = `Driver range <strong>${watts(min)} – ${watts(max)}</strong>`;
+    } catch (_) { input.disabled = true; output.textContent = '—'; current.innerHTML = 'Current limit <strong>unavailable</strong>'; range.innerHTML = 'Driver range <strong>unavailable</strong>'; }
+  }
+   refreshPowerLimit(); setInterval(refreshPowerLimit, 2000);
+ })();
+ const thermalFields=[['gpu_thermal_guard_enabled','Guard enabled','bool'],['gpu_max_temp_c','Pause threshold °C','number'],['gpu_max_temp_seconds','Sustained duration seconds','number'],['gpu_resume_temp_c','Resume below °C','number']];
+ function renderThermalConfig(values,locked){const form=$('thermalForm');if(!form)return;form.innerHTML=thermalFields.map(([key,label,type])=>{const lock=locked.has(key),value=values[key],mark=lock?'':'<span class="apply-mark" title="Applied immediately">↻</span>';if(type==='bool')return `<div class="thermal-field checkbox ${lock?'locked':''}"><label><input data-thermal="${key}" type="checkbox" ${value?'checked':''} ${lock?'disabled':''}> ${esc(label)}</label>${mark}</div>`;return `<div class="thermal-field ${lock?'locked':''}"><label for="thermal-${key}">${esc(label)} ${mark}</label><input id="thermal-${key}" data-thermal="${key}" type="number" value="${value==null?'':esc(value)}" ${lock?'disabled':''}></div>`}).join('')}
+ function thermalNotice(message,tone=''){const n=$('thermalNotice');if(!n)return;n.textContent=message;n.className='thermal-notice'+(tone?' '+tone:'')}
+ $('thermalForm').addEventListener('input',()=>{thermalNotice('Unsaved thermal changes. Save to validate and apply them.','warn');$('thermalSave').disabled=false});
+ $('thermalReset').onclick=()=>{if(configSnapshot){const values=configSnapshot.saved||configSnapshot.effective||{};renderThermalConfig(values,new Set(configSnapshot.cli_locked||[]));thermalNotice('')}};
+ $('thermalSave').onclick=async()=>{if(!configSnapshot?.persisted){thermalNotice('Start the service with --config PATH before saving.','warn');return}const body={};for(const el of document.querySelectorAll('[data-thermal]')){if(el.disabled)continue;body[el.dataset.thermal]=el.type==='checkbox'?el.checked:(el.value===''?null:Number(el.value))}const b=$('thermalSave');b.disabled=true;b.textContent='Saving…';try{const r=await fetch('/api/config',{method:'PUT',headers:{'Content-Type':'application/json','X-ReInstinct-Action':'update-config'},body:JSON.stringify(body)}),j=await r.json();if(!r.ok)throw new Error(j.error?.message||'thermal configuration update failed');thermalNotice('Saved and applied immediately.');await loadConfig()}catch(e){thermalNotice(e.message,'error');b.disabled=false}finally{b.textContent='Save thermal settings';if(configSnapshot?.persisted)b.disabled=false}};
+ const baseDecorateGpuCard=decorateGpuCard;
+ function decorateGpuCard(s){const g=s.gpu||{},m=g.memory||{},all=g.inventory?.gpus||{},x=Object.values(all).find(x=>x.hip_device_index===0)||{},w=x.power||{},t=(x.temperatures||[]).slice().sort((a,b)=>(b.temperature_c??-1)-(a.temperature_c??-1))[0]||{},guard=g.thermal_guard||{},threshold=Number(guard.maximum_temperature_threshold_c),powerMax=Number(w.limit_watts??w.maximum_watts),power=Number(w.watts),vramTotal=Number(m.total_bytes),vramUsed=Number(m.used_bytes),temp=Number(t.temperature_c),compute=Number(x.utilization?.percent),c=$('cards')?.children[3];if(!c)return;c.querySelector('.hero').innerHTML=`${gib(m.used_bytes)} <small>memory used</small>`;const meter=(label,percent,text,tone='')=>{const valid=Number.isFinite(percent);const width=valid?Math.min(100,Math.max(0,percent)):0;return `<div class="gpu-meter"><div class="meter-label"><span>${label}</span><b>${esc(valid?text:'unavailable')}</b></div><div class="meter"><i class="${tone}" style="width:${width}%"></i></div></div>`};let meters=c.querySelector('.gpu-meters');if(!meters){meters=document.createElement('div');meters.className='gpu-meters';c.append(meters)}const powerPercent=powerMax>0?power/powerMax*100:null,vramPercent=vramTotal>0?vramUsed/vramTotal*100:null,tempPercent=threshold>0?temp/threshold*100:null;meters.innerHTML=meter('Power',powerPercent,Number.isFinite(power)?`${power.toFixed(1)} W / ${Number.isFinite(powerMax)?powerMax.toFixed(1)+' W':'—'}`:'—',powerPercent>=90?'warn':'')+meter('VRAM',vramPercent,`${gib(m.vramUsed??vramUsed)} / ${gib(m.total_bytes)}`,vramPercent>=90?'warn':'')+meter('Temp',tempPercent,Number.isFinite(temp)?`${temp.toFixed(1)}°C / ${Number.isFinite(threshold)?threshold.toFixed(0)+'°C':'—'}`:'—',tempPercent>=100?'bad':tempPercent>=90?'warn':'')+meter('Compute',compute,Number.isFinite(compute)?`${compute.toFixed(0)}%`:'—');c.querySelector('dl').innerHTML=[['PCIe',`Gen ${esc(x.pcie?.current_generation||'—')} ×${esc(x.pcie?.current_lanes||'—')}`],['Free VRAM',gib(m.free_bytes)],['Thermal guard',esc(guard.state||'unavailable')],['Vision',s.model?.vision?.enabled?'yes':'no'].map(r=>`<dt>${esc(r[0])}</dt><dd>${r[1]}</dd>`).join('')}
+ $('thermalSave').disabled=!configSnapshot?.persisted;
+ </script></body></html>"#,
+    );
+    html
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -989,5 +1077,18 @@ mod tests {
         assert!(!INDEX_HTML_V3.contains("refreshError"));
         assert!(INDEX_HTML_V3.contains("renderThermal(g.thermal_guard);decorateGpuCard(s)"));
         assert!(INDEX_HTML_V3.contains("refreshInFlight"));
+        let dashboard = dashboard_html();
+        assert!(dashboard.contains("Current limit"));
+        assert!(dashboard.contains("Driver range"));
+        assert!(dashboard.contains("input.type = 'range'"));
+        assert!(dashboard.contains(r#"<details id="runsPanel">"#));
+        assert!(!dashboard.contains(r#"<details id="runsPanel" open>"#));
+        assert!(dashboard.contains("thermalForm"));
+        assert!(dashboard.contains("data-thermal"));
+        assert!(dashboard.contains("Pause threshold °C"));
+        assert!(!dashboard.contains("Thermal guard enabled','bool'"));
+        assert!(dashboard.contains("meter('Power'"));
+        assert!(dashboard.contains("meter('Compute'"));
+        assert!(dashboard.contains("</script><script>"));
     }
 }

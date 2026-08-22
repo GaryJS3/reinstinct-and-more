@@ -146,6 +146,7 @@ sealed class ContractSuite
         {
             ("status page and OpenAPI", StatusAndOpenApiAsync),
             ("operations telemetry and model catalog", OperationsAsync),
+            ("GPU inventory and management contract", GpuInventoryAsync),
             ("configuration discovery and guard", ConfigurationAsync),
             ("health", HealthAsync),
             ("readiness", ReadinessAsync),
@@ -221,6 +222,9 @@ sealed class ContractSuite
                 "log metadata missing");
             Check(root.GetProperty("management").GetProperty("switch_requires_action_header").GetBoolean(),
                 "model-switch action-header guard missing");
+            var thermal = root.GetProperty("gpu").GetProperty("thermal_guard");
+            Check(thermal.GetProperty("state").GetString() is { Length: > 0 }, "thermal state missing");
+            Check(thermal.TryGetProperty("resume_temperature_c", out _), "thermal resume threshold missing");
         }
 
         using (var spec = await _client.SendJsonAsync(HttpMethod.Get, "openapi.json", null))
@@ -242,7 +246,31 @@ sealed class ContractSuite
                 "OpenAPI model-catalog operation missing");
             Check(root.GetProperty("paths").TryGetProperty("/readyz", out _),
                 "OpenAPI readiness operation missing");
+            Check(root.GetProperty("paths").TryGetProperty("/api/gpus", out _),
+                "OpenAPI GPU inventory operation missing");
+            Check(root.GetProperty("paths").TryGetProperty("/api/gpus/{pci_address}/power-limit", out _),
+                "OpenAPI power-limit operation missing");
         }
+    }
+
+    private async Task GpuInventoryAsync()
+    {
+        using var response = await _client.SendJsonAsync(HttpMethod.Get, "api/gpus", null);
+        using var document = await ReadJsonAsync(response, HttpStatusCode.OK);
+        var root = document.RootElement;
+        Check(root.GetProperty("virtualization").GetProperty("mode").GetString() is { Length: > 0 }, "GPU virtualization mode missing");
+        var gpus = root.GetProperty("gpus");
+        Check(gpus.ValueKind == JsonValueKind.Object, "GPU inventory must be keyed by PCI address");
+        foreach (var gpu in gpus.EnumerateObject())
+        {
+            Check(gpu.Name.Contains(':') && gpu.Name.Contains('.'), "GPU key is not an exact PCI address");
+            Check(gpu.Value.TryGetProperty("pcie", out _), "PCIe telemetry missing");
+            Check(gpu.Value.TryGetProperty("temperatures", out _), "temperature field missing");
+        }
+        using var missingAction = await _client.SendJsonAsync(HttpMethod.Post,
+            "api/gpus/0000:00:00.0/reset", new { });
+        Check(missingAction.StatusCode == HttpStatusCode.BadRequest,
+            $"GPU reset without action header expected 400, got {(int)missingAction.StatusCode}");
     }
 
     private async Task OperationsAsync()
@@ -295,6 +323,10 @@ sealed class ContractSuite
                 "configuration effective object missing");
             Check(root.TryGetProperty("reload", out var reload) && reload.ValueKind == JsonValueKind.Object,
                 "configuration reload state missing");
+            Check(effective.GetProperty("gpu_thermal_guard_enabled").GetBoolean(), "thermal guard default missing");
+            Check(effective.GetProperty("gpu_max_temp_c").GetDouble() == 90, "thermal maximum default missing");
+            Check(effective.GetProperty("gpu_max_temp_seconds").GetInt64() == 5, "thermal duration default missing");
+            Check(effective.GetProperty("gpu_resume_temp_c").GetDouble() == 82, "thermal resume default missing");
         }
 
         using var missingHeader = await _client.SendJsonAsync(HttpMethod.Put, "api/config",

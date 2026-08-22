@@ -15,6 +15,8 @@
 mod http;
 mod json;
 mod api;
+pub(crate) mod gpu;
+pub(crate) mod thermal;
 pub mod config;
 
 pub use api::DashboardLogWriter;
@@ -28,6 +30,7 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use json::Json;
+use serde_json::Value;
 use tracing::{error, info, warn};
 
 use crate::gguf::GgufFile;
@@ -62,7 +65,7 @@ impl Metrics {
     }
 
     /// Prometheus-style text exposition. Cheap — read each counter once.
-    fn render_prometheus(&self) -> String {
+    fn render_prometheus(&self, thermal: &thermal::ThermalGuard) -> String {
         use std::fmt::Write;
         let mut s = String::with_capacity(2048);
         let metric = |s: &mut String, name: &str, help: &str, value: u64| {
@@ -96,6 +99,20 @@ impl Metrics {
                self.requests_length.load(Ordering::Relaxed));
         metric(&mut s, "panics_recovered_total", "panics caught by the worker's catch_unwind",
                self.panics_recovered.load(Ordering::Relaxed));
+        let t = thermal.json();
+        metric(&mut s, "thermal_pauses_total", "thermal interlock pauses",
+               t["thermal_pauses"].as_u64().unwrap_or(0));
+        metric(&mut s, "thermal_sensor_failures_total", "thermal sensor failures",
+               t["sensor_failures"].as_u64().unwrap_or(0));
+        let _ = writeln!(s, "# HELP reinstinct_thermal_paused_seconds_total thermal hold seconds");
+        let _ = writeln!(s, "# TYPE reinstinct_thermal_paused_seconds_total counter");
+        let _ = writeln!(s, "reinstinct_thermal_paused_seconds_total {}", t["paused_seconds_total"].as_f64().unwrap_or(0.0));
+        let _ = writeln!(s, "# HELP reinstinct_thermal_max_temperature_c maximum observed monitored temperature");
+        let _ = writeln!(s, "# TYPE reinstinct_thermal_max_temperature_c gauge");
+        let _ = writeln!(s, "reinstinct_thermal_max_temperature_c {}", t["maximum_observed_temperature_c"].as_f64().unwrap_or(0.0));
+        let _ = writeln!(s, "# HELP reinstinct_thermal_held_requests currently held inference requests");
+        let _ = writeln!(s, "# TYPE reinstinct_thermal_held_requests gauge");
+        let _ = writeln!(s, "reinstinct_thermal_held_requests {}", t["held_requests"].as_u64().unwrap_or(0));
         let _ = writeln!(s, "# HELP reinstinct_start_unix_seconds server start time");
         let _ = writeln!(s, "# TYPE reinstinct_start_unix_seconds gauge");
         let _ = writeln!(s, "reinstinct_start_unix_seconds {}",
@@ -218,6 +235,7 @@ struct GenerationOutput {
     prefill_ms: f64,
     ttft_ms: f64,
     generation_ms: f64,
+    thermal_wait_ms: f64,
 }
 
 /// A unit of work handed from a connection thread to the GPU worker.
@@ -1173,7 +1191,8 @@ impl ServerModel {
     /// responses to embed in the final `logprobs` field. Empty when the
     /// request didn't ask for logprobs OR when the model is on the spec-
     /// decode path (which doesn't surface per-token softmax probs today).
-    fn generate(&mut self, req: &GenReq,
+    fn generate(&mut self, req: &GenReq, request_id: u64,
+                thermal: &thermal::ThermalGuard,
                 mut on_token: impl FnMut(&str, Option<&TokenLogprob>) -> bool)
         -> Result<GenerationOutput, String>
     {
@@ -1185,8 +1204,10 @@ impl ServerModel {
         // penalty); `counts` is the same data laid out per-vocab for
         // OpenAI-style frequency/presence penalties. Both are empty when
         // the per-request knobs leave their defaults.
-        let deadline = req.request_timeout
+        let mut deadline = req.request_timeout
             .map(|d| std::time::Instant::now() + d);
+        let mut thermal_wait_ms = 0.0;
+        macro_rules! checkpoint { () => {{ thermal_wait_ms += thermal.checkpoint(request_id, &mut deadline)?; }}; }
 
         match self {
             ServerModel::Qwen { gpu, state, tok, eos, max_seq, vision, .. } => {
@@ -1217,6 +1238,7 @@ impl ServerModel {
                 state.reset()?;
                 let mut vision_profile = None;
                 let prefill_started = std::time::Instant::now();
+                let thermal_wait_before_prefill = thermal_wait_ms;
                 let (mut logits, prompt_rows) = match &req.prompt {
                     PromptInput::ChatVision { messages, image } => {
                         let formatted = crate::chat::format_qwen3_with_media_marker(messages)?;
@@ -1232,7 +1254,8 @@ impl ServerModel {
                         if rows + req.max_tokens + 4 > *max_seq {
                             return Err(format!("multimodal prompt ({rows} physical rows) + max_tokens ({}) exceeds context window ({})", req.max_tokens, max_seq));
                         }
-                        let logits = gpu.forward_multimodal_chunks(&processed.chunks, state)?;
+                        let logits = gpu.forward_multimodal_chunks_with_checkpoint(
+                            &processed.chunks, state, || { checkpoint!(); Ok(()) })?;
                         vision_profile = Some((mtmd_ms, processed.timings));
                         (logits, rows)
                     }
@@ -1242,13 +1265,15 @@ impl ServerModel {
                                 "prompt ({}) + max_tokens ({}) exceeds context window ({})",
                                 prompt.len(), req.max_tokens, max_seq));
                         }
+                        checkpoint!();
                         let logits = if prompt.len() > 1 {
                             gpu.forward_tokens_batched(&prompt, state)?
                         } else { gpu.forward_tokens(&prompt, state)? };
                         (logits, prompt.len())
                     }
                 };
-                let prefill_ms = prefill_started.elapsed().as_secs_f64() * 1e3;
+                let prefill_ms = (prefill_started.elapsed().as_secs_f64() * 1e3
+                    - (thermal_wait_ms - thermal_wait_before_prefill)).max(0.0);
                 let prefill_logical_pos = state.rope_pos;
                 let vocab = logits.len();
                 let mut counts: Vec<u16> = if sp.frequency_penalty != 0.0
@@ -1262,6 +1287,7 @@ impl ServerModel {
                 let mut all_lp: Vec<TokenLogprob> = Vec::new();
                 let mut client_open = true;
                 let decode_started = std::time::Instant::now();
+                let thermal_wait_before_decode = thermal_wait_ms;
                 let mut first_token_ms = None;
                 for _ in 0..req.max_tokens {
                     if let Some(d) = deadline {
@@ -1306,6 +1332,7 @@ impl ServerModel {
                         hit_eos = true;
                         break;
                     }
+                    checkpoint!();
                     logits = gpu.forward_token(t, state)?;
                 }
                 if !matched_text_stop {
@@ -1314,7 +1341,8 @@ impl ServerModel {
                 if client_open && prev_text_len < full_text.len() {
                     let _ = on_token(&full_text[prev_text_len..], None);
                 }
-                let generation_ms = decode_started.elapsed().as_secs_f64() * 1e3;
+                let generation_ms = (decode_started.elapsed().as_secs_f64() * 1e3
+                    - (thermal_wait_ms - thermal_wait_before_decode)).max(0.0);
                 let ttft_ms = first_token_ms.unwrap_or(prefill_ms);
                 if let Some((mtmd_ms, mtmd)) = vision_profile {
                     info!("vision profile rows={} logical_pos={} decode_image_ms={:.1} tokenize_ms={:.1} projector_ms={:.1} copy_ms={:.1} mtmd_ms={:.1} prefill_ms={:.1} ttft_ms={:.1} decode_ms={:.1} generated={}",
@@ -1324,7 +1352,7 @@ impl ServerModel {
                 }
                 Ok(GenerationOutput { text: full_text, prompt_tokens: prompt_rows,
                     completion_tokens: out.len(), hit_stop: hit_eos, logprobs: all_lp,
-                    prefill_ms, ttft_ms, generation_ms })
+                    prefill_ms, ttft_ms, generation_ms, thermal_wait_ms })
             }
             ServerModel::Gemma { gpu, state, tok, eos, bos, max_seq, drafter, prefix_cache, .. } => {
                 let prompt = match &req.prompt {
@@ -1389,6 +1417,7 @@ impl ServerModel {
                 if !do_spec {
                     // Plain prefill + decode. If we hit the prefix cache,
                     // prefill only the suffix; otherwise full prompt.
+                    checkpoint!();
                     let prefill_started = std::time::Instant::now();
                     let mut logits = if restored {
                         let suffix = &prompt[overlap..];
@@ -1423,6 +1452,7 @@ impl ServerModel {
                     let mut all_lp: Vec<TokenLogprob> = Vec::new();
                     let mut client_open = true;
                     let decode_started = std::time::Instant::now();
+                    let thermal_wait_before_decode = thermal_wait_ms;
                     let mut ttft_ms = None;
                     for _ in 0..req.max_tokens {
                         if let Some(d) = deadline {
@@ -1462,6 +1492,7 @@ impl ServerModel {
                             hit_eos = true;
                             break;
                         }
+                        checkpoint!();
                         logits = gpu.forward_token(t, state)?;
                     }
                     if !matched_text_stop {
@@ -1470,10 +1501,12 @@ impl ServerModel {
                     if client_open && prev_text_len < full_text.len() {
                         let _ = on_token(&full_text[prev_text_len..], None);
                     }
-                    let generation_ms = decode_started.elapsed().as_secs_f64() * 1e3;
+                    let generation_ms = (decode_started.elapsed().as_secs_f64() * 1e3
+                        - (thermal_wait_ms - thermal_wait_before_decode)).max(0.0);
                     return Ok(GenerationOutput { text: full_text, prompt_tokens: prompt.len(),
                         completion_tokens: out.len(), hit_stop: hit_eos, logprobs: all_lp,
-                        prefill_ms, ttft_ms: ttft_ms.unwrap_or(prefill_ms), generation_ms });
+                        prefill_ms, ttft_ms: ttft_ms.unwrap_or(prefill_ms), generation_ms,
+                        thermal_wait_ms });
                 }
 
                 // Spec-decode path: prefill, then K=req.speculative_k
@@ -1484,10 +1517,14 @@ impl ServerModel {
                 // Prefill all but the last token — its logits aren't
                 // useful; the verify path immediately re-forwards it
                 // through `forward_token` to seed the chain.
+                checkpoint!();
                 let prefill_started = std::time::Instant::now();
                 let _ = gpu.prefill_forward(&prompt[..prompt.len() - 1], state)?;
+                let thermal_wait_before_verify = thermal_wait_ms;
+                checkpoint!();
                 let verify_logits = gpu.forward_token(*prompt.last().unwrap(), state)?;
-                let prefill_ms = prefill_started.elapsed().as_secs_f64() * 1e3;
+                let prefill_ms = (prefill_started.elapsed().as_secs_f64() * 1e3
+                    - (thermal_wait_ms - thermal_wait_before_verify)).max(0.0);
                 if d.verify_graphs[k].is_none() && !gpu.is_moe() {
                     d.verify_graphs[k] = Some(gpu.capture_verify_graph(state, k)?);
                 }
@@ -1502,6 +1539,7 @@ impl ServerModel {
                 let adaptive_window = std::env::var("REINSTINCT_MTP_WINDOW").ok()
                     .and_then(|s| s.parse::<usize>().ok()).unwrap_or(8);
                 let decode_started = std::time::Instant::now();
+                let thermal_wait_before_decode = thermal_wait_ms;
                 let (gen_toks, stats) = crate::runtime::spec_decode::spec_decode_generate(
                     gpu, &d.runtime, state,
                     d.verify_graphs[k].as_ref(), k,
@@ -1511,8 +1549,10 @@ impl ServerModel {
                     req.max_tokens, k, req.sampler.temperature, req.sampler.seed,
                     req.speculative_p_min,
                     adaptive_alpha, adaptive_window,
+                    || { checkpoint!(); Ok(()) },
                 )?;
-                let generation_ms = decode_started.elapsed().as_secs_f64() * 1e3;
+                let generation_ms = (decode_started.elapsed().as_secs_f64() * 1e3
+                    - (thermal_wait_ms - thermal_wait_before_decode)).max(0.0);
                 info!("spec-decode K={k}: {}/{} accept ({:.0}%){}",
                     stats.n_accepted, stats.n_drafted, 100.0 * stats.accept_rate(),
                     if stats.adaptive_disabled { " [adaptive: MTP off]" } else { "" });
@@ -1524,7 +1564,8 @@ impl ServerModel {
                 // shaper renders `logprobs: null` when the vec is empty.
                 Ok(GenerationOutput { text: tok.decode(&gen_toks), prompt_tokens: prompt.len(),
                     completion_tokens: gen_toks.len(), hit_stop: stats.hit_eos,
-                    logprobs: Vec::new(), prefill_ms, ttft_ms: prefill_ms, generation_ms })
+                    logprobs: Vec::new(), prefill_ms, ttft_ms: prefill_ms, generation_ms,
+                    thermal_wait_ms })
             }
         }
     }
@@ -1808,6 +1849,12 @@ fn worker(rx: mpsc::Receiver<WorkerCommand>, mut current_config: config::ServeCo
                         ThinkingStripStream::new()));
                     let stripper_cb = std::rc::Rc::clone(&stripper);
                     let progress_status = job_status.clone();
+                    let status_thermal = job_status.as_ref().map(|s| Arc::clone(&s.thermal))
+                        .ok_or_else(|| "thermal guard state is unavailable".to_string());
+                    let status_thermal = match status_thermal {
+                        Ok(g) => g,
+                        Err(e) => { let _ = job.reply.send(StreamMsg::Done(HttpReply { status: 503, status_text: "Service Unavailable", body: error_body(&e, "server_error") })); continue; }
+                    };
                     let progress_id = job.request_id;
                     let mut progress_tokens = 0usize;
                     let mut progress_started: Option<std::time::Instant> = None;
@@ -1835,12 +1882,12 @@ fn worker(rx: mpsc::Receiver<WorkerCommand>, mut current_config: config::ServeCo
                         reply_for_cb.send(StreamMsg::Chunk(frame)).is_ok()
                     };
                     let result = std::panic::catch_unwind(
-                        std::panic::AssertUnwindSafe(|| model.generate(&req, on_token)));
+                        std::panic::AssertUnwindSafe(|| model.generate(&req, job.request_id, &status_thermal, on_token)));
                     match result {
                         Ok(Ok(output)) => {
                             let GenerationOutput { text, prompt_tokens: n_p,
                                 completion_tokens: n_c, hit_stop: eos, logprobs: lp,
-                                prefill_ms, ttft_ms, generation_ms } = output;
+                                prefill_ms, ttft_ms, generation_ms, thermal_wait_ms } = output;
                             let wall_us = t.elapsed().as_micros() as u64;
                             metrics.requests_ok.fetch_add(1, Ordering::Relaxed);
                             metrics.prompt_tokens.fetch_add(n_p as u64, Ordering::Relaxed);
@@ -1858,7 +1905,7 @@ fn worker(rx: mpsc::Receiver<WorkerCommand>, mut current_config: config::ServeCo
                             } else { 0.0 };
                             captured_stats = Some(api::RunStats {
                                 prompt_tokens: n_p, completion_tokens: n_c,
-                                queue_ms: 0.0, prefill_ms, ttft_ms, generation_ms,
+                                queue_ms: 0.0, prefill_ms, ttft_ms, generation_ms, thermal_wait_ms,
                                 total_ms: wall_us as f64 / 1000.0,
                                 prompt_tokens_per_second: prompt_tok_per_s,
                                 generation_tokens_per_second: tok_per_s,
@@ -2068,6 +2115,55 @@ fn handle_conn(mut stream: std::net::TcpStream, target: Target,
         let _ = http::write_response(&mut stream, 200, "OK", &body);
         return;
     }
+    if is_get && path == "/api/gpus" {
+        let body = status.gpus_json();
+        let _ = http::write_response(&mut stream, 200, "OK", &body);
+        return;
+    }
+    if (request.method.eq_ignore_ascii_case("PUT") || request.method.eq_ignore_ascii_case("POST"))
+        && path.starts_with("/api/gpus/") {
+        let remainder = &path["/api/gpus/".len()..];
+        let Some((pci, operation)) = remainder.split_once('/') else {
+            let _ = http::write_response(&mut stream, 404, "Not Found", &error_body("GPU operation path is incomplete", "invalid_request_error"));
+            return;
+        };
+        let (expected, helper_action) = match (request.method.as_str(), operation) {
+            ("PUT", "power-limit") => ("set-power-limit", "set-power-limit"),
+            ("PUT", "tuning") => ("set-tuning", "set-tuning"),
+            ("POST", "reset") => ("reset-gpu", "reset"),
+            _ => { let _ = http::write_response(&mut stream, 404, "Not Found", &error_body("unknown GPU operation", "invalid_request_error")); return; }
+        };
+        if request.headers.get("content-type").is_none_or(|v| !v.to_ascii_lowercase().starts_with("application/json")) {
+            let _ = http::write_response(&mut stream, 415, "Unsupported Media Type", &error_body("GPU mutations require Content-Type: application/json", "invalid_request_error")); return;
+        }
+        if request.headers.get("x-reinstinct-action").map(String::as_str) != Some(expected) {
+            let _ = http::write_response(&mut stream, 400, "Bad Request", &error_body(&format!("GPU mutation requires X-ReInstinct-Action: {expected}"), "invalid_request_error")); return;
+        }
+        let inventory = status.inventory.json();
+        let Some(gpu) = inventory["gpus"].get(pci) else {
+            let _ = http::write_response(&mut stream, 404, "Not Found", &error_body("exact PCI GPU identity was not found", "gpu_not_found")); return;
+        };
+        if gpu["vendor"].as_str() != Some("AMD") {
+            let _ = http::write_response(&mut stream, 400, "Bad Request", &error_body("GPU controls are available only for AMD devices", "unsupported_operation")); return;
+        }
+        let payload = match serde_json::from_str::<serde_json::Value>(&request.body) {
+            Ok(Value::Object(_)) => serde_json::from_str::<serde_json::Value>(&request.body).unwrap_or(Value::Null),
+            _ => { let _ = http::write_response(&mut stream, 400, "Bad Request", &error_body("GPU mutation body must be a JSON object", "invalid_request_error")); return; }
+        };
+        let writable = match operation { "power-limit" => gpu["controls"]["power_limit_writable"].as_bool() == Some(true), "tuning" => gpu["controls"]["tuning_writable"].as_bool() == Some(true), _ => gpu["controls"]["reset_supported"].as_bool() == Some(true) };
+        if !writable { let _ = http::write_response(&mut stream, 409, "Conflict", &error_body("driver does not report this AMD operation as writable", "unsupported_operation")); return; }
+        if operation == "power-limit" {
+            let Some(watts) = payload.get("watts").and_then(Value::as_f64) else { let _ = http::write_response(&mut stream, 400, "Bad Request", &error_body("power-limit requires numeric watts", "invalid_request_error")); return; };
+            let max = gpu["power"]["maximum_watts"].as_f64();
+            let min = gpu["power"]["minimum_watts"].as_f64().unwrap_or(0.0);
+            if !watts.is_finite() || watts < min || max.is_some_and(|m| watts > m) { let _ = http::write_response(&mut stream, 400, "Bad Request", &error_body("power limit is outside the driver-reported range", "invalid_request_error")); return; }
+        }
+        match gpu::control(pci, helper_action, &payload) {
+            Ok(reply) => { let _ = http::write_response(&mut stream, 200, "OK", &reply.to_string()); }
+            Err(e) => { let _ = http::write_response(&mut stream, 503, "Service Unavailable", &error_body(&e, "gpu_helper_unavailable")); }
+        }
+        return;
+    }
     if is_get && path == "/api/runs" {
         let body = status.runs_json();
         let _ = http::write_response(&mut stream, 200, "OK", &body);
@@ -2117,6 +2213,10 @@ fn handle_conn(mut stream: std::net::TcpStream, target: Target,
         };
         if let Err(e) = next.persist() {
             let _ = http::write_response(&mut stream, 500, "Internal Server Error", &error_body(&e, "server_error"));
+            return;
+        }
+        if let Err(e) = status.apply_thermal_config(&next) {
+            let _ = http::write_response(&mut stream, 400, "Bad Request", &error_body(&e, "invalid_request_error"));
             return;
         }
         let reload = current.restart_required_fields(&next);
@@ -2206,7 +2306,7 @@ fn handle_conn(mut stream: std::net::TcpStream, target: Target,
         return;
     }
     if is_get && path.ends_with("/metrics") {
-        let body = metrics.render_prometheus();
+        let body = metrics.render_prometheus(&status.thermal);
         // Direct write — bypass JSON error_body shape.
         let resp = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\n\
@@ -2508,6 +2608,9 @@ pub fn run(overrides: config::ServeOverrides)
 
     let (tx, rx) = mpsc::channel::<WorkerCommand>();
     let metrics = Arc::new(Metrics::new());
+    let inventory = Arc::new(gpu::GpuInventory::host());
+    let thermal = Arc::new(thermal::ThermalGuard::new(effective.thermal_config()));
+    thermal.start(Arc::clone(&inventory));
 
     // Derive each port's advertised model name from the GGUF filename
     // stem (same rule the worker uses for ServerModel.name). The embed
@@ -2536,6 +2639,8 @@ pub fn run(overrides: config::ServeOverrides)
         next_config_reload_id: AtomicU64::new(0),
         queued: AtomicU64::new(0), active_request: AtomicU64::new(0),
         history: std::sync::Mutex::new(api::RunHistory::new()),
+        inventory: Arc::clone(&inventory),
+        thermal: Arc::clone(&thermal),
     });
     let big_status = mk_status(big_port, Target::Big, &big, big_drafter.clone(), vision.as_ref());
     let embed_path = embed.clone().unwrap_or_else(|| PathBuf::from("embedder-not-configured"));

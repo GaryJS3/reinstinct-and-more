@@ -90,8 +90,18 @@ subset that has actually passed its compatibility gates.
 - [x] Make catalog scans cacheable/refreshable, make model switching asynchronous
   with a status endpoint, add a readiness probe, and reject inference while a
   model is loading or switching.
-- [ ] Add optional Linux hwmon temperature, power input/cap, and clock data.
-  Missing hwmon fields must result in `null`, never endpoint failure.
+- [x] Add Linux PCI-keyed multi-GPU inventory at `GET /api/gpus`, including
+  null-tolerant hwmon/DRM/PCIe fields, virtualization evidence, and the
+  primary HIP GPU compatibility object in `/api/status.gpu`.
+- [x] Add persisted live thermal-guard settings and cooperative checkpoints;
+  the guard samples once per second, pauses after the configured sustained
+  threshold, resumes below the configured threshold, and reports separate
+  thermal-wait timing and counters.
+- [x] Add AMD runtime management routes and a root-owned structured helper.
+  The routes, allowlist protocol, range/readback/rollback logic, contract
+  shape, restricted helper installation, and isolated MI50 validation are
+  complete. Live destructive reset and unsafe thermal-threshold testing remain
+  explicitly outside the validation scope.
 
 ### Completions
 

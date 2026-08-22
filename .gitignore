@@ -5,6 +5,8 @@ Cargo.lock.bak
 
 # .NET
 **/bin/
+!/src/bin/
+!/src/bin/reinstinct-gpu-helper.rs
 **/obj/
 
 # Compiled HIP kernel cache (per-host, regenerated on demand)

@@ -13,5 +13,9 @@
   "vision_threads": 8,
   "vision_min_tokens": -1,
   "vision_max_tokens": -1,
-  "cpu_vision": false
+  "cpu_vision": false,
+  "gpu_thermal_guard_enabled": true,
+  "gpu_max_temp_c": 90,
+  "gpu_max_temp_seconds": 5,
+  "gpu_resume_temp_c": 82
 }

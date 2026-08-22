@@ -9,6 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::Metrics;
 use super::config::ServeConfig;
+use super::gpu::GpuInventory;
+use super::thermal::ThermalGuard;
 use serde_json::{Value, json};
 
 pub struct ApiStatus {
@@ -30,6 +32,8 @@ pub struct ApiStatus {
     pub config: Mutex<ServeConfig>,
     pub config_reload: Mutex<ConfigReloadStatus>,
     pub next_config_reload_id: AtomicU64,
+    pub inventory: std::sync::Arc<GpuInventory>,
+    pub thermal: std::sync::Arc<ThermalGuard>,
 }
 
 #[derive(Clone)]
@@ -137,6 +141,7 @@ pub struct RunStats {
     pub prefill_ms: f64,
     pub ttft_ms: f64,
     pub generation_ms: f64,
+    pub thermal_wait_ms: f64,
     pub total_ms: f64,
     pub prompt_tokens_per_second: f64,
     pub generation_tokens_per_second: f64,
@@ -277,10 +282,10 @@ impl ApiStatus {
     pub fn runs_json(&self) -> String {
         let history = match self.history.lock() {
             Ok(history) => history,
-            Err(_) => return json!({"capacity":RUN_HISTORY_CAPACITY,"runs":[]}).to_string(),
+            Err(_) => return json!({"capacity":RUN_HISTORY_CAPACITY,"retained":0,
+                "active_count":0,"completed":0,"errored":0,"runs":[]}).to_string(),
         };
-        let runs: Vec<Value> = history.entries.iter().rev().map(run_summary_json).collect();
-        json!({"capacity":history.capacity,"retained":runs.len(),"runs":runs}).to_string()
+        runs_value(&history).to_string()
     }
 
     pub fn run_json(&self, id: u64) -> Option<String> {
@@ -369,6 +374,26 @@ impl ApiStatus {
         }).to_string()
     }
 
+    pub fn gpus_json(&self) -> String { self.inventory.json().to_string() }
+
+    pub fn apply_thermal_config(&self, next: &ServeConfig) -> Result<(), String> {
+        let changed = self.config.lock().map(|current| {
+            current.gpu_thermal_guard_enabled != next.gpu_thermal_guard_enabled
+                || current.gpu_max_temp_c != next.gpu_max_temp_c
+                || current.gpu_max_temp_seconds != next.gpu_max_temp_seconds
+                || current.gpu_resume_temp_c != next.gpu_resume_temp_c
+        }).map_err(|_| "configuration state is unavailable")?;
+        if !changed { return Ok(()); }
+        self.thermal.update_config(next.thermal_config())?;
+        if let Ok(mut current) = self.config.lock() {
+            current.gpu_thermal_guard_enabled = next.gpu_thermal_guard_enabled;
+            current.gpu_max_temp_c = next.gpu_max_temp_c;
+            current.gpu_max_temp_seconds = next.gpu_max_temp_seconds;
+            current.gpu_resume_temp_c = next.gpu_resume_temp_c;
+        }
+        Ok(())
+    }
+
     pub fn queue_config_reload(&self, next: &ServeConfig) -> Result<u64, String> {
         let phase = self.phase.lock().map_err(|_| "service state is unavailable")?;
         if phase.name != "ready" { return Err(format!("service is {}", phase.name)); }
@@ -449,7 +474,7 @@ impl ApiStatus {
             "run_history":history_summary,
             "logs":logs_summary_json(),
             "management":{"model_switch":self.switch_value(),"config_reload":self.config_reload.lock().map(|r| json!({"id":r.id,"state":r.state,"error":r.error})).unwrap_or(Value::Null),"switch_requires_action_header":true},
-            "gpu":gpu_json(),
+            "gpu":gpu_json(&self.inventory, &self.thermal),
             "metrics":{"requests_total":metrics.requests_total.load(Ordering::Relaxed),
                 "http_requests_total":metrics.requests_total.load(Ordering::Relaxed),
                 "inference_runs_total":metrics.inference_runs_total.load(Ordering::Relaxed),
@@ -609,6 +634,7 @@ fn stats_json(stats: &RunStats) -> Value {
         "prefill_ms":nullable_number(stats.prefill_ms),
         "ttft_ms":nullable_number(stats.ttft_ms),
         "generation_ms":nullable_number(stats.generation_ms),
+        "thermal_wait_ms":stats.thermal_wait_ms,
         "total_ms":nullable_number(stats.total_ms),
         "prompt_tokens_per_second":nullable_number(stats.prompt_tokens_per_second),
         "generation_tokens_per_second":nullable_number(stats.generation_tokens_per_second)
@@ -623,6 +649,15 @@ fn run_summary_json(run: &RunRecord) -> Value {
         "completed_at_ms":run.completed_at_ms,"status_code":run.status_code,
         "error":run.error,"stats":stats_json(&run.stats)
     })
+}
+
+fn runs_value(history: &RunHistory) -> Value {
+    let runs: Vec<Value> = history.entries.iter().rev().map(run_summary_json).collect();
+    json!({"capacity":history.capacity,"retained":runs.len(),
+        "active_count":history.entries.iter().filter(|run| run.state == "active").count(),
+        "completed":history.entries.iter().filter(|run| run.state == "complete").count(),
+        "errored":history.entries.iter().filter(|run| run.state == "errored").count(),
+        "runs":runs})
 }
 
 fn run_detail_json(run: &RunRecord) -> Value {
@@ -696,7 +731,8 @@ fn error_message(body: &str) -> Option<String> {
         .and_then(|v| v.get("error")?.get("message")?.as_str().map(str::to_string))
 }
 
-fn gpu_json() -> Value {
+fn gpu_json(inventory: &GpuInventory, thermal: &ThermalGuard) -> Value {
+    let inventory_value = inventory.json();
     match crate::hip::device_count() {
         Ok(n) => {
             let name = (n > 0).then(|| crate::hip::device_name(0).ok()).flatten();
@@ -704,9 +740,10 @@ fn gpu_json() -> Value {
             .map(|(free,total)|json!({"free_bytes":free,"used_bytes":total.saturating_sub(free),"total_bytes":total}));
             let architecture = std::env::var("REINSTINCT_OFFLOAD_ARCH")
                 .unwrap_or_else(|_| crate::runtime::DEFAULT_ARCH.into());
-            json!({"available":n>0,"device_count":n,"name":name,"architecture":architecture,"memory":memory})
+            json!({"available":n>0,"device_count":n,"name":name,"architecture":architecture,"memory":memory,
+                "thermal_guard":thermal.json(),"inventory":inventory_value})
         }
-        Err(e) => json!({"available":false,"error":e}),
+        Err(e) => json!({"available":false,"error":e,"thermal_guard":thermal.json(),"inventory":inventory_value}),
     }
 }
 
@@ -718,6 +755,10 @@ pub fn openapi_json() -> String {
         "/healthz":{"get":{"summary":"Liveness","responses":{"200":{"description":"Alive","content":{"text/plain":{"schema":{"type":"string"}}}}}}},
         "/readyz":{"get":{"summary":"Readiness","responses":{"200":{"description":"Model ready","content":{"text/plain":{"schema":{"type":"string"}}}}},"503":{"description":"Loading or unavailable"}}},
         "/api/status":{"get":{"summary":"Live server status","responses":{"200":{"description":"Runtime, model, queue, GPU and counters","content":{"application/json":{"schema":{"$ref":"#/components/schemas/ServerStatus"}}}}}}},
+        "/api/gpus":{"get":{"summary":"Inventory and telemetry for every installed GPU","responses":{"200":{"description":"PCI-keyed GPU inventory with virtualization evidence","content":{"application/json":{"schema":{"$ref":"#/components/schemas/GpuInventory"}}}}}}},
+        "/api/gpus/{pci_address}/power-limit":{"put":{"summary":"Set an AMD runtime power cap through the privileged helper","parameters":[{"name":"pci_address","in":"path","required":true,"schema":{"type":"string","pattern":"^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\\.[0-7]$"}},{"name":"X-ReInstinct-Action","in":"header","required":true,"schema":{"const":"set-power-limit"}}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","required":["watts"],"properties":{"watts":{"type":"number"}}}}}},"responses":{"200":{"description":"Helper readback"},"400":{"description":"Invalid identity, range, JSON, or action"},"409":{"description":"Read-only or unsupported device"},"503":{"description":"Helper unavailable"}}}},
+        "/api/gpus/{pci_address}/tuning":{"put":{"summary":"Set bounded AMD runtime tuning through the privileged helper","parameters":[{"name":"pci_address","in":"path","required":true,"schema":{"type":"string"}},{"name":"X-ReInstinct-Action","in":"header","required":true,"schema":{"const":"set-tuning"}}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object"}}}},"responses":{"200":{"description":"Helper readback"},"400":{"description":"Invalid request"},"409":{"description":"Read-only or unsupported device"},"503":{"description":"Helper unavailable"}}}},
+        "/api/gpus/{pci_address}/reset":{"post":{"summary":"Reset an AMD GPU through the privileged helper","parameters":[{"name":"pci_address","in":"path","required":true,"schema":{"type":"string"}},{"name":"X-ReInstinct-Action","in":"header","required":true,"schema":{"const":"reset-gpu"}}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object"}}}},"responses":{"200":{"description":"Reset result"},"400":{"description":"Invalid request"},"409":{"description":"Unsupported device"},"503":{"description":"Helper unavailable"}}}},
         "/api/config":{"get":{"summary":"Get active and saved server configuration"},"put":{"summary":"Validate and persist server configuration","parameters":[{"name":"X-ReInstinct-Action","in":"header","required":true,"schema":{"const":"update-config"}}],"responses":{"200":{"description":"Configuration saved"},"400":{"description":"Invalid configuration"}}}},
         "/api/config/reload":{"get":{"summary":"Get configuration reload state"},"post":{"summary":"Apply the saved engine configuration","parameters":[{"name":"X-ReInstinct-Action","in":"header","required":true,"schema":{"const":"reload-config"}}],"responses":{"202":{"description":"Reload queued"},"409":{"description":"Busy or service restart required"}}}},
         "/api/runs":{"get":{"summary":"List bounded in-memory inference run history","responses":{"200":{"description":"Newest retained runs first","content":{"application/json":{"schema":{"$ref":"#/components/schemas/RunList"}}}}}}},
@@ -736,6 +777,7 @@ pub fn openapi_json() -> String {
         "TextPart":{"type":"object","required":["type","text"],"properties":{"type":{"const":"text"},"text":{"type":"string"}}},
         "ImagePart":{"type":"object","required":["type","image_url"],"properties":{"type":{"const":"image_url"},"image_url":{"type":"object","required":["url"],"properties":{"url":{"type":"string","pattern":"^data:image/(jpeg|png);base64,"}}}}},
         "ServerStatus":{"type":"object","additionalProperties":true},
+        "GpuInventory":{"type":"object","required":["virtualization","gpus"],"properties":{"virtualization":{"type":"object"},"gpus":{"type":"object","additionalProperties":{"type":"object"}}}},
         "RunList":{"type":"object","additionalProperties":true},
         "RunDetail":{"type":"object","additionalProperties":true},
         "Error":{"type":"object","required":["error"],"properties":{"error":{"type":"object","required":["message","type","param","code"],"properties":{"message":{"type":"string"},"type":{"type":"string"},"param":{"oneOf":[{"type":"string"},{"type":"null"}]},"code":{"oneOf":[{"type":"string"},{"type":"null"}]}}}}}
@@ -846,6 +888,9 @@ pub const INDEX_HTML_V3: &str = r#"<!doctype html><html lang="en"><head><meta ch
 .config-tools{padding:14px 16px;background:#0b120f;display:grid;grid-template-columns:minmax(260px,1fr) auto;gap:12px 18px}.config-path{min-width:0;display:flex;align-items:center;gap:9px;overflow:hidden}.config-path:before{content:"JSON";flex:none;color:var(--cyan);border:1px solid #31534a;padding:3px 6px;font-size:9px;letter-spacing:.12em}.config-path span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.config-actions{display:flex;gap:8px}.btn.primary{border-color:#628a43;background:#172319;color:var(--lime)}.btn:disabled{cursor:not-allowed;opacity:.42}.config-key{grid-column:1/-1;display:flex;gap:17px;padding-top:11px;border-top:1px solid #1d2923;color:var(--muted);font-size:10px}.config-key b{color:var(--cyan);font-size:14px}.config-notice{display:none;margin:12px 16px 0;padding:10px 12px;border-left:2px solid var(--cyan);background:#10201b;color:#b8cbc1;font-size:11px}.config-notice.show{display:block}.config-notice.warn{border-color:var(--amber);background:#211c10;color:#f0d794}.config-notice.error{border-color:var(--red);background:#241315;color:#ffb0b0}.config-form{padding:16px;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1px;background:#26352e}.config-field{min-width:0;background:#0e1612;padding:13px 14px;display:grid;grid-template-columns:minmax(130px,.65fr) minmax(160px,1.35fr) 18px;align-items:center;gap:12px}.config-field:hover{background:#111c17}.config-field label{color:#b7c4bd;font-size:11px}.config-field input:not([type=checkbox]){width:100%;min-width:0;background:#0a100d;border-color:#34463d;padding:9px 10px}.config-field input:focus{outline:1px solid var(--cyan);outline-offset:1px}.config-field .apply-mark{color:var(--cyan);font-size:15px;text-align:center}.config-field .restart-mark{color:var(--amber);font-size:12px;text-align:center}.config-field.locked{opacity:.58}.config-field.checkbox-field{grid-template-columns:1fr 18px}.config-field.checkbox-field label{display:flex;align-items:center;gap:9px}.config-field.checkbox-field input{min-width:0;accent-color:var(--lime)}@media(max-width:1050px){.config-form{grid-template-columns:1fr}}@media(max-width:680px){.config-tools{grid-template-columns:1fr}.config-actions{grid-row:2}.config-key{grid-row:3;flex-direction:column;gap:8px}.config-field{grid-template-columns:1fr 18px}.config-field label{grid-column:1/-1}.config-field input:not([type=checkbox]){grid-column:1}}
 </style></head><body><main><header><div><div class="eyebrow">gfx906 / operations console</div><h1>ReInstinct</h1><div id="version" class="sub">Connecting…</div></div><span id="phase" class="badge">connecting</span></header><section id="cards" class="grid"></section><section id="loadPanel" class="card" style="display:none"><div class="row"><div><div class="label">Model loading estimate</div><strong id="loadText"></strong></div><strong id="loadPct" class="cyan"></strong></div><div class="progress"><i id="loadBar"></i></div><div id="loadHint" class="sub" style="margin-top:8px"></div></section>
 <section id="errorPanel" class="card" style="display:none;border-color:var(--red)"><div class="label">Engine startup failure</div><pre id="errorText" style="margin-top:10px;color:var(--red);max-height:260px;white-space:pre-wrap;overflow:auto"></pre><div class="sub" style="margin-top:10px">The HTTP dashboard is still available. Fix the startup configuration or model, then restart the service.</div></section>
+<details id="gpusPanel"><summary>GPUs <span id="gpuSummary" class="summary-meta">loading</span></summary><div class="tools"><span class="sub">All PCI devices are read-only unless AMD driver capabilities and the privileged helper permit a bounded runtime operation.</span></div><div class="table-wrap"><table><thead><tr><th>PCI / identity</th><th>Driver / virtualization</th><th>PCIe</th><th>Power</th><th>Temperature</th><th>VRAM</th><th>Controls</th></tr></thead><tbody id="gpuRows"></tbody></table></div></details>
+<details id="thermalPanel"><summary>Thermal guard <span id="thermalSummary" class="summary-meta">loading</span></summary><div class="tools"><span id="thermalDetail" class="sub">The inference GPU is monitored at one-second intervals.</span></div></details>
+<details id="amdPanel"><summary>AMD GPU configuration <span id="amdSummary" class="summary-meta">select a writable GPU</span></summary><div class="tools"><select id="amdPci" class="btn"><option value="">No writable AMD GPU</option></select><input id="amdWatts" type="number" min="1" step="0.1" placeholder="Power limit (W)"><select id="amdLevel" class="btn"><option value="auto">auto</option><option value="low">low</option><option value="high">high</option><option value="manual">manual</option></select><button id="amdPower" class="btn primary">Apply power</button><button id="amdTune" class="btn">Apply tuning</button><button id="amdReset" class="btn">Reset</button><span class="sub">Runtime-only, driver-bounded, and subject to the thermal interlock. Confirm each mutation.</span></div></details>
 <details id="modelsPanel"><summary>Model catalog <span id="modelSummary" class="summary-meta">not scanned</span></summary><div class="tools"><button id="scanModels" class="btn">Refresh models</button><input id="modelFilter" type="search" placeholder="Filter models or paths…"><span class="sub">NFS scan is cached until refreshed. Switching waits for an idle worker.</span></div><div id="modelList" class="model-list"></div></details>
 <details id="configPanel"><summary>Engine configuration <span id="configSummary" class="summary-meta">loading</span></summary><div class="config-tools"><div class="config-path"><span id="configPath"></span></div><div class="config-actions"><button id="configSave" class="btn primary">Save</button><button id="configReload" class="btn">Reload</button><button id="configReset" class="btn">Reset</button></div><div class="config-key"><span><b>↻</b> applied after Reload</span><span><b>◆</b> applied after service restart</span><span>CLI-locked settings are read-only</span></div></div><div id="configNotice" class="config-notice" role="status"></div><form id="configForm" class="config-form"></form></details>
 <details id="runsPanel" open><summary>Recent runs <span id="runSummary" class="summary-meta">0 retained</span></summary><div class="tools"><input id="runFilter" type="search" placeholder="Filter runs by IP, route, state…"></div><div class="table-wrap"><table><thead><tr><th>ID / time</th><th>Client</th><th>Type</th><th>State</th><th>Tokens p/g</th><th>Prompt tok/s</th><th>Gen tok/s</th><th>TTFT</th><th>Total</th></tr></thead><tbody id="runRows"></tbody></table></div></details>
@@ -853,24 +898,28 @@ pub const INDEX_HTML_V3: &str = r#"<!doctype html><html lang="en"><head><meta ch
 <nav><a href="/docs">API docs</a><a href="/openapi.json">OpenAPI</a><a href="/metrics">Prometheus</a><a href="/api/runs">Run JSON</a><a href="/api/logs">Log JSON</a><span class="privacy">memory-only telemetry · clears on restart</span></nav></main>
 <dialog id="detail"><div class="dialog-head"><strong id="detailTitle">Run detail</strong><button class="btn" onclick="detail.close()">Close</button></div><div class="dialog-body"><div id="detailStats" class="stats"></div><h3 class="label">Request</h3><pre id="requestPayload" class="payload"></pre><h3 class="label">Response</h3><pre id="responsePayload" class="payload"></pre></div></dialog>
 <script>
-const $=id=>document.getElementById(id),esc=x=>String(x??'—').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])),rate=n=>n==null?'—':Number(n).toFixed(1),ms=n=>n==null?'—':n<1000?Number(n).toFixed(0)+' ms':(n/1000).toFixed(2)+' s',gib=n=>n==null?'—':(n/1073741824).toFixed(1)+' GiB',net=n=>n==null?'—':n>=1000?(n/1000).toFixed(2)+' Gbps':Number(n).toFixed(1)+' Mbps',clock=n=>n?new Date(n).toLocaleTimeString():'—';let cachedLogs=[],cachedRuns=[],lastHistory={};
+const $=id=>document.getElementById(id),esc=x=>String(x??'—').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])),rate=n=>n==null?'—':Number(n).toFixed(1),ms=n=>n==null?'—':n<1000?Number(n).toFixed(0)+' ms':(n/1000).toFixed(2)+' s',gib=n=>n==null?'—':(n/1073741824).toFixed(1)+' GiB',net=n=>n==null?'—':n>=1000?(n/1000).toFixed(2)+' Gbps':Number(n).toFixed(1)+' Mbps',clock=n=>n?new Date(n).toLocaleTimeString():'—';let cachedLogs=[],cachedRuns=[],lastHistory={},refreshInFlight=false;
 const card=(t,h,rows)=>`<article class="card"><h2>${esc(t)}</h2><div class="hero">${h}</div><dl>${rows.map(r=>`<dt>${esc(r[0])}</dt><dd>${r[1]}</dd>`).join('')}</dl></article>`;
-async function refresh(){try{const s=await fetch('/api/status',{cache:'no-store'}).then(r=>r.json());renderStatus(s);if($('runsPanel').open){const h=await fetch('/api/runs',{cache:'no-store'}).then(r=>r.json());cachedRuns=h.runs||[];lastHistory=h;renderRuns(h)}else{lastHistory=s.run_history||{};renderRunSummary(lastHistory)}if($('logsPanel').open){const l=await fetch('/api/logs',{cache:'no-store'}).then(r=>r.json());cachedLogs=l.lines||[];renderLogs();$('logSummary').textContent=`${l.retained||0} / ${l.capacity||0} retained`}else{$('logSummary').textContent=`${(s.logs||{}).retained||0} / ${(s.logs||{}).capacity||0} retained`}}catch(e){$('phase').textContent='unavailable';$('phase').className='badge error'}}
-function renderStatus(s){window.currentModel=s.model.id;const p=s.performance||{},a=p.aggregate||{},last=p.last||{},g=s.gpu||{},m=g.memory||{},n=s.network||{},v=s.model.vision||{},rh=s.run_history||{},sw=s.management?.model_switch||{};$('version').textContent=`v${s.service.version} · ${s.model.id} · uptime ${s.uptime_seconds}s`;$('phase').textContent=s.status;$('phase').className='badge '+s.status;if(sw.state==='queued'||sw.state==='loading')$('version').textContent+=` · model switch ${sw.state} #${sw.id}`;if(sw.state==='failed')$('version').textContent+=` · switch failed: ${sw.error||'unknown error'}`;$('cards').innerHTML=card('Prompt throughput',`<span class="lime">${rate(a.prompt_tokens_per_second)}</span> <small>tok/s</small>`,[['Last run',rate(last.prompt_tokens_per_second)],['Prompt tokens',s.metrics.prompt_tokens]])+card('Generation throughput',`<span class="cyan">${rate(a.generation_tokens_per_second)}</span> <small>tok/s</small>`,[['Last run',rate(last.generation_tokens_per_second)],['Generated',s.metrics.completion_tokens]])+card('Worker',s.worker.active_request_id?`<span class="cyan">ACTIVE #${s.worker.active_request_id}</span>`:'<span class="lime">IDLE</span>',[['Queued',s.worker.queued_requests],['Complete / errors',`${s.metrics.requests_ok} / ${rh.errored||0}`]])+card('GPU',gib(m.used_bytes),[['Free',gib(m.free_bytes)],['Vision',v.enabled?`yes · ${esc(v.device)}`:'no']])+card('Network',`<span class="cyan">${net(n.receive_mbps)}</span>`,[['Transmit',net(n.transmit_mbps)],['Scope',esc(n.scope)]]);const x=s.loading;if(x){$('loadPanel').style.display='block';const pct=Math.min(98,(x.estimated_fraction||0)*100);$('loadBar').style.width=pct+'%';$('loadPct').textContent=pct.toFixed(1)+'%';$('loadText').textContent=`${x.elapsed_seconds.toFixed(0)}s elapsed · ${x.stage==='finalizing_gpu'?'finalizing GPU setup':x.estimated_eta_seconds==null?'ETA calculating':Math.ceil(x.estimated_eta_seconds)+'s estimated remaining'}`;$('loadHint').textContent=`${gib(x.observed_network_bytes)} observed / ${gib(x.expected_bytes)} model · ${x.estimate_basis}`}else $('loadPanel').style.display='none';document.querySelectorAll('#modelList button[data-path]').forEach(b=>b.disabled=sw.state==='queued'||sw.state==='loading');renderRunSummary(rh)}
-function renderRunSummary(h){$('runSummary').textContent=`${h.retained||0} retained · ${h.active?'1 active':'0 active'} · ${h.errored||0} errors`}
+async function refresh(){if(refreshInFlight)return;refreshInFlight=true;try{const s=await fetch('/api/status',{cache:'no-store'}).then(r=>r.json());renderStatus(s);if($('runsPanel').open){const h=await fetch('/api/runs',{cache:'no-store'}).then(r=>r.json());cachedRuns=h.runs||[];lastHistory=h;renderRuns(h)}else{lastHistory=s.run_history||{};renderRunSummary(lastHistory)}if($('logsPanel').open){const l=await fetch('/api/logs',{cache:'no-store'}).then(r=>r.json());cachedLogs=l.lines||[];renderLogs();$('logSummary').textContent=`${l.retained||0} / ${l.capacity||0} retained`}else{$('logSummary').textContent=`${(s.logs||{}).retained||0} / ${(s.logs||{}).capacity||0} retained`}}catch(e){$('phase').textContent='unavailable';$('phase').className='badge error'}finally{refreshInFlight=false}}
+function renderStatus(s){window.currentModel=s.model.id;const p=s.performance||{},a=p.aggregate||{},last=p.last||{},g=s.gpu||{},m=g.memory||{},n=s.network||{},v=s.model.vision||{},rh=s.run_history||{},sw=s.management?.model_switch||{};$('version').textContent=`v${s.service.version} · ${s.model.id} · uptime ${s.uptime_seconds}s`;$('phase').textContent=s.status;$('phase').className='badge '+s.status;if(sw.state==='queued'||sw.state==='loading')$('version').textContent+=` · model switch ${sw.state} #${sw.id}`;if(sw.state==='failed')$('version').textContent+=` · switch failed: ${sw.error||'unknown error'}`;$('cards').innerHTML=card('Prompt throughput',`<span class="lime">${rate(a.prompt_tokens_per_second)}</span> <small>tok/s</small>`,[['Last run',rate(last.prompt_tokens_per_second)],['Prompt tokens',s.metrics.prompt_tokens]])+card('Generation throughput',`<span class="cyan">${rate(a.generation_tokens_per_second)}</span> <small>tok/s</small>`,[['Last run',rate(last.generation_tokens_per_second)],['Generated',s.metrics.completion_tokens]])+card('Worker',s.worker.active_request_id?`<span class="cyan">ACTIVE #${s.worker.active_request_id}</span>`:'<span class="lime">IDLE</span>',[['Queued',s.worker.queued_requests],['Complete / errors',`${s.metrics.requests_ok} / ${rh.errored||0}`]])+card('GPU',gib(m.used_bytes),[['Free',gib(m.free_bytes)],['Vision',v.enabled?`yes · ${esc(v.device)}`:'no']])+card('Network',`<span class="cyan">${net(n.receive_mbps)}</span>`,[['Transmit',net(n.transmit_mbps)],['Scope',esc(n.scope)]]);const x=s.loading;if(x){$('loadPanel').style.display='block';const pct=Math.min(98,(x.estimated_fraction||0)*100);$('loadBar').style.width=pct+'%';$('loadPct').textContent=pct.toFixed(1)+'%';$('loadText').textContent=`${x.elapsed_seconds.toFixed(0)}s elapsed · ${x.stage==='finalizing_gpu'?'finalizing GPU setup':x.estimated_eta_seconds==null?'ETA calculating':Math.ceil(x.estimated_eta_seconds)+'s estimated remaining'}`;$('loadHint').textContent=`${gib(x.observed_network_bytes)} observed / ${gib(x.expected_bytes)} model · ${x.estimate_basis}`}else $('loadPanel').style.display='none';document.querySelectorAll('#modelList button[data-path]').forEach(b=>b.disabled=sw.state==='queued'||sw.state==='loading');renderRunSummary(rh);renderThermal(g.thermal_guard);decorateGpuCard(s);$('errorPanel').style.display=s.status==='error'?'block':'none';$('errorText').textContent=s.status==='error'?(s.status_detail||'Engine failed without a reported detail.'):''}
+function renderRunSummary(h){const active=h.active_count??(h.active?1:0);$('runSummary').textContent=`${h.retained||0} retained · ${active} active · ${h.errored||0} errors`}
+function renderThermal(t){t=t||{};const state=t.state||'unavailable',temp=t.current_temperature_c==null?'—':Number(t.current_temperature_c).toFixed(1)+'°C',resume=t.resume_temperature_c==null?'—':Number(t.resume_temperature_c).toFixed(0)+'°C';$('thermalSummary').textContent=`${state} · ${temp}`;$('thermalDetail').textContent=state==='threshold_pending'?`HOT · pausing in ${Math.ceil(t.threshold_remaining_seconds||0)}s · current ${temp}`:state==='paused'||state==='cooling'?`Request ${t.affected_request||'queued'} held ${Number(t.paused_seconds||0).toFixed(1)}s · current ${temp} · resumes at ${resume} · queue remains alive.`:`State ${state} · threshold ${t.maximum_temperature_threshold_c||'—'}°C for ${t.maximum_temperature_seconds||'—'}s · resume ${resume}.`}
+function decorateGpuCard(s){const g=s.gpu||{},m=g.memory||{},all=g.inventory?.gpus||{},x=Object.values(all).find(x=>x.hip_device_index===0)||{},p=x.pcie||{},w=x.power||{},t=(x.temperatures||[]).slice().sort((a,b)=>(b.temperature_c||-1)-(a.temperature_c||-1))[0]||{},guard=g.thermal_guard||{};const c=$('cards')?.children[3];if(!c)return;c.querySelector('.hero').innerHTML=`${gib(m.used_bytes)} <small>VRAM · ${esc(guard.state||'unavailable')} · ${t.temperature_c==null?'—':Number(t.temperature_c).toFixed(1)+'°C'}</small>`;c.querySelector('dl').innerHTML=[['Power',`${w.watts==null?'—':Number(w.watts).toFixed(1)+' W'} / ${w.limit_watts==null?'—':Number(w.limit_watts).toFixed(1)+' W'}`],['Temperature',t.temperature_c==null?'—':Number(t.temperature_c).toFixed(1)+'°C'],['PCIe',`Gen ${p.current_generation||'—'} ×${p.current_lanes||'—'}`],['Free VRAM',gib(m.free_bytes)]].map(r=>`<dt>${esc(r[0])}</dt><dd>${r[1]}</dd>`).join('')}
+async function refreshGpus(){try{const j=await fetch('/api/gpus',{cache:'no-store'}).then(r=>r.json()),g=Object.values(j.gpus||{});$('gpuSummary').textContent=`${g.length} device${g.length===1?'':'s'} · ${j.virtualization?.mode||'unknown'}`;$('gpuRows').innerHTML=g.length?g.map(x=>{const p=x.pcie||{},w=x.power||{},t=(x.temperatures||[]).slice().sort((a,b)=>(b.temperature_c||-1)-(a.temperature_c||-1))[0]||{};return `<tr><td><b>${esc(x.pci_address)}</b><br>${esc(x.vendor||'Unknown')} ${esc(x.name||'—')}<br><span class="sub">${esc(x.vendor_id||'—')}/${esc(x.device_id||'—')} · HIP ${esc(x.hip_device_index)}</span></td><td>${esc(x.driver||'—')}<br>${esc(j.virtualization?.mode||'unknown')}</td><td>Gen ${esc(p.current_generation)} ×${esc(p.current_lanes)}<br>${esc(p.theoretical_gbps_per_direction)} GB/s</td><td>${w.watts==null?'—':Number(w.watts).toFixed(1)+' W'} / ${w.limit_watts==null?'—':Number(w.limit_watts).toFixed(1)+' W'}</td><td>${t.temperature_c==null?'—':Number(t.temperature_c).toFixed(1)+'°C'}<br>${esc(t.label)}</td><td>${gib(x.vram?.used_bytes)} / ${gib(x.vram?.total_bytes)}</td><td>${x.controls?.helper_installed&&x.controls?.power_limit_writable?'AMD writable':'read-only'}</td></tr>`}).join(''):'<tr><td colspan="7">No GPU inventory available.</td></tr>'}catch(e){$('gpuSummary').textContent='unavailable';$('gpuRows').innerHTML='<tr><td colspan="7">GPU inventory unavailable.</td></tr>'}}
+async function refreshAmd(){try{const j=await fetch('/api/gpus',{cache:'no-store'}).then(r=>r.json()),w=Object.values(j.gpus||{}).filter(x=>x.vendor==='AMD'&&x.controls?.helper_installed&&x.controls?.power_limit_writable);$('amdPci').innerHTML=w.length?w.map(x=>`<option value="${esc(x.pci_address)}">${esc(x.pci_address)} · ${esc(x.name||x.driver||'AMD')}</option>`).join(''):'<option value="">No writable AMD GPU</option>';$('amdSummary').textContent=w.length?`${w.length} writable AMD device${w.length===1?'':'s'}`:'No helper-enabled writable AMD GPU'}catch(_){$('amdSummary').textContent='unavailable'}}
+async function amdMutation(operation){const pci=$('amdPci').value;if(!pci){alert('Select a writable AMD GPU first.');return}if(!confirm(`Apply runtime ${operation} to ${pci}? The thermal guard remains authoritative.`))return;const specs={power:['PUT','set-power-limit',{watts:Number($('amdWatts').value)}],tuning:['PUT','set-tuning',{performance_level:$('amdLevel').value}],reset:['POST','reset-gpu',{}]}[operation];const r=await fetch(`/api/gpus/${encodeURIComponent(pci)}/${operation==='power'?'power-limit':operation==='tuning'?'tuning':'reset'}`,{method:specs[0],headers:{'Content-Type':'application/json','X-ReInstinct-Action':specs[1]},body:JSON.stringify(specs[2])}),j=await r.json();$('amdSummary').textContent=r.ok?`Applied ${operation}; readback ${JSON.stringify(j.readback||j)}`:`${r.status}: ${j.error?.message||'operation failed'}`;refreshGpus();refreshAmd()}
 function renderRuns(h){const q=$('runFilter').value.toLowerCase(),runs=(h.runs||[]).filter(r=>!q||[r.client_ip,r.path,r.request_type,r.state,String(r.status_code||'')].join(' ').toLowerCase().includes(q));renderRunSummary(h);$('runRows').innerHTML=runs.length?runs.map(r=>{const x=r.stats||{};return `<tr data-id="${r.id}"><td><b>#${r.id}</b><br>${clock(r.queued_at_ms)}</td><td>${esc(r.client_ip)}</td><td>${esc(r.request_type)}</td><td><span class="state ${esc(r.state)}">${esc(r.state)}</span></td><td>${x.prompt_tokens||0}/${x.completion_tokens||0}</td><td class="lime">${rate(x.prompt_tokens_per_second)}</td><td class="cyan">${rate(x.generation_tokens_per_second)}</td><td>${ms(x.ttft_ms)}</td><td>${ms(x.total_ms)}</td></tr>`}).join(''):'<tr><td colspan="9">No matching retained runs.</td></tr>'}
 function renderLogs(){const q=$('logFilter').value.toLowerCase(),lines=cachedLogs.filter(x=>x.toLowerCase().includes(q));$('logLines').textContent=lines.join('\n')||'No matching logs.'}
  $('logFilter').addEventListener('input',renderLogs);$('runFilter').addEventListener('input',()=>renderRuns(Object.assign({runs:cachedRuns},lastHistory)));$('modelFilter').addEventListener('input',()=>filterModels());$('logTail').onclick=()=>{$('logLines').scrollTop=$('logLines').scrollHeight};$('logsPanel').addEventListener('toggle',()=>{if($('logsPanel').open)refresh()});$('runsPanel').addEventListener('toggle',()=>{if($('runsPanel').open)refresh()});$('runRows').onclick=async e=>{const row=e.target.closest('tr[data-id]');if(!row)return;const r=await fetch('/api/runs/'+row.dataset.id).then(x=>x.json()),x=r.stats||{};$('detailTitle').textContent=`Run #${r.id} · ${r.state}`;$('detailStats').innerHTML=[['Client',r.client_ip],['Route',r.method+' '+r.path],['Prompt',`${x.prompt_tokens} · ${rate(x.prompt_tokens_per_second)} tok/s`],['Generation',`${x.completion_tokens} · ${rate(x.generation_tokens_per_second)} tok/s`],['TTFT',ms(x.ttft_ms)],['Total',ms(x.total_ms)]].map(v=>`<div><span>${esc(v[0])}</span>${esc(v[1])}</div>`).join('');$('requestPayload').textContent=JSON.stringify(r.request,null,2);$('responsePayload').textContent=JSON.stringify(r.response,null,2);$('detail').showModal()};
 function filterModels(){const q=$('modelFilter').value.toLowerCase();document.querySelectorAll('.model').forEach(row=>row.hidden=!!q&&!row.textContent.toLowerCase().includes(q))}
 $('scanModels').onclick=async()=>{const b=$('scanModels');b.disabled=true;b.textContent='Refreshing…';try{const c=await fetch('/api/models?refresh=1',{cache:'no-store'}).then(r=>r.json());$('modelSummary').textContent=`${c.count} models · ${c.root} · ${c.scan_duration_ms} ms`;$('modelList').innerHTML=c.models.map(m=>`<div class="model ${m.id===window.currentModel?'active-model':''}"><strong>${esc(m.id)}</strong><button class="btn" data-path="${esc(m.path)}" ${m.id===window.currentModel?'disabled':''}>${m.id===window.currentModel?'Loaded':'Load model'}</button><span>${Number(m.size_gib).toFixed(2)} GiB · ${m.vision_capable?'image projector found':'text only'}</span><span class="path">${esc(m.path)}${m.image_projector?'<br>projector: '+esc(m.image_projector):''}</span></div>`).join('');filterModels()}catch(e){$('modelList').textContent='Catalog scan failed: '+e}finally{b.disabled=false;b.textContent='Refresh models'}};
 $('modelList').onclick=async e=>{const b=e.target.closest('button[data-path]');if(!b)return;const path=b.dataset.path;if(!confirm(`Unload the current model and load:\n${path}\n\nInference will pause during loading.`))return;b.disabled=true;b.textContent='Queued…';try{const r=await fetch('/api/models/switch',{method:'POST',headers:{'Content-Type':'application/json','X-ReInstinct-Action':'switch-model'},body:JSON.stringify({path})}),j=await r.json();if(!r.ok)throw new Error(j.error?.message||'switch failed');$('modelSummary').textContent=`switch #${j.id} queued`;refresh()}catch(e){alert(e.message)}finally{b.disabled=false}};
-let configSnapshot=null;const restartKeys=new Set(['big_port','small_port','embed_port']);const configFields=[['big','Big model','path'],['model_dir','Model catalog root','path'],['big_drafter','Big drafter (optional)','path'],['small','Small model (optional)','path'],['embed','Embedder (optional)','path'],['big_port','Big port','number'],['small_port','Small port','number'],['embed_port','Embed port','number'],['max_seq','Context size','number'],['mmproj','Vision projector (optional)','path'],['mtmd_bridge','Vision bridge (optional)','path'],['vision_threads','Vision threads','number'],['vision_min_tokens','Vision minimum tokens','number'],['vision_max_tokens','Vision maximum tokens','number'],['cpu_vision','CPU vision','bool']];
+let configSnapshot=null;const restartKeys=new Set(['big_port','small_port','embed_port']);const configFields=[['big','Big model','path'],['model_dir','Model catalog root','path'],['big_drafter','Big drafter (optional)','path'],['small','Small model (optional)','path'],['embed','Embedder (optional)','path'],['big_port','Big port','number'],['small_port','Small port','number'],['embed_port','Embed port','number'],['max_seq','Context size','number'],['mmproj','Vision projector (optional)','path'],['mtmd_bridge','Vision bridge (optional)','path'],['vision_threads','Vision threads','number'],['vision_min_tokens','Vision minimum tokens','number'],['vision_max_tokens','Vision maximum tokens','number'],['cpu_vision','CPU vision','bool'],['gpu_thermal_guard_enabled','Thermal guard enabled','bool'],['gpu_max_temp_c','Maximum temperature °C','number'],['gpu_max_temp_seconds','Sustained duration seconds','number'],['gpu_resume_temp_c','Resume temperature °C','number']];
 function configNotice(message,tone=''){const n=$('configNotice');n.textContent=message;n.className='config-notice'+(message?' show':'')+(tone?' '+tone:'')}
 function renderConfig(c){configSnapshot=c;const locked=new Set(c.cli_locked||[]),reloadFields=c.reload_required_fields||[],restartFields=c.restart_required_fields||[];$('configPath').textContent=c.path||'No configuration file — settings are read-only';$('configSummary').textContent=reloadFields.length?'reload needed':restartFields.length?'restart needed':(c.persisted?'saved':'read-only');$('configReload').disabled=!c.persisted||!reloadFields.length||restartFields.length>0;$('configSave').disabled=!c.persisted;if(c.reload?.error)configNotice(c.reload.error,'error');else if(restartFields.length)configNotice(`Saved. Restart the service to apply: ${restartFields.join(', ')}.`,'warn');else if(reloadFields.length)configNotice(`Saved changes are waiting. Reload the engine to apply ${reloadFields.length} setting${reloadFields.length===1?'':'s'}.`,'warn');else if(!c.persisted)configNotice('Start the service with --config PATH to enable dashboard persistence.','warn');else configNotice('');const v=c.saved||c.effective||{};$('configForm').innerHTML=configFields.map(([key,label,type])=>{const lock=locked.has(key),val=v[key],restart=restartKeys.has(key),mark=lock?'':`<span class="${restart?'restart-mark':'apply-mark'}" title="${restart?'Applied after service restart':'Applied after Reload'}">${restart?'◆':'↻'}</span>`;if(type==='bool')return `<div class="config-field checkbox-field ${lock?'locked':''}"><label><input data-config="${key}" type="checkbox" ${val?'checked':''} ${lock?'disabled':''}> ${esc(label)}</label>${mark}</div>`;return `<div class="config-field ${lock?'locked':''}"><label for="cfg-${key}">${esc(label)}</label><input id="cfg-${key}" data-config="${key}" type="${type==='number'?'number':'text'}" value="${val==null?'':esc(val)}" ${lock?'disabled':''}>${mark}</div>`}).join('')}
 async function loadConfig(){try{const c=await fetch('/api/config',{cache:'no-store'}).then(r=>r.json());renderConfig(c)}catch(e){configNotice('Configuration unavailable: '+e,'error')}}
 $('configPanel').addEventListener('toggle',()=>{if($('configPanel').open)loadConfig()});$('configForm').addEventListener('input',()=>{$('configSummary').textContent='unsaved';$('configReload').disabled=true;configNotice('Unsaved changes. Save to validate them and see whether Reload is required.','warn')});$('configReset').onclick=()=>{if(configSnapshot)renderConfig(configSnapshot)};$('configSave').onclick=async()=>{if(!configSnapshot?.persisted){configNotice('Start the service with --config PATH before saving.','warn');return}const body={};for(const el of document.querySelectorAll('[data-config]')){if(el.disabled)continue;body[el.dataset.config]=el.type==='checkbox'?el.checked:(el.type==='number'?(el.value===''?null:Number(el.value)):(el.value===''?null:el.value))}const b=$('configSave');b.disabled=true;b.textContent='Saving…';try{const r=await fetch('/api/config',{method:'PUT',headers:{'Content-Type':'application/json','X-ReInstinct-Action':'update-config'},body:JSON.stringify(body)}),j=await r.json();if(!r.ok)throw new Error(j.error?.message||'configuration update failed');await loadConfig()}catch(e){configNotice(e.message,'error')}finally{b.disabled=!configSnapshot?.persisted;b.textContent='Save'}};$('configReload').onclick=async()=>{if(!confirm('Reload the engine now? Inference will pause while models are reloaded.'))return;const b=$('configReload');b.disabled=true;b.textContent='Queuing…';try{const r=await fetch('/api/config/reload',{method:'POST',headers:{'X-ReInstinct-Action':'reload-config'}}),j=await r.json();if(!r.ok)throw new Error(j.error?.message||'reload failed');configNotice(`Reload #${j.id} queued.`);$('configSummary').textContent='reload queued';loadConfig()}catch(e){configNotice(e.message,'error')}finally{b.textContent='Reload'}};loadConfig();
- async function refreshError(){try{const s=await fetch('/api/status',{cache:'no-store'}).then(r=>r.json());$('errorPanel').style.display=s.status==='error'?'block':'none';$('errorText').textContent=s.status==='error'?(s.status_detail||'Engine failed without a reported detail.'):''}catch(_){}}
- refreshError();setInterval(refreshError,2000);refresh();setInterval(refresh,2000);
+ $('amdPower').onclick=()=>amdMutation('power');$('amdTune').onclick=()=>amdMutation('tuning');$('amdReset').onclick=()=>amdMutation('reset');refresh();setInterval(refresh,2000);refreshGpus();refreshAmd();setInterval(refreshGpus,2000);setInterval(refreshAmd,5000);
 </script></body></html>"#;
 
 #[cfg(test)]
@@ -911,5 +960,34 @@ mod tests {
         assert_eq!(history.entries.len(), RUN_HISTORY_CAPACITY);
         assert!(history.find(1).is_none());
         assert!(history.find(RUN_HISTORY_CAPACITY as u64 + 1).is_some());
+    }
+
+    #[test]
+    fn run_list_keeps_summary_counts_with_rows() {
+        let mut history = RunHistory::new();
+        for (id, state, status_code) in [(1, "complete", 200), (2, "errored", 500),
+                                         (3, "active", 0)] {
+            history.push(RunRecord { id, client_ip: "127.0.0.1".into(),
+                method: "POST".into(), path: "/v1/chat/completions".into(),
+                request_type: "chat".into(), state, queued_at_ms: id,
+                started_at_ms: Some(id), completed_at_ms: (status_code > 0).then_some(id),
+                status_code: (status_code > 0).then_some(status_code), request: Value::Null,
+                response: Some(Value::Null), error: None, stats: RunStats::default() });
+        }
+        let value = runs_value(&history);
+        assert_eq!(value["retained"], 3);
+        assert_eq!(value["active_count"], 1);
+        assert_eq!(value["completed"], 1);
+        assert_eq!(value["errored"], 1);
+        assert_eq!(value["runs"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn operations_dashboard_uses_one_status_refresh_path() {
+        assert_eq!(INDEX_HTML_V3.matches("fetch('/api/status'").count(), 1);
+        assert!(!INDEX_HTML_V3.contains("syncThermal"));
+        assert!(!INDEX_HTML_V3.contains("refreshError"));
+        assert!(INDEX_HTML_V3.contains("renderThermal(g.thermal_guard);decorateGpuCard(s)"));
+        assert!(INDEX_HTML_V3.contains("refreshInFlight"));
     }
 }

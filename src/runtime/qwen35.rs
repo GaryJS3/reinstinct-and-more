@@ -3497,8 +3497,18 @@ impl GpuQwen35 {
         chunks: &[crate::multimodal::Chunk],
         state: &mut Qwen35GpuState,
     ) -> Result<Vec<f32>, String> {
+        self.forward_multimodal_chunks_with_checkpoint(chunks, state, || Ok(()))
+    }
+
+    pub fn forward_multimodal_chunks_with_checkpoint(
+        &self,
+        chunks: &[crate::multimodal::Chunk],
+        state: &mut Qwen35GpuState,
+        mut checkpoint: impl FnMut() -> Result<(), String>,
+    ) -> Result<Vec<f32>, String> {
         let mut last = None;
         for chunk in chunks {
+            checkpoint()?;
             let logits = match chunk {
                 crate::multimodal::Chunk::Text { tokens, n_pos } => {
                     if tokens.is_empty() { continue; }

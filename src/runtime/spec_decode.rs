@@ -89,6 +89,7 @@ pub fn spec_decode_generate(
     // and a single bad streak kills MTP; too long and the -25% damage on
     // low-α prompts goes on too long. 8 is roughly 16-24 tokens decided.
     adaptive_window: usize,
+    mut checkpoint: impl FnMut() -> Result<(), String>,
 ) -> Result<(Vec<u32>, SpecStats), String> {
     let mut generated: Vec<u32> = Vec::new();
     let mut stats = SpecStats::default();
@@ -115,6 +116,7 @@ pub fn spec_decode_generate(
             last_tok = pick;
             if pick == eos { stats.hit_eos = true; break; }
             if generated.len() >= max_tokens { break; }
+            checkpoint()?;
             verify_logits = target.forward_token(pick, state)?;
             continue;
         }
@@ -122,11 +124,13 @@ pub fn spec_decode_generate(
         // --- DRAFT phase: K autoregressive drafter steps pinned to
         //     pos_const = state.pos - 1 (the last-validated position).
         let pos_const = state.pos - 1;
+        checkpoint()?;
         drafter.set_h_prev_from_target(target)?;
         let mut drafted: Vec<u32> = Vec::with_capacity(k);
         let mut drafter_logits_arr: Vec<Vec<f32>> = Vec::with_capacity(k);
         let mut prev = last_tok;
         for _ in 0..k {
+            checkpoint()?;
             let logits_d = drafter.forward_step(target, state, prev, pos_const)?;
             let d = if sampling { sample_from_logits(&logits_d, temperature, &mut rng) }
                     else        { argmax(&logits_d) };
@@ -163,11 +167,13 @@ pub fn spec_decode_generate(
         if drafted.is_empty() {
             // p_min triggered on the FIRST draft step — fall back to a
             // single forward to avoid an empty-verify round.
+            checkpoint()?;
             let next = target.forward_token(last_tok, state)?;
             let pick = if sampling { sample_from_logits(&next, temperature, &mut rng) }
                        else        { argmax(&next) };
             generated.push(pick);
             last_tok = pick;
+            checkpoint()?;
             verify_logits = target.forward_token(pick, state)?;
             stats.hit_eos = pick == eos;
             if stats.hit_eos { break; }
@@ -177,6 +183,7 @@ pub fn spec_decode_generate(
         // --- BATCHED VERIFY: target processes K candidates in one
         //     forward, returns K logit vectors.
         let pre_verify_pos = state.pos;
+        checkpoint()?;
         let verify_batch = match verify_graph {
             Some(g) if drafted.len() == captured_k =>
                 target.forward_verify_via_graph(g, captured_k, &drafted, state)?,
@@ -222,6 +229,7 @@ pub fn spec_decode_generate(
                 if generated.len() >= max_tokens { rejected = true; break; }
             } else {
                 state.truncate(pre_verify_pos + i);
+                checkpoint()?;
                 let new_verify = target.forward_token(replacement, state)?;
                 generated.push(replacement);
                 last_tok = replacement;
@@ -240,6 +248,7 @@ pub fn spec_decode_generate(
                 verify_logits = verify_batch.last().cloned().unwrap();
             } else {
                 let bonus = argmax(verify_batch.last().unwrap());
+                checkpoint()?;
                 verify_logits = target.forward_token(bonus, state)?;
                 generated.push(bonus);
                 last_tok = bonus;

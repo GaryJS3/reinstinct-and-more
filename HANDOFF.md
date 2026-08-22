@@ -2,9 +2,9 @@
 
 ## Current deployment snapshot (2026-08-22)
 
-The current deployed service is commit `7ddf521` (`serve: split config save
-and reload actions`). It runs on `ai@10.0.0.41:8006` as the enabled
-`reinstinct-server.service`, from the isolated checkout
+The current deployed service includes separate configuration Save/Reload
+actions, PCI-keyed GPU telemetry, and the thermal interlock. It runs on
+`ai@10.0.0.41:8006` as the enabled `reinstinct-server.service`, from the isolated checkout
 `/home/ai/inference-bench/reinstinct-service-20260822`.
 
 - Default service configuration: `/etc/reinstinct/server.json`.

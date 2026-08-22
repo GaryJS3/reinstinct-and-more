@@ -81,6 +81,11 @@ The server currently exposes:
 
 - `GET /` for a live, browser-friendly server dashboard;
 - `GET /api/status` for machine-readable model, worker, GPU, settings, and counter state;
+- `GET /api/gpus` for PCI-keyed multi-GPU inventory, virtualization evidence,
+  telemetry, and read-only/non-AMD capability reporting;
+- `PUT /api/gpus/{pci_address}/power-limit`, `PUT
+  /api/gpus/{pci_address}/tuning`, and `POST /api/gpus/{pci_address}/reset`
+  for exact-identity AMD mutations through the optional privileged helper;
 - `GET /api/config` for active/saved JSON settings, CLI-locked fields, pending reload fields, and reload state;
 - `PUT /api/config` for validated atomic persistence without an engine reload;
 - `GET /api/config/reload` plus `POST /api/config/reload` for reload state and explicit idle-only engine reloads;
@@ -94,6 +99,11 @@ The server currently exposes:
 - SSE streaming terminated by `data: [DONE]`, with optional usage chunks.
 - UTF-8-safe output assembly when one character spans multiple generated
   byte-level tokens.
+
+The dashboard also reports the cooperative thermal interlock. Its default
+90°C/5-second/82°C policy is persisted in the JSON configuration and can be
+changed live with the four `gpu_*` settings. Thermal hold time is retained as
+`thermal_wait_ms` in run history and is not included in inference timing.
 
 The OpenAPI document describes the implemented subset rather than claiming
 the entire OpenAI API. Responses, Conversations, tool calling, and structured

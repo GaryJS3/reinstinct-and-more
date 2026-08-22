@@ -27,6 +27,10 @@ const KEYS: &[&str] = &[
     "vision_min_tokens",
     "vision_max_tokens",
     "cpu_vision",
+    "gpu_thermal_guard_enabled",
+    "gpu_max_temp_c",
+    "gpu_max_temp_seconds",
+    "gpu_resume_temp_c",
 ];
 
 #[derive(Clone, Debug)]
@@ -66,6 +70,10 @@ pub struct ServeConfig {
     pub vision_min_tokens: i32,
     pub vision_max_tokens: i32,
     pub cpu_vision: bool,
+    pub gpu_thermal_guard_enabled: bool,
+    pub gpu_max_temp_c: f64,
+    pub gpu_max_temp_seconds: u64,
+    pub gpu_resume_temp_c: f64,
     pub config_path: Option<PathBuf>,
     pub cli_locked: BTreeSet<String>,
 }
@@ -192,6 +200,10 @@ impl ServeConfig {
                 .get("cpu_vision")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            gpu_thermal_guard_enabled: value.get("gpu_thermal_guard_enabled").and_then(Value::as_bool).unwrap_or(true),
+            gpu_max_temp_c: value.get("gpu_max_temp_c").and_then(Value::as_f64).unwrap_or(90.0),
+            gpu_max_temp_seconds: number("gpu_max_temp_seconds", 5)?,
+            gpu_resume_temp_c: value.get("gpu_resume_temp_c").and_then(Value::as_f64).unwrap_or(82.0),
             config_path,
             cli_locked: BTreeSet::new(),
         };
@@ -206,6 +218,11 @@ impl ServeConfig {
         if self.max_seq == 0 {
             return Err("max_seq must be positive".into());
         }
+        if !self.gpu_max_temp_c.is_finite() || !self.gpu_resume_temp_c.is_finite()
+            || self.gpu_resume_temp_c >= self.gpu_max_temp_c {
+            return Err("gpu_resume_temp_c must be lower than gpu_max_temp_c".into());
+        }
+        if self.gpu_max_temp_seconds == 0 { return Err("gpu_max_temp_seconds must be positive".into()); }
         match (&self.mmproj, &self.mtmd_bridge) {
             (None, None) => {},
             (Some(_), Some(_)) if self.vision_threads > 0 && self.vision_min_tokens != 0 && self.vision_max_tokens != 0 && !(self.vision_min_tokens > 0 && self.vision_max_tokens > 0 && self.vision_min_tokens > self.vision_max_tokens) => {},
@@ -217,7 +234,11 @@ impl ServeConfig {
 
     pub fn json_value(&self) -> Value {
         let path = |p: &PathBuf| Value::String(p.to_string_lossy().into_owned());
-        serde_json::json!({"big":path(&self.big),"model_dir":path(&self.model_dir),"big_drafter":self.big_drafter.as_ref().map(path),"small":self.small.as_ref().map(path),"embed":self.embed.as_ref().map(path),"big_port":self.big_port,"small_port":self.small_port,"embed_port":self.embed_port,"max_seq":self.max_seq,"mmproj":self.mmproj.as_ref().map(path),"mtmd_bridge":self.mtmd_bridge.as_ref().map(path),"vision_threads":self.vision_threads,"vision_min_tokens":self.vision_min_tokens,"vision_max_tokens":self.vision_max_tokens,"cpu_vision":self.cpu_vision})
+        serde_json::json!({"big":path(&self.big),"model_dir":path(&self.model_dir),"big_drafter":self.big_drafter.as_ref().map(path),"small":self.small.as_ref().map(path),"embed":self.embed.as_ref().map(path),"big_port":self.big_port,"small_port":self.small_port,"embed_port":self.embed_port,"max_seq":self.max_seq,"mmproj":self.mmproj.as_ref().map(path),"mtmd_bridge":self.mtmd_bridge.as_ref().map(path),"vision_threads":self.vision_threads,"vision_min_tokens":self.vision_min_tokens,"vision_max_tokens":self.vision_max_tokens,"cpu_vision":self.cpu_vision,"gpu_thermal_guard_enabled":self.gpu_thermal_guard_enabled,"gpu_max_temp_c":self.gpu_max_temp_c,"gpu_max_temp_seconds":self.gpu_max_temp_seconds,"gpu_resume_temp_c":self.gpu_resume_temp_c})
+    }
+
+    pub fn thermal_config(&self) -> crate::serve::thermal::ThermalConfig {
+        crate::serve::thermal::ThermalConfig { enabled: self.gpu_thermal_guard_enabled, max_temp_c: self.gpu_max_temp_c, max_temp_seconds: self.gpu_max_temp_seconds, resume_temp_c: self.gpu_resume_temp_c }
     }
 
     pub fn apply_update(&self, update: &Value) -> Result<Self, String> {

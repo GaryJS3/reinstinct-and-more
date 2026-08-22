@@ -544,8 +544,19 @@ Every enabled serve port exposes a browser dashboard at `GET /`. Its live
 data comes from `GET /api/status`, which reports the loaded model and context
 settings, startup/ready/error state, active and queued requests, request/token
 counters, aggregate and last-run prompt/generation throughput, vision
-configuration, and HIP device/VRAM information. The page refreshes every two
-seconds without placing work on the GPU queue.
+configuration, HIP device/VRAM information, and thermal-guard state. The page
+refreshes every two seconds without placing work on the GPU queue. `GET
+/api/gpus` returns every discovered PCI GPU keyed by exact PCI address, with
+best-effort PCIe, VRAM, power, temperature, fan, utilization, clock, DRM/HIP,
+and virtualization fields; unreadable fields are `null`.
+
+The thermal guard defaults to a 90°C junction/hottest-sensor limit sustained
+for five seconds and resumes at 82°C. It pauses only at inference checkpoints,
+keeps streaming connections and queued requests alive, and reports thermal
+hold time separately from inference timing. If a sensor disappears after
+monitoring began, the guard fails closed after five failed samples. No suitable
+startup sensor leaves inference available but exposes `unavailable` in status
+and the dashboard.
 
 If model, HIP device, or engine initialization fails, the listeners remain
 available and the dashboard changes to an **Engine startup failure** view. It
@@ -1278,6 +1289,29 @@ forward-pass divergence to a specific layer.
   was prototyped but ~3.5× slower than the decode-loop on MI50 due to
   per-(token,slot) expert weight reads. Currently MTP costs ~30% on
   the MoE target, helps only the dense 31B.
+
+### GPU management and thermal configuration
+
+AMD controls are runtime-only and use exact PCI identities:
+
+```text
+PUT  /api/gpus/{pci_address}/power-limit   X-ReInstinct-Action: set-power-limit
+PUT  /api/gpus/{pci_address}/tuning         X-ReInstinct-Action: set-tuning
+POST /api/gpus/{pci_address}/reset          X-ReInstinct-Action: reset-gpu
+```
+
+Each mutation requires JSON, a driver-reported writable operation, and the
+operation-specific header. The server delegates to the allowlisted
+`reinstinct-gpu-helper` Unix-socket protocol. Install it root-owned with a
+restricted socket; it does not execute shell commands, edit `pp_table` or
+VBIOS ceilings, expose voltage, or persist tuning across reboot. Non-AMD GPUs
+remain visible and read-only. Use an authenticated reverse proxy before
+exposing management routes outside a trusted network.
+
+The live JSON settings are `gpu_thermal_guard_enabled`, `gpu_max_temp_c`,
+`gpu_max_temp_seconds`, and `gpu_resume_temp_c`. Save applies these fields
+without a model reload, and the resume temperature must be lower than the
+maximum temperature.
 
 ## SERVE-MODE NOTES
 

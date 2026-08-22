@@ -2752,7 +2752,7 @@ fn mtp_gen_cli(target_path: &std::path::Path, drafter_path: &std::path::Path,
         cfg_eos,
         steps, k, temperature, seed,
         p_min_cli,
-        adaptive_alpha, adaptive_window,
+        adaptive_alpha, adaptive_window, || Ok(()),
     ).map_err(anyhow::Error::msg)?;
 
     let gen_secs = t_gen.elapsed().as_secs_f64();

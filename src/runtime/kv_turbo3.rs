@@ -27,7 +27,7 @@
 //! → 2.0× compression vs int8, 4.6× vs fp16.
 
 use crate::quant::turbo3::{BLOCKS_PER_GROUP, BYTES_PER_BLOCK, CacheKind, ROT_GROUP};
-use crate::hip::{DeviceBuf, Module};
+use crate::hip::{DeviceBuf, MemoryCategory, Module};
 #[cfg(test)] use crate::hip;
 use super::KernelCache;
 use std::ffi::c_void;
@@ -117,14 +117,14 @@ impl TurboKvCache {
         // populated `len` would otherwise see leftover allocations.
         let zeros = vec![0u8; total_bytes];
         Ok(Self {
-            k: DeviceBuf::from_slice(&zeros)?,
-            v: DeviceBuf::from_slice(&zeros)?,
+            k: DeviceBuf::from_slice_in(&zeros, MemoryCategory::Context)?,
+            v: DeviceBuf::from_slice_in(&zeros, MemoryCategory::Context)?,
             n_kv, head_dim, max_seq, len: 0,
             write_module: None,
-            signs1_k: DeviceBuf::from_slice(CacheKind::K.signs1())?,
-            signs2_k: DeviceBuf::from_slice(CacheKind::K.signs2())?,
-            signs1_v: DeviceBuf::from_slice(CacheKind::V.signs1())?,
-            signs2_v: DeviceBuf::from_slice(CacheKind::V.signs2())?,
+            signs1_k: DeviceBuf::from_slice_in(CacheKind::K.signs1(), MemoryCategory::Context)?,
+            signs2_k: DeviceBuf::from_slice_in(CacheKind::K.signs2(), MemoryCategory::Context)?,
+            signs1_v: DeviceBuf::from_slice_in(CacheKind::V.signs1(), MemoryCategory::Context)?,
+            signs2_v: DeviceBuf::from_slice_in(CacheKind::V.signs2(), MemoryCategory::Context)?,
         })
     }
 

@@ -25,7 +25,7 @@ use crate::cpu::qwen3_5::Qwen35F32Model;
 use crate::model::qwen3_5::Qwen35Model;
 use crate::gguf::{GgufFile, GgmlType};
 #[cfg_attr(not(test), allow(unused_imports))]
-use crate::hip::{self, DeviceBuf, Event, Graph, GraphExec, Module, Stream};
+use crate::hip::{self, DeviceBuf, Event, Graph, GraphExec, MemoryCategory, Module, Stream};
 use crate::hip::sys::HipStreamCaptureMode;
 use crate::hip::rocblas::{Handle as RocblasHandle, RocblasOp};
 
@@ -194,9 +194,9 @@ impl GpuMatvecTensor {
                 .map(|&b| f32::from_bits((b as u32) << 16))
                 .collect();
             let raw: &[u8] = bytemuck::cast_slice(&f32s);
-            (DeviceBuf::from_slice(raw)?, GgmlType::F32)
+            (DeviceBuf::from_slice_in(raw, MemoryCategory::ModelWeights)?, GgmlType::F32)
         } else {
-            (DeviceBuf::from_slice(bytes)?, info.ggml_type)
+            (DeviceBuf::from_slice_in(bytes, MemoryCategory::ModelWeights)?, info.ggml_type)
         };
         Ok(Self {
             data, dtype,
@@ -234,13 +234,13 @@ impl GpuMatvecTensor {
         };
         match packed {
             Some(p) => Ok(Self {
-                data: DeviceBuf::from_slice(&p)?,
+                data: DeviceBuf::from_slice_in(&p, MemoryCategory::ModelWeights)?,
                 dtype: info.ggml_type,
                 in_dim, out_dim,
                 repacked: true,
             }),
             None => Ok(Self {
-                data: DeviceBuf::from_slice(bytes)?,
+                data: DeviceBuf::from_slice_in(bytes, MemoryCategory::ModelWeights)?,
                 dtype: info.ggml_type,
                 in_dim, out_dim,
                 repacked: false,
@@ -258,7 +258,7 @@ fn load_fp32_tensor(gguf: &GgufFile, name: &str) -> Result<DeviceBuf<f32>, Strin
     match info.ggml_type {
         GgmlType::F32 => {
             let floats: &[f32] = bytemuck::cast_slice(bytes);
-            DeviceBuf::from_slice(floats)
+            DeviceBuf::from_slice_in(floats, MemoryCategory::ModelWeights)
         }
         // Some MTP-bearing MoE GGUFs store small per-channel vectors
         // (e.g. ffn_gate_inp_shexp) as BF16 to save space. Convert at
@@ -269,7 +269,7 @@ fn load_fp32_tensor(gguf: &GgufFile, name: &str) -> Result<DeviceBuf<f32>, Strin
             let floats: Vec<f32> = u16s.iter()
                 .map(|&b| f32::from_bits((b as u32) << 16))
                 .collect();
-            DeviceBuf::from_slice(&floats)
+            DeviceBuf::from_slice_in(&floats, MemoryCategory::ModelWeights)
         }
         other => Err(format!("tensor {name}: expected F32 or BF16, got {:?}", other)),
     }
@@ -343,7 +343,7 @@ impl GpuExpertTensor {
                 bytes_per_expert: packed.len() / n_expert,
                 dtype: info.ggml_type,
                 in_dim: in_dim as u32, out_dim: out_dim as u32,
-                data: DeviceBuf::from_slice(&packed)?,
+                data: DeviceBuf::from_slice_in(&packed, MemoryCategory::ModelWeights)?,
                 repacked: true,
             })
         } else {
@@ -351,7 +351,7 @@ impl GpuExpertTensor {
                 bytes_per_expert: bpe,
                 dtype: info.ggml_type,
                 in_dim: in_dim as u32, out_dim: out_dim as u32,
-                data: DeviceBuf::from_slice(bytes)?,
+                data: DeviceBuf::from_slice_in(bytes, MemoryCategory::ModelWeights)?,
                 repacked: false,
             })
         }
@@ -446,7 +446,7 @@ impl<T: Copy> DeviceBufPool<T> {
         let reused = self.free.borrow_mut().get_mut(&len).and_then(|v| v.pop());
         let buf = match reused {
             Some(b) => b,
-            None    => DeviceBuf::new(len)?,
+            None    => DeviceBuf::new_in(len, MemoryCategory::Scratch)?,
         };
         Ok(PooledBuf { buf: Some(buf), pool: self, len })
     }
@@ -526,7 +526,7 @@ impl MoeRuntime {
         let n_used    = moe.n_expert_used as usize;
         let expert_ff = moe.expert_ff as usize;
         let shexp_ff  = moe.shared_expert_ff as usize;
-        let ones = DeviceBuf::from_slice(&vec![1.0f32; n_expert])?;
+        let ones = DeviceBuf::from_slice_in(&vec![1.0f32; n_expert], MemoryCategory::Scratch)?;
         let c = MOE_PREFILL_CHUNK;
         Ok(Self {
             n_expert, n_used, expert_ff, shexp_ff,
@@ -946,8 +946,8 @@ impl GpuKvCache {
     pub fn new(max_seq: usize, n_kv_heads: usize, head_dim: usize) -> Result<Self, String> {
         let kv_dim = n_kv_heads * head_dim;
         Ok(Self {
-            k: DeviceBuf::new(max_seq * kv_dim)?,
-            v: DeviceBuf::new(max_seq * kv_dim)?,
+            k: DeviceBuf::new_in(max_seq * kv_dim, MemoryCategory::Context)?,
+            v: DeviceBuf::new_in(max_seq * kv_dim, MemoryCategory::Context)?,
             max_seq, kv_dim, len: 0,
         })
     }

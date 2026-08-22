@@ -663,6 +663,20 @@ today.
 
 ## 11. Runtime infrastructure
 
+### VRAM accounting
+
+`hip::DeviceBuf` records live device bytes by ownership category: model
+weights, reserved context, runtime state, scratch/pools, vision, and an
+unattributed residual. HIP `hipMemGetInfo` remains authoritative for total
+used/free VRAM; the categorized counters are reconciled against that value so
+driver allocations and external vision-runtime allocations remain visible
+instead of being silently assigned to a model section.
+
+Context reservation and context utilization are intentionally separate. KV
+buffers are allocated for their configured capacity, while each runtime state
+reports the physical positions currently populated. The dashboard therefore
+shows both reserved context bytes and a separate positions-used bar.
+
 ### KernelCache (`runtime/mod.rs`)
 
 Single-file responsibility: turn HIP C++ source strings into `.hsaco`

@@ -25,6 +25,9 @@ pub struct ApiStatus {
     pub network: Mutex<NetworkSample>,
     pub queued: AtomicU64,
     pub active_request: AtomicU64,
+    /// Physical context positions currently occupied by the active model
+    /// state. This is deliberately separate from reserved context bytes.
+    pub context_used_tokens: AtomicU64,
     pub history: Mutex<RunHistory>,
     pub catalog: Mutex<Option<CatalogCache>>,
     pub model_switch: Mutex<ModelSwitchStatus>,
@@ -204,6 +207,10 @@ pub struct Phase {
 }
 
 impl ApiStatus {
+    pub fn set_context_used(&self, tokens: usize) {
+        self.context_used_tokens.store(tokens as u64, Ordering::Relaxed);
+    }
+
     pub fn set_phase(&self, name: &'static str, detail: Option<String>) {
         if let Ok(mut phase) = self.phase.lock() {
             *phase = Phase { name, detail };
@@ -474,7 +481,9 @@ impl ApiStatus {
             "run_history":history_summary,
             "logs":logs_summary_json(),
             "management":{"model_switch":self.switch_value(),"config_reload":self.config_reload.lock().map(|r| json!({"id":r.id,"state":r.state,"error":r.error})).unwrap_or(Value::Null),"switch_requires_action_header":true},
-            "gpu":gpu_json(&self.inventory, &self.thermal),
+            "gpu":gpu_json(&self.inventory, &self.thermal,
+                self.max_seq.lock().map(|v| *v).unwrap_or(0),
+                self.context_used_tokens.load(Ordering::Relaxed)),
             "metrics":{"requests_total":metrics.requests_total.load(Ordering::Relaxed),
                 "http_requests_total":metrics.requests_total.load(Ordering::Relaxed),
                 "inference_runs_total":metrics.inference_runs_total.load(Ordering::Relaxed),
@@ -731,13 +740,43 @@ fn error_message(body: &str) -> Option<String> {
         .and_then(|v| v.get("error")?.get("message")?.as_str().map(str::to_string))
 }
 
-fn gpu_json(inventory: &GpuInventory, thermal: &ThermalGuard) -> Value {
+fn gpu_json(inventory: &GpuInventory, thermal: &ThermalGuard,
+            context_capacity_tokens: usize, context_used_tokens: u64) -> Value {
     let inventory_value = inventory.json();
     match crate::hip::device_count() {
         Ok(n) => {
             let name = (n > 0).then(|| crate::hip::device_name(0).ok()).flatten();
             let memory=(n > 0).then(|| crate::hip::mem_info().ok()).flatten()
-            .map(|(free,total)|json!({"free_bytes":free,"used_bytes":total.saturating_sub(free),"total_bytes":total}));
+            .map(|(free,total)| {
+                let used = total.saturating_sub(free);
+                let tracked = crate::hip::memory_snapshot();
+                let tracked_bytes = tracked.tracked_bytes();
+                let residual = (used as u64).saturating_sub(tracked_bytes);
+                let capacity = context_capacity_tokens as u64;
+                let used_tokens = context_used_tokens.min(capacity);
+                let reserved = tracked.context_bytes;
+                json!({
+                    "free_bytes":free,"used_bytes":used,"total_bytes":total,
+                    "tracked_bytes":tracked_bytes,
+                    "unattributed_bytes":residual,
+                    "sections": {
+                        "model_weights_bytes":tracked.model_weights_bytes,
+                        "context_reserved_bytes":tracked.context_bytes,
+                        "runtime_bytes":tracked.runtime_bytes,
+                        "scratch_bytes":tracked.scratch_bytes,
+                        "vision_bytes":tracked.vision_bytes,
+                        "unattributed_bytes":tracked.unattributed_bytes.saturating_add(residual)
+                    },
+                    "context": {
+                        "available": context_capacity_tokens > 0,
+                        "capacity_tokens": context_capacity_tokens,
+                        "used_tokens": used_tokens,
+                        "utilization_fraction": if capacity > 0 { used_tokens as f64 / capacity as f64 } else { 0.0 },
+                        "reserved_bytes": reserved,
+                        "used_equivalent_bytes": if capacity > 0 { reserved.saturating_mul(used_tokens) / capacity } else { 0 }
+                    }
+                })
+            });
             let architecture = std::env::var("REINSTINCT_OFFLOAD_ARCH")
                 .unwrap_or_else(|_| crate::runtime::DEFAULT_ARCH.into());
             json!({"available":n>0,"device_count":n,"name":name,"architecture":architecture,"memory":memory,
@@ -858,7 +897,7 @@ pub const INDEX_HTML_V2: &str = r#"<!doctype html>
 *{box-sizing:border-box}body{margin:0;min-height:100vh;background:linear-gradient(90deg,rgba(183,255,90,.035) 1px,transparent 1px),linear-gradient(rgba(183,255,90,.025) 1px,transparent 1px),radial-gradient(circle at 82% 4%,#17352b 0,transparent 32%);background-size:32px 32px,32px 32px,auto}
 body:before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.18;background:repeating-linear-gradient(0deg,transparent 0 3px,#000 4px)}
 main{position:relative;width:min(1480px,calc(100% - 36px));margin:auto;padding:30px 0 48px}header{display:flex;justify-content:space-between;align-items:flex-end;border-bottom:1px solid var(--line);padding:8px 0 20px;margin-bottom:18px}.eyebrow{color:var(--accent);letter-spacing:.18em;font-size:11px;text-transform:uppercase}.title{font-family:Bahnschrift,"DIN Condensed",sans-serif;font-size:clamp(34px,6vw,70px);line-height:.9;letter-spacing:-.035em;margin:6px 0 0;text-transform:uppercase}.sub{color:var(--muted);font-size:12px;margin-top:10px}.badge{border:1px solid var(--line);padding:9px 13px;text-transform:uppercase;font-size:11px;letter-spacing:.13em;background:#131c18}.badge.ready{border-color:#5c8d40;color:var(--accent);box-shadow:0 0 22px rgba(183,255,90,.12)}.badge.error,.badge.unavailable{border-color:#733;color:var(--bad)}
-.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.card{background:linear-gradient(145deg,rgba(20,29,25,.96),rgba(11,17,14,.96));border:1px solid var(--line);padding:15px;min-height:122px;position:relative;overflow:hidden}.card:after{content:attr(data-index);position:absolute;right:9px;top:7px;color:#34423b;font-size:10px}.card h2{font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);margin:0 0 14px}.metric{font-family:Bahnschrift,"DIN Condensed",sans-serif;font-size:30px;letter-spacing:-.02em}.metric small{font:11px "Aptos Mono",monospace;color:var(--muted)}dl{display:grid;grid-template-columns:1fr auto;gap:7px;margin:0;font-size:11px}dt{color:var(--muted)}dd{margin:0;text-align:right;overflow-wrap:anywhere}.accent{color:var(--accent)}.cyan{color:var(--cyan)}.bad{color:var(--bad)}
+.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.card{background:linear-gradient(145deg,rgba(20,29,25,.96),rgba(11,17,14,.96));border:1px solid var(--line);padding:15px;min-height:122px;position:relative;overflow:hidden}.card:after{content:attr(data-index);position:absolute;right:9px;top:7px;color:#34423b;font-size:10px}.card h2{font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);margin:0 0 14px}.metric{font-family:Bahnschrift,"DIN Condensed",sans-serif;font-size:30px;letter-spacing:-.02em}.metric small{font:11px "Aptos Mono",monospace;color:var(--muted)}dl{display:grid;grid-template-columns:1fr auto;gap:7px;margin:0;font-size:11px}dt{color:var(--muted)}dd{margin:0;text-align:right;overflow-wrap:anywhere}.accent{color:var(--accent)}.cyan{color:var(--cyan)}.bad{color:var(--bad)}.memory-panel{margin-top:10px;background:linear-gradient(145deg,rgba(20,29,25,.96),rgba(11,17,14,.96));border:1px solid var(--line);padding:15px}.memory-head{display:flex;justify-content:space-between;gap:12px;align-items:baseline}.memory-title{font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted)}.memory-total{font:22px Bahnschrift,"DIN Condensed",sans-serif}.memory-bar,.context-bar{display:flex;height:18px;margin:12px 0 9px;background:#070b09;border:1px solid var(--line);overflow:hidden}.context-bar{height:9px;margin-top:8px}.memory-segment{height:100%;min-width:1px}.memory-legend{display:flex;flex-wrap:wrap;gap:8px 16px;font-size:10px;color:var(--muted)}.memory-legend span:before{content:"";display:inline-block;width:8px;height:8px;margin-right:5px;background:var(--swatch);border-radius:2px}.memory-detail{display:grid;grid-template-columns:1fr auto;gap:5px;margin-top:10px;font-size:11px}.memory-detail b{text-align:right;color:var(--ink)}
 .runs{margin-top:20px;border:1px solid var(--line);background:rgba(9,14,12,.94)}.runs-head{display:flex;align-items:center;justify-content:space-between;padding:15px 16px;border-bottom:1px solid var(--line)}.runs-head h2{font:20px Bahnschrift,sans-serif;text-transform:uppercase;letter-spacing:.04em;margin:0}.runs-head p{font-size:10px;color:var(--muted);margin:3px 0 0}.live{display:flex;align-items:center;gap:7px;color:var(--muted);font-size:10px;text-transform:uppercase}.live:before{content:"";width:7px;height:7px;border-radius:50%;background:var(--accent);box-shadow:0 0 12px var(--accent);animation:pulse 1.8s infinite}@keyframes pulse{50%{opacity:.35}}
 .table-wrap{overflow:auto;max-height:520px}table{width:100%;border-collapse:collapse;font-size:11px;white-space:nowrap}th{position:sticky;top:0;z-index:1;background:#121b17;text-align:left;color:var(--muted);font-weight:500;text-transform:uppercase;letter-spacing:.09em;padding:10px 12px;border-bottom:1px solid var(--line)}td{padding:11px 12px;border-bottom:1px solid #1c2822}tbody tr{cursor:pointer;transition:background .15s,color .15s}tbody tr:hover{background:#19251f;color:#fff}.state{display:inline-block;min-width:72px;padding:4px 7px;border:1px solid var(--line);text-align:center;text-transform:uppercase;font-size:9px;letter-spacing:.08em}.state.complete{color:var(--accent);border-color:#42622f}.state.active{color:var(--cyan);border-color:#2b6b67}.state.queued{color:var(--warn);border-color:#765f30}.state.errored{color:var(--bad);border-color:#713535}.empty{padding:34px;text-align:center;color:var(--muted)}
 nav{display:flex;gap:18px;flex-wrap:wrap;margin-top:15px;font-size:11px}a{color:var(--cyan);text-decoration:none;border-bottom:1px solid transparent}a:hover{border-color:currentColor}.privacy{margin-left:auto;color:var(--muted)}
@@ -867,6 +906,7 @@ dialog{width:min(900px,calc(100% - 28px));max-height:88vh;border:1px solid #5367
 </style></head>
 <body><main><header><div><div class="eyebrow">gfx906 / inference telemetry</div><h1 class="title">ReInstinct</h1><div id="version" class="sub">Connecting to flight recorder…</div></div><span id="phase" class="badge">connecting</span></header>
 <section id="cards" class="grid"></section>
+<section id="memoryPanel" class="memory-panel" aria-live="polite"></section>
 <section class="runs"><div class="runs-head"><div><h2>Recent runs</h2><p>Newest first · click any row for captured request, response, and stage timings</p></div><div class="live">live refresh</div></div><div class="table-wrap"><table><thead><tr><th>ID / time</th><th>Client</th><th>Type</th><th>State</th><th>Tokens p / g</th><th>Prompt tok/s</th><th>Gen tok/s</th><th>TTFT</th><th>Total</th></tr></thead><tbody id="runRows"><tr><td colspan="9" class="empty">No inference runs retained yet.</td></tr></tbody></table></div></section>
 <nav><a href="/docs">API docs</a><a href="/openapi.json">OpenAPI 3.1</a><a href="/metrics">Prometheus</a><a href="/v1/models">Models</a><a href="/api/runs">Run JSON</a><span class="privacy">128-run memory buffer · image bytes redacted · clears on restart</span></nav>
 </main>
@@ -932,14 +972,24 @@ pub fn dashboard_html() -> String {
   .power-control{flex:1 1 390px;min-width:280px;display:grid;grid-template-columns:1fr auto;gap:6px 12px;align-items:center}.power-control label{color:var(--muted);font-size:10px;letter-spacing:.1em;text-transform:uppercase}.power-control output{font:18px Bahnschrift,sans-serif;color:var(--lime);white-space:nowrap}.power-control input[type=range]{grid-column:1/-1;width:100%;min-width:220px;accent-color:var(--lime);cursor:pointer}.power-control input[type=range]:disabled{cursor:not-allowed;opacity:.4}.power-meta{grid-column:1/-1;display:flex;justify-content:space-between;gap:12px;color:var(--muted);font-size:10px}.power-meta strong{color:var(--ink);font-weight:400}
   .thermal-body{padding:14px 16px}.thermal-settings{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1px;background:#26352e}.thermal-field{background:#0e1612;padding:12px;display:grid;gap:7px}.thermal-field label{color:#b7c4bd;font-size:10px;text-transform:uppercase;letter-spacing:.08em}.thermal-field input{width:100%;min-width:0;background:#0a100d;border-color:#34463d;padding:9px 10px;font:11px inherit}.thermal-field input:focus{outline:1px solid var(--cyan);outline-offset:1px}.thermal-field.checkbox{display:flex;align-items:center}.thermal-field.checkbox label{display:flex;align-items:center;gap:9px;text-transform:none;letter-spacing:0}.thermal-field.checkbox input{width:auto;accent-color:var(--lime)}.thermal-field.locked{opacity:.58}.thermal-actions{display:flex;align-items:center;gap:9px;margin-top:12px}.thermal-notice{color:var(--muted);font-size:10px}.thermal-notice.warn{color:var(--amber)}.thermal-notice.error{color:var(--red)}.gpu-meters{display:grid;gap:8px;margin-top:14px}.gpu-meter{display:grid;gap:4px}.meter-label{display:flex;justify-content:space-between;gap:10px;color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:.08em}.meter-label b{color:var(--ink);font-weight:400;letter-spacing:0;text-transform:none}.meter{height:7px;border:1px solid var(--line);background:#070b09;overflow:hidden}.meter i{display:block;height:100%;background:linear-gradient(90deg,var(--cyan),var(--lime));transition:width .4s}.meter i.warn{background:linear-gradient(90deg,var(--amber),#ff8f5a)}.meter i.bad{background:var(--red)}
 </style></head>"#,
-    );    html = html.replace(
+    );
+    html = html.replace(
+        "</style></head>",
+        r#"<style>.memory-panel{margin:0 0 12px;padding:14px 16px;background:linear-gradient(145deg,#141d19f5,#0b110ef5);border:1px solid var(--line)}.memory-head{display:flex;justify-content:space-between;align-items:baseline;gap:12px}.memory-title{color:var(--muted);font-size:10px;letter-spacing:.13em;text-transform:uppercase}.memory-total{font:22px Bahnschrift,sans-serif}.memory-total small{font:10px inherit;color:var(--muted)}.memory-bar,.context-bar{display:flex;height:18px;margin:11px 0 8px;background:#070b09;border:1px solid var(--line);overflow:hidden}.context-bar{height:8px;margin-top:8px}.memory-segment{height:100%;min-width:1px}.memory-legend{display:flex;flex-wrap:wrap;gap:7px 15px;color:var(--muted);font-size:10px}.memory-legend span:before{content:"";display:inline-block;width:8px;height:8px;margin-right:5px;background:var(--swatch);border-radius:2px}.memory-detail{display:grid;grid-template-columns:1fr auto;gap:5px;margin-top:9px;font-size:10px}.memory-detail b{text-align:right;color:var(--ink);font-weight:400}</style></head>"#,
+    );
+    html = html.replace(
         r#"<details id="thermalPanel"><summary>Thermal guard <span id="thermalSummary" class="summary-meta">loading</span></summary><div class="tools"><span id="thermalDetail" class="sub">The inference GPU is monitored at one-second intervals.</span></div></details>"#,
         r#"<details id="thermalPanel"><summary>Thermal guard <span id="thermalSummary" class="summary-meta">loading</span></summary><div class="thermal-body"><div class="tools"><span id="thermalDetail" class="sub">The inference GPU is monitored at one-second intervals.</span></div><div id="thermalForm" class="thermal-settings"></div><div class="thermal-actions"><button id="thermalSave" class="btn primary">Save thermal settings</button><button id="thermalReset" class="btn">Reset</button><span id="thermalNotice" class="thermal-notice" role="status"></span></div></div></details>"#,
     );
     html = html.replace(
         r#"<details id="runsPanel" open>"#,
         r#"<details id="runsPanel">"#,
-    );    html = html.replace(
+    );
+    html = html.replace(
+        r#"<section id="cards" class="grid"></section>"#,
+        r#"<section id="cards" class="grid"></section><section id="memoryPanel" class="memory-panel" aria-live="polite"></section>"#,
+    );
+    html = html.replace(
         r#"['cpu_vision','CPU vision','bool'],['gpu_thermal_guard_enabled','Thermal guard enabled','bool'],['gpu_max_temp_c','Maximum temperature °C','number'],['gpu_max_temp_seconds','Sustained duration seconds','number'],['gpu_resume_temp_c','Resume temperature °C','number']"#,
         r#"['cpu_vision','CPU vision','bool']"#,
     );
@@ -959,7 +1009,10 @@ pub fn dashboard_html() -> String {
     );
     html = html.replace(
         "</script></body></html>",
-         r#"</script><script> (() => {
+         r#"</script><script>
+ function renderMemory(s){const m=s.gpu?.memory||{},sec=m.sections||{},total=Number(m.total_bytes)||0,used=Number(m.used_bytes)||0,free=Number(m.free_bytes)||0;const rows=[['Model weights',Number(sec.model_weights_bytes)||0,'#b7ff5a'],['Context reserved',Number(sec.context_reserved_bytes)||0,'#62d9d1'],['Runtime',Number(sec.runtime_bytes)||0,'#a78bfa'],['Scratch / pools',Number(sec.scratch_bytes)||0,'#ffc857'],['Vision',Number(sec.vision_bytes)||0,'#fb923c'],['Unattributed',Number(sec.unattributed_bytes)||0,'#718096'],['Free',free,'#26332c']];const pct=v=>total>0?Math.max(0,Math.min(100,v/total*100)):0;const fmt=v=>`${(v/1073741824).toFixed(2)} GiB`;const c=m.context||{},contextPct=Number(c.utilization_fraction)||0;const panel=document.getElementById('memoryPanel');if(!panel)return;panel.innerHTML=`<div class="memory-head"><div class="memory-title">VRAM allocation</div><div class="memory-total">${fmt(used)} <small>/ ${fmt(total)} used</small></div></div><div class="memory-bar" role="img" aria-label="VRAM allocation breakdown">${rows.map(r=>`<i class="memory-segment" style="width:${pct(r[1])}%;background:${r[2]}" title="${r[0]}: ${fmt(r[1])}"></i>`).join('')}</div><div class="memory-legend">${rows.map(r=>`<span style="--swatch:${r[2]}">${r[0]}</span>`).join('')}</div><div class="memory-title" style="margin-top:16px">Context capacity</div><div class="context-bar" role="progressbar" aria-valuenow="${c.used_tokens||0}" aria-valuemax="${c.capacity_tokens||0}"><i class="memory-segment" style="width:${Math.max(0,Math.min(100,contextPct*100))}%;background:#62d9d1"></i></div><div class="memory-detail"><span>Positions used</span><b>${c.used_tokens??'—'} / ${c.capacity_tokens??'—'} · ${(contextPct*100).toFixed(1)}%</b><span>Reserved context VRAM</span><b>${fmt(Number(c.reserved_bytes)||0)} · used equivalent ${fmt(Number(c.used_equivalent_bytes)||0)}</b></div><div class="sub" style="margin-top:10px">Categorized ${fmt(Number(m.tracked_bytes)||0)} · residual ${fmt(Number(m.unattributed_bytes)||0)}</div>`}
+ const _renderStatus=renderStatus;renderStatus=s=>{_renderStatus(s);renderMemory(s)};
+ (() => {
   const input = document.getElementById('amdWatts');
   const select = document.getElementById('amdPci');
   if (!input || !select) return;
@@ -1086,6 +1139,9 @@ mod tests {
         assert!(dashboard.contains("thermalForm"));
         assert!(dashboard.contains("data-thermal"));
         assert!(dashboard.contains("Pause threshold °C"));
+        assert!(dashboard.contains("memoryPanel"));
+        assert!(dashboard.contains("Context capacity"));
+        assert!(dashboard.contains("Model weights"));
         assert!(!dashboard.contains("Thermal guard enabled','bool'"));
         assert!(dashboard.contains("meter('Power'"));
         assert!(dashboard.contains("meter('Compute'"));

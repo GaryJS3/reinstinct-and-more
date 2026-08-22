@@ -9,7 +9,7 @@
 use std::ffi::c_void;
 
 use crate::gguf::{GgmlType, GgufFile};
-use crate::hip::{DeviceBuf, Event, Graph, GraphExec, Module, Stream};
+use crate::hip::{DeviceBuf, Event, Graph, GraphExec, MemoryCategory, Module, Stream};
 use crate::hip::sys::HipStreamCaptureMode;
 use crate::model::gemma4::{AttnKind, Gemma4Model};
 use crate::runtime::KernelCache;
@@ -106,7 +106,7 @@ fn load_fp32(gguf: &GgufFile, name: &str) -> Result<DeviceBuf<f32>, String> {
     let bytes = gguf.tensor_data(name).map_err(|e| format!("{name}: {e}"))?
         .ok_or_else(|| format!("{name}: no data"))?;
     let floats: &[f32] = bytemuck::cast_slice(bytes);
-    DeviceBuf::from_slice(floats)
+    DeviceBuf::from_slice_in(floats, MemoryCategory::ModelWeights)
 }
 
 /// Load an F32 tensor and multiply every element by `scale` host-side
@@ -124,7 +124,7 @@ fn load_fp32_scaled(gguf: &GgufFile, name: &str, scale: f32)
         .ok_or_else(|| format!("{name}: no data"))?;
     let mut floats: Vec<f32> = bytemuck::cast_slice::<u8, f32>(bytes).to_vec();
     for v in &mut floats { *v *= scale; }
-    DeviceBuf::from_slice(&floats)
+    DeviceBuf::from_slice_in(&floats, MemoryCategory::ModelWeights)
 }
 
 /// Load a 2D BF16 weight, converting it to f32 on the host and wrapping
@@ -145,7 +145,7 @@ fn load_bf16_as_f32_matvec(gguf: &GgufFile, name: &str) -> Result<GpuMatvecTenso
     let src: &[u16] = bytemuck::cast_slice(bytes);
     let f32s: Vec<f32> = src.iter().map(|&b| crate::quant::half::bf16_to_f32(b)).collect();
     Ok(GpuMatvecTensor {
-        data:    DeviceBuf::from_slice(bytemuck::cast_slice::<f32, u8>(&f32s))?,
+        data:    DeviceBuf::from_slice_in(bytemuck::cast_slice::<f32, u8>(&f32s), MemoryCategory::ModelWeights)?,
         dtype:   GgmlType::F32,
         in_dim:  shape[0] as u32,
         out_dim: shape[1] as u32,
@@ -220,14 +220,14 @@ impl ExpertTensor {
             return Ok(Self {
                 bytes_per_expert: packed.len() / n_expert,
                 dtype: info.ggml_type,
-                data: DeviceBuf::from_slice(&packed)?,
+                data: DeviceBuf::from_slice_in(&packed, MemoryCategory::ModelWeights)?,
                 repacked: true,
             });
         }
         Ok(Self {
             bytes_per_expert: bytes.len() / n_expert,
             dtype: info.ggml_type,
-            data: DeviceBuf::from_slice(bytes)?,
+            data: DeviceBuf::from_slice_in(bytes, MemoryCategory::ModelWeights)?,
             repacked: false,
         })
     }
@@ -262,7 +262,7 @@ impl ExpertTensor {
         Ok(Self {
             bytes_per_expert: packed.len() / n_expert,
             dtype: info.ggml_type,
-            data: DeviceBuf::from_slice(&packed)?,
+            data: DeviceBuf::from_slice_in(&packed, MemoryCategory::ModelWeights)?,
             repacked: true,
         })
     }
@@ -425,10 +425,10 @@ impl Gemma4KvCache {
     fn new(n_kv: usize, head_dim: usize, max_seq: usize) -> Result<Self, String> {
         let kv_dim = n_kv * head_dim;
         Ok(Self {
-            k:  DeviceBuf::new(max_seq * kv_dim)?,
-            v:  DeviceBuf::new(max_seq * kv_dim)?,
-            ks: DeviceBuf::new(max_seq * n_kv)?,
-            vs: DeviceBuf::new(max_seq * n_kv)?,
+            k:  DeviceBuf::new_in(max_seq * kv_dim, MemoryCategory::Context)?,
+            v:  DeviceBuf::new_in(max_seq * kv_dim, MemoryCategory::Context)?,
+            ks: DeviceBuf::new_in(max_seq * n_kv, MemoryCategory::Context)?,
+            vs: DeviceBuf::new_in(max_seq * n_kv, MemoryCategory::Context)?,
             n_kv, head_dim, max_seq, len: 0,
         })
     }
@@ -615,10 +615,10 @@ impl Gemma4GpuState {
         let mut layers = Vec::with_capacity(self.caches.len());
         for c in &self.caches {
             let kv_dim = c.n_kv * c.head_dim;
-            let k  = DeviceBuf::new(c.len * kv_dim)?;
-            let v  = DeviceBuf::new(c.len * kv_dim)?;
-            let ks = DeviceBuf::new(c.len * c.n_kv)?;
-            let vs = DeviceBuf::new(c.len * c.n_kv)?;
+            let k  = DeviceBuf::new_in(c.len * kv_dim, MemoryCategory::Context)?;
+            let v  = DeviceBuf::new_in(c.len * kv_dim, MemoryCategory::Context)?;
+            let ks = DeviceBuf::new_in(c.len * c.n_kv, MemoryCategory::Context)?;
+            let vs = DeviceBuf::new_in(c.len * c.n_kv, MemoryCategory::Context)?;
             if c.len > 0 {
                 k .copy_range_from_device(&c.k,  0, 0, c.len * kv_dim)?;
                 v .copy_range_from_device(&c.v,  0, 0, c.len * kv_dim)?;

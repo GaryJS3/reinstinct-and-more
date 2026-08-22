@@ -29,7 +29,7 @@
 //! quality gain. Kept the Warm/Cold names and the existing turbo3 +
 //! cold-demote pipeline; removed the Hot tier and its dedicated kernels.
 
-use crate::hip::{DeviceBuf, Module};
+use crate::hip::{DeviceBuf, MemoryCategory, Module};
 use crate::quant::turbo3::{CacheKind, ROT_GROUP};
 use super::KernelCache;
 use super::kv_turbo3::{slot_bytes, launch_promote_q8_to_turbo3};
@@ -107,18 +107,18 @@ impl SuperQuantKvCache {
         let hsaco = kernel_cache.compile("kv_write_q8_step", KV_WRITE_Q8_STEP_SOURCE)?;
         let write_q8_module = Module::load(&hsaco)?;
         Ok(Self {
-            warm_k: DeviceBuf::new(config.warm_cap * n_kv * head_dim)?,
-            warm_v: DeviceBuf::new(config.warm_cap * n_kv * head_dim)?,
-            warm_ks: DeviceBuf::new(config.warm_cap * n_kv)?,
-            warm_vs: DeviceBuf::new(config.warm_cap * n_kv)?,
-            cold_k: DeviceBuf::new(config.cold_cap * n_kv * sb)?,
-            cold_v: DeviceBuf::new(config.cold_cap * n_kv * sb)?,
-            signs1_k: DeviceBuf::from_slice(CacheKind::K.signs1())?,
-            signs2_k: DeviceBuf::from_slice(CacheKind::K.signs2())?,
-            signs1_v: DeviceBuf::from_slice(CacheKind::V.signs1())?,
-            signs2_v: DeviceBuf::from_slice(CacheKind::V.signs2())?,
-            scratch_warm_q: DeviceBuf::new(config.warm_cap * n_kv * head_dim)?,
-            scratch_warm_s: DeviceBuf::new(config.warm_cap * n_kv)?,
+            warm_k: DeviceBuf::new_in(config.warm_cap * n_kv * head_dim, MemoryCategory::Context)?,
+            warm_v: DeviceBuf::new_in(config.warm_cap * n_kv * head_dim, MemoryCategory::Context)?,
+            warm_ks: DeviceBuf::new_in(config.warm_cap * n_kv, MemoryCategory::Context)?,
+            warm_vs: DeviceBuf::new_in(config.warm_cap * n_kv, MemoryCategory::Context)?,
+            cold_k: DeviceBuf::new_in(config.cold_cap * n_kv * sb, MemoryCategory::Context)?,
+            cold_v: DeviceBuf::new_in(config.cold_cap * n_kv * sb, MemoryCategory::Context)?,
+            signs1_k: DeviceBuf::from_slice_in(CacheKind::K.signs1(), MemoryCategory::Context)?,
+            signs2_k: DeviceBuf::from_slice_in(CacheKind::K.signs2(), MemoryCategory::Context)?,
+            signs1_v: DeviceBuf::from_slice_in(CacheKind::V.signs1(), MemoryCategory::Context)?,
+            signs2_v: DeviceBuf::from_slice_in(CacheKind::V.signs2(), MemoryCategory::Context)?,
+            scratch_warm_q: DeviceBuf::new_in(config.warm_cap * n_kv * head_dim, MemoryCategory::Context)?,
+            scratch_warm_s: DeviceBuf::new_in(config.warm_cap * n_kv, MemoryCategory::Context)?,
             n_kv, head_dim, config,
             warm_count: Cell::new(0), cold_count: Cell::new(0),
             write_q8_module,

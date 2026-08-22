@@ -1770,6 +1770,7 @@ fn worker(rx: mpsc::Receiver<WorkerCommand>, mut current_config: config::ServeCo
         if let Some(status) = job_status.as_ref() {
             status.queued.fetch_sub(1, Ordering::Relaxed);
             status.active_request.store(job.request_id, Ordering::Relaxed);
+            status.set_context_used(0);
             status.activate_run(job.request_id);
         }
         let mut captured_response: Option<String> = None;
@@ -1890,6 +1891,13 @@ fn worker(rx: mpsc::Receiver<WorkerCommand>, mut current_config: config::ServeCo
                                 prefill_ms, ttft_ms, generation_ms, thermal_wait_ms } = output;
                             let wall_us = t.elapsed().as_micros() as u64;
                             metrics.requests_ok.fetch_add(1, Ordering::Relaxed);
+                            if let Some(status) = job_status.as_ref() {
+                                // The generated state contains the prompt plus
+                                // accepted decode positions. This is a
+                                // conservative status snapshot; the runtime
+                                // allocator remains authoritative for bytes.
+                                status.set_context_used(n_p.saturating_add(n_c));
+                            }
                             metrics.prompt_tokens.fetch_add(n_p as u64, Ordering::Relaxed);
                             metrics.completion_tokens.fetch_add(n_c as u64, Ordering::Relaxed);
                             metrics.prefill_us_total.fetch_add((prefill_ms * 1000.0) as u64, Ordering::Relaxed);
@@ -2096,7 +2104,7 @@ fn handle_conn(mut stream: std::net::TcpStream, target: Target,
     let model_name = status.model.lock().map(|model| model.id.clone()).unwrap_or_default();
     if is_get && path.is_empty() {
         let _ = http::write_typed_response(&mut stream, 200, "OK",
-            "text/html; charset=utf-8", api::INDEX_HTML_V3);
+            "text/html; charset=utf-8", &api::dashboard_html());
         return;
     }
     if is_get && path == "/docs" {
@@ -2638,6 +2646,7 @@ pub fn run(overrides: config::ServeOverrides)
         config_reload: std::sync::Mutex::new(api::ConfigReloadStatus::default()),
         next_config_reload_id: AtomicU64::new(0),
         queued: AtomicU64::new(0), active_request: AtomicU64::new(0),
+        context_used_tokens: AtomicU64::new(0),
         history: std::sync::Mutex::new(api::RunHistory::new()),
         inventory: Arc::clone(&inventory),
         thermal: Arc::clone(&thermal),

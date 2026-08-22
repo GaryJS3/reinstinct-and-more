@@ -102,6 +102,9 @@ subset that has actually passed its compatibility gates.
   shape, restricted helper installation, and isolated MI50 validation are
   complete. Live destructive reset and unsafe thermal-threshold testing remain
   explicitly outside the validation scope.
+- [x] Expose categorized HIP VRAM sections (model weights, reserved context,
+  runtime, scratch, vision, and residual) plus separate context positions used
+  versus reserved capacity in `/api/status` and the operations dashboard.
 
 ### Completions
 

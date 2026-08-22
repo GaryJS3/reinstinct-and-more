@@ -9,6 +9,7 @@ pub mod rocblas;
 use std::ffi::{CString, c_char, c_void};
 use std::marker::PhantomData;
 use std::ptr::null_mut;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use sys::{Hip, HipDevice, HipError, HipEvent, HipFunction, HipGraph, HipGraphExec, HipMemcpyKind,
           HipModule, HipStream, HipStreamCaptureMode, hip};
@@ -16,6 +17,69 @@ use sys::{Hip, HipDevice, HipError, HipEvent, HipFunction, HipGraph, HipGraphExe
 /// Result type for the safe HIP API. The error message has already been
 /// rendered via `hipGetErrorString` (or describes a load failure).
 pub type Result<T> = std::result::Result<T, String>;
+
+/// High-level ownership class for device allocations exposed by the
+/// operations dashboard.  `Runtime` is the conservative default for legacy
+/// call sites that have not yet been classified more narrowly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MemoryCategory {
+    ModelWeights,
+    Context,
+    Runtime,
+    Scratch,
+    Vision,
+    Unattributed,
+}
+
+impl MemoryCategory {
+    const COUNT: usize = 6;
+    const fn index(self) -> usize { match self {
+        Self::ModelWeights => 0, Self::Context => 1, Self::Runtime => 2,
+        Self::Scratch => 3, Self::Vision => 4, Self::Unattributed => 5,
+    }}
+}
+
+static ALLOCATED_BYTES: [AtomicU64; MemoryCategory::COUNT] = [
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+];
+
+fn account(category: MemoryCategory, bytes: usize, add: bool) {
+    let counter = &ALLOCATED_BYTES[category.index()];
+    let bytes = bytes as u64;
+    if add { counter.fetch_add(bytes, Ordering::Relaxed); }
+    else { counter.fetch_sub(bytes, Ordering::Relaxed); }
+}
+
+/// Current bytes owned by ReInstinct's HIP buffers, grouped by purpose.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MemorySnapshot {
+    pub model_weights_bytes: u64,
+    pub context_bytes: u64,
+    pub runtime_bytes: u64,
+    pub scratch_bytes: u64,
+    pub vision_bytes: u64,
+    pub unattributed_bytes: u64,
+}
+
+impl MemorySnapshot {
+    pub fn tracked_bytes(self) -> u64 {
+        self.model_weights_bytes + self.context_bytes + self.runtime_bytes +
+            self.scratch_bytes + self.vision_bytes + self.unattributed_bytes
+    }
+}
+
+pub fn memory_snapshot() -> MemorySnapshot {
+    let load = |c: MemoryCategory| ALLOCATED_BYTES[c.index()].load(Ordering::Relaxed);
+    MemorySnapshot {
+        model_weights_bytes: load(MemoryCategory::ModelWeights),
+        context_bytes: load(MemoryCategory::Context),
+        runtime_bytes: load(MemoryCategory::Runtime),
+        scratch_bytes: load(MemoryCategory::Scratch),
+        vision_bytes: load(MemoryCategory::Vision),
+        unattributed_bytes: load(MemoryCategory::Unattributed),
+    }
+}
 
 #[inline]
 fn ck(api: &Hip, e: HipError, ctx: &str) -> Result<()> {
@@ -106,6 +170,8 @@ impl Drop for Stream {
 pub struct DeviceBuf<T> {
     ptr: *mut T,
     len: usize,
+    bytes: usize,
+    category: MemoryCategory,
     _phantom: PhantomData<T>,
 }
 
@@ -115,16 +181,29 @@ unsafe impl<T: Sync> Sync for DeviceBuf<T> {}
 impl<T: Copy> DeviceBuf<T> {
     /// Allocate `len` Ts on the device. Contents are uninitialised.
     pub fn new(len: usize) -> Result<Self> {
+        Self::new_in(len, MemoryCategory::Runtime)
+    }
+
+    /// Allocate `len` Ts and classify the allocation for memory telemetry.
+    pub fn new_in(len: usize, category: MemoryCategory) -> Result<Self> {
         let api = hip().map_err(|s| s.to_string())?;
         let mut p: *mut c_void = null_mut();
-        let bytes = len * std::mem::size_of::<T>();
+        let bytes = len.checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(|| "hipMalloc size overflow".to_string())?;
         unsafe { ck(api, (api.malloc)(&mut p, bytes), "hipMalloc")?; }
-        Ok(DeviceBuf { ptr: p as *mut T, len, _phantom: PhantomData })
+        account(category, bytes, true);
+        Ok(DeviceBuf { ptr: p as *mut T, len, bytes, category, _phantom: PhantomData })
     }
 
     /// Allocate and copy `src` H2D in one shot.
     pub fn from_slice(src: &[T]) -> Result<Self> {
         let buf = Self::new(src.len())?;
+        buf.copy_from_host(src)?;
+        Ok(buf)
+    }
+
+    pub fn from_slice_in(src: &[T], category: MemoryCategory) -> Result<Self> {
+        let buf = Self::new_in(src.len(), category)?;
         buf.copy_from_host(src)?;
         Ok(buf)
     }
@@ -258,6 +337,7 @@ impl<T: Copy> DeviceBuf<T> {
 impl<T> Drop for DeviceBuf<T> {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
+            account(self.category, self.bytes, false);
             if let Ok(api) = hip() {
                 unsafe { let _ = (api.free)(self.ptr as *mut c_void); }
             }

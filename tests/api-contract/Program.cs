@@ -212,6 +212,12 @@ sealed class ContractSuite
             Check(root.GetProperty("model").GetProperty("max_context_tokens").GetInt64() > 0,
                 "status context setting is missing");
             Check(root.GetProperty("gpu").ValueKind == JsonValueKind.Object, "status GPU object missing");
+            var memory = root.GetProperty("gpu").GetProperty("memory");
+            Check(memory.ValueKind == JsonValueKind.Object, "status GPU memory object missing");
+            Check(memory.GetProperty("sections").GetProperty("context_reserved_bytes").GetInt64() >= 0,
+                "context reserved memory section missing");
+            Check(memory.GetProperty("context").GetProperty("used_tokens").GetInt64() >= 0,
+                "context used memory metadata missing");
             Check(root.GetProperty("performance").ValueKind == JsonValueKind.Object,
                 "status performance object missing");
             Check(root.GetProperty("run_history").GetProperty("capacity").GetInt32() >= 1,

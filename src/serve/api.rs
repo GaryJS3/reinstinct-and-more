@@ -686,9 +686,37 @@ fn performance_json(metrics: &Metrics, history: &RunHistory) -> Value {
     let prompt_tps = if prefill_us > 0 { prompt_tokens as f64 * 1_000_000.0 / prefill_us as f64 } else { 0.0 };
     let generation_tps = if generation_us > 0 { completion_tokens as f64 * 1_000_000.0 / generation_us as f64 } else { 0.0 };
     let last = history.entries.iter().rev().find(|run| run.state == "complete");
+    let completed = history.entries.iter().filter(|run| run.state == "complete");
+    let mut prompt_samples = 0usize;
+    let mut generation_samples = 0usize;
+    let mut prompt_sum = 0.0;
+    let mut generation_sum = 0.0;
+    let mut prompt_max: f64 = 0.0;
+    let mut generation_max: f64 = 0.0;
+    for run in completed {
+        let prompt = run.stats.prompt_tokens_per_second;
+        if prompt > 0.0 && prompt.is_finite() {
+            prompt_samples += 1;
+            prompt_sum += prompt;
+            prompt_max = prompt_max.max(prompt);
+        }
+        let generation = run.stats.generation_tokens_per_second;
+        if generation > 0.0 && generation.is_finite() {
+            generation_samples += 1;
+            generation_sum += generation;
+            generation_max = generation_max.max(generation);
+        }
+    }
+    let prompt_average = if prompt_samples > 0 { prompt_sum / prompt_samples as f64 } else { 0.0 };
+    let generation_average = if generation_samples > 0 { generation_sum / generation_samples as f64 } else { 0.0 };
     json!({
         "aggregate":{"prompt_tokens_per_second":nullable_number(prompt_tps),
                      "generation_tokens_per_second":nullable_number(generation_tps)},
+        "average":{"prompt_tokens_per_second":nullable_number(prompt_average),
+                    "generation_tokens_per_second":nullable_number(generation_average)},
+        "max":{"prompt_tokens_per_second":nullable_number(prompt_max),
+                "generation_tokens_per_second":nullable_number(generation_max)},
+        "sample_count":{"prompt":prompt_samples,"generation":generation_samples},
         "last":{"prompt_tokens_per_second":last.map(|r| nullable_number(r.stats.prompt_tokens_per_second)).unwrap_or(Value::Null),
                 "generation_tokens_per_second":last.map(|r| nullable_number(r.stats.generation_tokens_per_second)).unwrap_or(Value::Null)}
     })
@@ -918,7 +946,7 @@ const rate=n=>n==null?'—':Number(n).toFixed(1);const ms=n=>n==null?'—':Numbe
 const clock=n=>n?new Date(n).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'}):'—';
 const card=(i,t,hero,rows)=>`<article class="card" data-index="0${i}"><h2>${e(t)}</h2><div class="metric">${hero}</div><dl>${rows.map(r=>`<dt>${e(r[0])}</dt><dd>${r[1]}</dd>`).join('')}</dl></article>`;
 async function refresh(){try{const [s,h]=await Promise.all([fetch('/api/status',{cache:'no-store'}).then(r=>r.json()),fetch('/api/runs',{cache:'no-store'}).then(r=>r.json())]);renderStatus(s,h);renderRuns(h.runs||[])}catch(err){phase.textContent='unavailable';phase.className='badge unavailable'}}
-function renderStatus(s,h){const g=s.gpu||{},m=g.memory||{},v=s.model.vision||{},p=s.performance||{},a=p.aggregate||{},l=p.last||{},runs=h.runs||[],runErrors=runs.filter(r=>r.state==='errored').length;version.textContent=`v${s.service.version} · ${s.model.id} · uptime ${s.uptime_seconds}s`;phase.textContent=s.status;phase.className='badge '+s.status;cards.innerHTML=card(1,'Prompt throughput',`<span class="accent">${rate(a.prompt_tokens_per_second)}</span> <small>tok/s aggregate</small>`,[['Last run',`<span class="accent">${rate(l.prompt_tokens_per_second)} tok/s</span>`],['Prompt tokens',e(s.metrics.prompt_tokens)]])+card(2,'Generation throughput',`<span class="cyan">${rate(a.generation_tokens_per_second)}</span> <small>tok/s aggregate</small>`,[['Last run',`<span class="cyan">${rate(l.generation_tokens_per_second)} tok/s</span>`],['Generated tokens',e(s.metrics.completion_tokens)]])+card(3,'Worker',s.worker.active_request_id?`<span class="cyan">ACTIVE #${e(s.worker.active_request_id)}</span>`:`<span class="accent">IDLE</span>`,[['Queued',e(s.worker.queued_requests)],['Completed',e(s.metrics.requests_ok)],['Retained errors',`<span class="${runErrors?'bad':''}">${runErrors}</span>`],['HTTP 4xx / 5xx',`${e(s.metrics.requests_4xx)} / ${e(s.metrics.requests_5xx)}`]])+card(4,'GPU',`<span>${gib(m.used_bytes)}</span> <small>used</small>`,[['Device',e(g.name)],['Architecture',e(g.architecture)],['Free',gib(m.free_bytes)],['Vision',v.enabled?`${e(v.device)} / ${e(v.threads)} threads`:'disabled']]);}
+function renderStatus(s,h){const g=s.gpu||{},m=g.memory||{},v=s.model.vision||{},p=s.performance||{},a=p.average||p.aggregate||{},aggregate=p.aggregate||{},max=p.max||{},l=p.last||{},runs=h.runs||[],runErrors=runs.filter(r=>r.state==='errored').length;version.textContent=`v${s.service.version} · ${s.model.id} · uptime ${s.uptime_seconds}s`;phase.textContent=s.status;phase.className='badge '+s.status;cards.innerHTML=card(1,'Prompt throughput',`<span class="accent">${rate(a.prompt_tokens_per_second)}</span> <small>tok/s average</small>`,[['Max',`${rate(max.prompt_tokens_per_second)} tok/s`],['Aggregate',`${rate(aggregate.prompt_tokens_per_second)} tok/s`],['Last run',`${rate(l.prompt_tokens_per_second)} tok/s`],['Prompt tokens',e(s.metrics.prompt_tokens)]])+card(2,'Generation throughput',`<span class="cyan">${rate(a.generation_tokens_per_second)}</span> <small>tok/s average</small>`,[['Max',`${rate(max.generation_tokens_per_second)} tok/s`],['Aggregate',`${rate(aggregate.generation_tokens_per_second)} tok/s`],['Last run',`${rate(l.generation_tokens_per_second)} tok/s`],['Generated tokens',e(s.metrics.completion_tokens)]])+card(3,'Worker',s.worker.active_request_id?`<span class="cyan">ACTIVE #${e(s.worker.active_request_id)}</span>`:`<span class="accent">IDLE</span>`,[['Queued',e(s.worker.queued_requests)],['Completed',e(s.metrics.requests_ok)],['Retained errors',`<span class="${runErrors?'bad':''}">${runErrors}</span>`],['HTTP 4xx / 5xx',`${e(s.metrics.requests_4xx)} / ${e(s.metrics.requests_5xx)}`]])+card(4,'GPU',`<span>${gib(m.used_bytes)}</span> <small>used</small>`,[['Device',e(g.name)],['Architecture',e(g.architecture)],['Free',gib(m.free_bytes)],['Vision',v.enabled?`${e(v.device)} / ${e(v.threads)} threads`:'disabled']]);}
 function renderRuns(runs){runRows.innerHTML=runs.length?runs.map(r=>{const x=r.stats||{};return `<tr data-id="${r.id}"><td><b>#${r.id}</b><br><span style="color:var(--muted)">${clock(r.queued_at_ms)}</span></td><td>${e(r.client_ip)}</td><td>${e(r.request_type)}${r.path.includes('chat')?'<br><span style="color:var(--muted)">chat</span>':''}</td><td><span class="state ${e(r.state)}">${e(r.state)}</span>${r.status_code?`<br><span style="color:var(--muted)">HTTP ${r.status_code}</span>`:''}</td><td>${e(x.prompt_tokens)} / ${e(x.completion_tokens)}</td><td class="accent">${rate(x.prompt_tokens_per_second)}</td><td class="cyan">${rate(x.generation_tokens_per_second)}</td><td>${ms(x.ttft_ms)}</td><td>${ms(x.total_ms)}</td></tr>`}).join(''):'<tr><td colspan="9" class="empty">No inference runs retained yet.</td></tr>';}
 runRows.addEventListener('click',async ev=>{const row=ev.target.closest('tr[data-id]');if(!row)return;const r=await fetch('/api/runs/'+row.dataset.id,{cache:'no-store'}).then(x=>x.json()),x=r.stats||{};detailTitle.textContent=`Run #${r.id} · ${r.state}`;detailGrid.innerHTML=[['Client',r.client_ip],['Route',r.method+' '+r.path],['State',r.state+(r.status_code?' / HTTP '+r.status_code:'')],['Queued',ms(x.queue_ms)],['Prompt',x.prompt_tokens+' tok / '+rate(x.prompt_tokens_per_second)+' tok/s'],['Generation',x.completion_tokens+' tok / '+rate(x.generation_tokens_per_second)+' tok/s'],['TTFT',ms(x.ttft_ms)],['Total',ms(x.total_ms)]].map(v=>`<div><span>${e(v[0])}</span>${e(v[1])}</div>`).join('');requestPayload.textContent=JSON.stringify(r.request,null,2);responsePayload.textContent=JSON.stringify(r.response,null,2);detail.showModal()});
 </script></body></html>"#;
@@ -941,7 +969,7 @@ pub const INDEX_HTML_V3: &str = r#"<!doctype html><html lang="en"><head><meta ch
 const $=id=>document.getElementById(id),esc=x=>String(x??'—').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])),rate=n=>n==null?'—':Number(n).toFixed(1),ms=n=>n==null?'—':n<1000?Number(n).toFixed(0)+' ms':(n/1000).toFixed(2)+' s',gib=n=>n==null?'—':(n/1073741824).toFixed(1)+' GiB',net=n=>n==null?'—':n>=1000?(n/1000).toFixed(2)+' Gbps':Number(n).toFixed(1)+' Mbps',clock=n=>n?new Date(n).toLocaleTimeString():'—';let cachedLogs=[],cachedRuns=[],lastHistory={},refreshInFlight=false;
 const card=(t,h,rows)=>`<article class="card"><h2>${esc(t)}</h2><div class="hero">${h}</div><dl>${rows.map(r=>`<dt>${esc(r[0])}</dt><dd>${r[1]}</dd>`).join('')}</dl></article>`;
 async function refresh(){if(refreshInFlight)return;refreshInFlight=true;try{const s=await fetch('/api/status',{cache:'no-store'}).then(r=>r.json());renderStatus(s);if($('runsPanel').open){const h=await fetch('/api/runs',{cache:'no-store'}).then(r=>r.json());cachedRuns=h.runs||[];lastHistory=h;renderRuns(h)}else{lastHistory=s.run_history||{};renderRunSummary(lastHistory)}if($('logsPanel').open){const l=await fetch('/api/logs',{cache:'no-store'}).then(r=>r.json());cachedLogs=l.lines||[];renderLogs();$('logSummary').textContent=`${l.retained||0} / ${l.capacity||0} retained`}else{$('logSummary').textContent=`${(s.logs||{}).retained||0} / ${(s.logs||{}).capacity||0} retained`}}catch(e){$('phase').textContent='unavailable';$('phase').className='badge error'}finally{refreshInFlight=false}}
-function renderStatus(s){window.currentModel=s.model.id;const p=s.performance||{},a=p.aggregate||{},last=p.last||{},g=s.gpu||{},m=g.memory||{},n=s.network||{},v=s.model.vision||{},rh=s.run_history||{},sw=s.management?.model_switch||{};$('version').textContent=`v${s.service.version} · ${s.model.id} · uptime ${s.uptime_seconds}s`;$('phase').textContent=s.status;$('phase').className='badge '+s.status;if(sw.state==='queued'||sw.state==='loading')$('version').textContent+=` · model switch ${sw.state} #${sw.id}`;if(sw.state==='failed')$('version').textContent+=` · switch failed: ${sw.error||'unknown error'}`;$('cards').innerHTML=card('Prompt throughput',`<span class="lime">${rate(a.prompt_tokens_per_second)}</span> <small>tok/s</small>`,[['Last run',rate(last.prompt_tokens_per_second)],['Prompt tokens',s.metrics.prompt_tokens]])+card('Generation throughput',`<span class="cyan">${rate(a.generation_tokens_per_second)}</span> <small>tok/s</small>`,[['Last run',rate(last.generation_tokens_per_second)],['Generated',s.metrics.completion_tokens]])+card('Worker',s.worker.active_request_id?`<span class="cyan">ACTIVE #${s.worker.active_request_id}</span>`:'<span class="lime">IDLE</span>',[['Queued',s.worker.queued_requests],['Complete / errors',`${s.metrics.requests_ok} / ${rh.errored||0}`]])+card('GPU',gib(m.used_bytes),[['Free',gib(m.free_bytes)],['Vision',v.enabled?`yes · ${esc(v.device)}`:'no']])+card('Network',`<span class="cyan">${net(n.receive_mbps)}</span>`,[['Transmit',net(n.transmit_mbps)],['Scope',esc(n.scope)]]);const x=s.loading;if(x){$('loadPanel').style.display='block';const pct=Math.min(98,(x.estimated_fraction||0)*100);$('loadBar').style.width=pct+'%';$('loadPct').textContent=pct.toFixed(1)+'%';$('loadText').textContent=`${x.elapsed_seconds.toFixed(0)}s elapsed · ${x.stage==='finalizing_gpu'?'finalizing GPU setup':x.estimated_eta_seconds==null?'ETA calculating':Math.ceil(x.estimated_eta_seconds)+'s estimated remaining'}`;$('loadHint').textContent=`${gib(x.observed_network_bytes)} observed / ${gib(x.expected_bytes)} model · ${x.estimate_basis}`}else $('loadPanel').style.display='none';document.querySelectorAll('#modelList button[data-path]').forEach(b=>b.disabled=sw.state==='queued'||sw.state==='loading');renderRunSummary(rh);renderThermal(g.thermal_guard);decorateGpuCard(s);$('errorPanel').style.display=s.status==='error'?'block':'none';$('errorText').textContent=s.status==='error'?(s.status_detail||'Engine failed without a reported detail.'):''}
+function renderStatus(s){window.currentModel=s.model.id;const p=s.performance||{},a=p.average||p.aggregate||{},aggregate=p.aggregate||{},max=p.max||{},last=p.last||{},g=s.gpu||{},m=g.memory||{},n=s.network||{},v=s.model.vision||{},rh=s.run_history||{},sw=s.management?.model_switch||{};$('version').textContent=`v${s.service.version} · ${s.model.id} · uptime ${s.uptime_seconds}s`;$('phase').textContent=s.status;$('phase').className='badge '+s.status;if(sw.state==='queued'||sw.state==='loading')$('version').textContent+=` · model switch ${sw.state} #${sw.id}`;if(sw.state==='failed')$('version').textContent+=` · switch failed: ${sw.error||'unknown error'}`;$('cards').innerHTML=card('Prompt throughput',`<span class="lime">${rate(a.prompt_tokens_per_second)}</span> <small>tok/s average</small>`,[['Max',`${rate(max.prompt_tokens_per_second)} tok/s`],['Aggregate',`${rate(aggregate.prompt_tokens_per_second)} tok/s`],['Last run',`${rate(last.prompt_tokens_per_second)} tok/s`],['Prompt tokens',s.metrics.prompt_tokens]])+card('Generation throughput',`<span class="cyan">${rate(a.generation_tokens_per_second)}</span> <small>tok/s average</small>`,[['Max',`${rate(max.generation_tokens_per_second)} tok/s`],['Aggregate',`${rate(aggregate.generation_tokens_per_second)} tok/s`],['Last run',`${rate(last.generation_tokens_per_second)} tok/s`],['Generated tokens',s.metrics.completion_tokens]])+card('Worker',s.worker.active_request_id?`<span class="cyan">ACTIVE #${s.worker.active_request_id}</span>`:'<span class="lime">IDLE</span>',[['Queued',s.worker.queued_requests],['Complete / errors',`${s.metrics.requests_ok} / ${rh.errored||0}`]])+card('GPU',gib(m.used_bytes),[['Free',gib(m.free_bytes)],['Vision',v.enabled?`yes · ${esc(v.device)}`:'no']])+card('Network',`<span class="cyan">${net(n.receive_mbps)}</span>`,[['Transmit',net(n.transmit_mbps)],['Scope',esc(n.scope)]]);const x=s.loading;if(x){$('loadPanel').style.display='block';const pct=Math.min(98,(x.estimated_fraction||0)*100);$('loadBar').style.width=pct+'%';$('loadPct').textContent=pct.toFixed(1)+'%';$('loadText').textContent=`${x.elapsed_seconds.toFixed(0)}s elapsed · ${x.stage==='finalizing_gpu'?'finalizing GPU setup':x.estimated_eta_seconds==null?'ETA calculating':Math.ceil(x.estimated_eta_seconds)+'s estimated remaining'}`;$('loadHint').textContent=`${gib(x.observed_network_bytes)} observed / ${gib(x.expected_bytes)} model · ${x.estimate_basis}`}else $('loadPanel').style.display='none';document.querySelectorAll('#modelList button[data-path]').forEach(b=>b.disabled=sw.state==='queued'||sw.state==='loading');renderRunSummary(rh);renderThermal(g.thermal_guard);decorateGpuCard(s);$('errorPanel').style.display=s.status==='error'?'block':'none';$('errorText').textContent=s.status==='error'?(s.status_detail||'Engine failed without a reported detail.'):''}
 function renderRunSummary(h){const active=h.active_count??(h.active?1:0);$('runSummary').textContent=`${h.retained||0} retained · ${active} active · ${h.errored||0} errors`}
 function renderThermal(t){t=t||{};const state=t.state||'unavailable',temp=t.current_temperature_c==null?'—':Number(t.current_temperature_c).toFixed(1)+'°C',resume=t.resume_temperature_c==null?'—':Number(t.resume_temperature_c).toFixed(0)+'°C';$('thermalSummary').textContent=`${state} · ${temp}`;$('thermalDetail').textContent=state==='threshold_pending'?`HOT · pausing in ${Math.ceil(t.threshold_remaining_seconds||0)}s · current ${temp}`:state==='paused'||state==='cooling'?`Request ${t.affected_request||'queued'} held ${Number(t.paused_seconds||0).toFixed(1)}s · current ${temp} · resumes at ${resume} · queue remains alive.`:`State ${state} · threshold ${t.maximum_temperature_threshold_c||'—'}°C for ${t.maximum_temperature_seconds||'—'}s · resume ${resume}.`}
 function decorateGpuCard(s){const g=s.gpu||{},m=g.memory||{},all=g.inventory?.gpus||{},x=Object.values(all).find(x=>x.hip_device_index===0)||{},p=x.pcie||{},w=x.power||{},t=(x.temperatures||[]).slice().sort((a,b)=>(b.temperature_c||-1)-(a.temperature_c||-1))[0]||{},guard=g.thermal_guard||{};const c=$('cards')?.children[3];if(!c)return;c.querySelector('.hero').innerHTML=`${gib(m.used_bytes)} <small>VRAM · ${esc(guard.state||'unavailable')} · ${t.temperature_c==null?'—':Number(t.temperature_c).toFixed(1)+'°C'}</small>`;c.querySelector('dl').innerHTML=[['Power',`${w.watts==null?'—':Number(w.watts).toFixed(1)+' W'} / ${w.limit_watts==null?'—':Number(w.limit_watts).toFixed(1)+' W'}`],['Temperature',t.temperature_c==null?'—':Number(t.temperature_c).toFixed(1)+'°C'],['PCIe',`Gen ${p.current_generation||'—'} ×${p.current_lanes||'—'}`],['Free VRAM',gib(m.free_bytes)]].map(r=>`<dt>${esc(r[0])}</dt><dd>${r[1]}</dd>`).join('')}
@@ -1123,6 +1151,30 @@ mod tests {
     }
 
     #[test]
+    fn performance_reports_average_and_max_retained_rates() {
+        let metrics = Metrics::new();
+        let mut history = RunHistory::new();
+        for (id, prompt, generation) in [(1, 100.0, 20.0), (2, 140.0, 30.0), (3, 0.0, 0.0)] {
+            history.push(RunRecord {
+                id, client_ip: "127.0.0.1".into(), method: "POST".into(),
+                path: "/v1/chat/completions".into(), request_type: "chat".into(),
+                state: "complete", queued_at_ms: id, started_at_ms: Some(id),
+                completed_at_ms: Some(id), status_code: Some(200), request: Value::Null,
+                response: Some(Value::Null), error: None,
+                stats: RunStats { prompt_tokens_per_second: prompt,
+                    generation_tokens_per_second: generation, ..RunStats::default() },
+            });
+        }
+        let value = performance_json(&metrics, &history);
+        assert_eq!(value["average"]["prompt_tokens_per_second"], 120.0);
+        assert_eq!(value["average"]["generation_tokens_per_second"], 25.0);
+        assert_eq!(value["max"]["prompt_tokens_per_second"], 140.0);
+        assert_eq!(value["max"]["generation_tokens_per_second"], 30.0);
+        assert_eq!(value["sample_count"]["prompt"], 2);
+        assert_eq!(value["sample_count"]["generation"], 2);
+    }
+
+    #[test]
     fn operations_dashboard_uses_one_status_refresh_path() {
         assert_eq!(INDEX_HTML_V3.matches("fetch('/api/status'").count(), 1);
         assert!(!INDEX_HTML_V3.contains("syncThermal"));
@@ -1141,6 +1193,8 @@ mod tests {
         assert!(dashboard.contains("memoryPanel"));
         assert!(dashboard.contains("Context capacity"));
         assert!(dashboard.contains("Model weights"));
+        assert!(dashboard.contains("tok/s average"));
+        assert!(dashboard.contains("['Max'"));
         assert!(!dashboard.contains("Thermal guard enabled','bool'"));
         assert!(dashboard.contains("meter('Power'"));
         assert!(dashboard.contains("meter('Compute'"));

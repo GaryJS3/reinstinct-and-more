@@ -12,7 +12,8 @@ dotnet run --project tests/api-contract -- --base-url http://127.0.0.1:8006
 
 The suite exercises liveness, model discovery, text chat, SSE streaming and
 usage, bounded run-history summaries/details, engine logs, network telemetry,
-model catalog metadata, safe rejection of out-of-catalog switches, and throughput fields,
+model catalog metadata, safe rejection of out-of-catalog switches, and aggregate,
+average, maximum, and per-run throughput fields,
 deterministic JPEG/PNG data URLs, OpenAI-shaped errors, the 8 MiB body limit,
 the exact Paperless-AI custom-provider `Test` request, timeout recovery, and
 client-disconnect recovery. A nonzero exit code means at least one contract

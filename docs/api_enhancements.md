@@ -75,10 +75,10 @@ subset that has actually passed its compatibility gates.
   redacted, and only the latest 128 runs are retained. History resets when the
   process restarts; persistent storage and cross-restart aggregation are
   deliberately deferred.
-- [x] `GET /api/status` and the dashboard report aggregate and last-completion
-  prompt/generation tokens per second plus prefill, TTFT, and generation
-  timing. Active generation progress is approximate until final usage is
-  available.
+- [x] `GET /api/status` and the dashboard report aggregate, retained-run
+  average, retained-run maximum, and last-completion prompt/generation tokens
+  per second plus prefill, TTFT, and generation timing. Active generation
+  progress is approximate until final usage is available.
 - [ ] Add last error and prefix-cache statistics.
 - [x] Add collapsible/filterable bounded engine logs (`GET /api/logs`) and a
   collapsible run section with retained/active/error counts.

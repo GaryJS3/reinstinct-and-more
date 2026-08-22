@@ -218,8 +218,15 @@ sealed class ContractSuite
                 "context reserved memory section missing");
             Check(memory.GetProperty("context").GetProperty("used_tokens").GetInt64() >= 0,
                 "context used memory metadata missing");
-            Check(root.GetProperty("performance").ValueKind == JsonValueKind.Object,
+            var performance = root.GetProperty("performance");
+            Check(performance.ValueKind == JsonValueKind.Object,
                 "status performance object missing");
+            Check(performance.GetProperty("average").ValueKind == JsonValueKind.Object,
+                "status average throughput object missing");
+            Check(performance.GetProperty("max").ValueKind == JsonValueKind.Object,
+                "status maximum throughput object missing");
+            Check(performance.GetProperty("sample_count").ValueKind == JsonValueKind.Object,
+                "status throughput sample counts missing");
             Check(root.GetProperty("run_history").GetProperty("capacity").GetInt32() >= 1,
                 "status run-history metadata missing");
             Check(root.GetProperty("network").GetProperty("receive_mbps").GetDouble() >= 0,
@@ -432,6 +439,20 @@ sealed class ContractSuite
                 "run prompt throughput missing");
             Check(stats.GetProperty("generation_tokens_per_second").GetDouble() > 0,
                 "run generation throughput missing");
+        }
+
+        using (var response = await _client.SendJsonAsync(HttpMethod.Get, "api/status", null))
+        using (var document = await ReadJsonAsync(response, HttpStatusCode.OK))
+        {
+            var performance = document.RootElement.GetProperty("performance");
+            Check(performance.GetProperty("average").GetProperty("prompt_tokens_per_second").GetDouble() > 0,
+                "average prompt throughput missing");
+            Check(performance.GetProperty("average").GetProperty("generation_tokens_per_second").GetDouble() > 0,
+                "average generation throughput missing");
+            Check(performance.GetProperty("max").GetProperty("prompt_tokens_per_second").GetDouble() > 0,
+                "maximum prompt throughput missing");
+            Check(performance.GetProperty("max").GetProperty("generation_tokens_per_second").GetDouble() > 0,
+                "maximum generation throughput missing");
         }
 
         using (var response = await _client.SendJsonAsync(HttpMethod.Get, $"api/runs/{id}", null))

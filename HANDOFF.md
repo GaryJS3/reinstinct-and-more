@@ -1,5 +1,27 @@
 # Handoff — reinstinct (2026-06-09)
 
+## Current deployment snapshot (2026-08-22)
+
+The current deployed service is commit `baa2cc0` (`serve: add config-backed
+dashboard reloads`). It runs on `ai@10.0.0.41:8006` as the enabled
+`reinstinct-server.service`, from the isolated checkout
+`/home/ai/inference-bench/reinstinct-service-20260822`.
+
+- Default service configuration: `/etc/reinstinct/server.json`.
+- Unit rollback copy: `/etc/systemd/system/reinstinct-server.service.bak-20260822`.
+- Dashboard: `http://10.0.0.41:8006/`.
+- Health/readiness: `/healthz` and `/readyz`; config/reload state:
+  `/api/config` and `/api/config/reload`.
+- The dashboard persists supported settings and reloads the engine only while
+  idle. Startup and GPU-worker failures remain visible in the dashboard and
+  engine-log panel while the HTTP listener stays available.
+- Furnace remains enabled but inactive and was not restarted or modified.
+
+The deployed smoke checks passed after restart: `/readyz` returned `200 ready`,
+`/api/config` reported the persisted config path, and a text chat request
+returned HTTP 200. The local worktree still contains unrelated `Cargo.toml`,
+`images/`, and `media/` changes; keep them out of service/docs commits.
+
 Snapshot for moving the project to another machine. Picks up after commit `1afa1a9`.
 
 ## What just shipped

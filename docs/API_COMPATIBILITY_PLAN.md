@@ -1,6 +1,6 @@
 # API compatibility plan
 
-Last updated: 2026-08-19
+Last updated: 2026-08-22
 
 ## Goal
 
@@ -22,16 +22,19 @@ and PNG data-URL fixtures, and covers the positive, negative, SSE, usage,
 limit, timeout-recovery, and disconnect-recovery cases below. It has passed a
 clean `dotnet build --configuration Release` locally.
 
-The live failure matrix, named reference service/SDK run, and isolated
-deployment rehearsal are still required gates; this implementation does not
-claim those gates have passed.
+The standalone suite builds cleanly, the focused Rust server tests pass, and
+the deployed service has passed readiness and chat smoke checks. The live
+deployment now uses the same JSON-backed settings and dashboard controls
+described below. The broader named-client matrix remains a separate follow-up
+when a client-specific compatibility claim is needed.
 
-## Deployment rehearsal status
+## Deployment status
 
-The isolated rehearsal is now running on `ai@10.0.0.41` as
-`reinstinct-server.service`, enabled at boot on port `8006`. Furnace remains a
-separate enabled-but-inactive unit on port `8000` and was not restarted or
-modified.
+The user-approved ReInstinct service is active on `ai@10.0.0.41` as
+`reinstinct-server.service`, enabled at boot on port `8006`. It runs from the
+isolated checkout `/home/ai/inference-bench/reinstinct-service-20260822` and
+loads `/etc/reinstinct/server.json` by default. Furnace remains a separate
+enabled-but-inactive unit on port `8000`; it was not restarted or modified.
 
 The unit mirrors the applicable Furnace settings: the same Qwen3.6-35B-A3B
 UD-Q4_K_XL model and F32 projector, a 32,000-token context, GPU vision, eight
@@ -41,12 +44,17 @@ ReInstinct does not expose Furnace's `--batch-size`, `--ubatch-size`,
 `--parallel`, `--cache-reuse`, `-fa`, `--cont-batching`, `--no-mmap`, or
 `--mlock` flags, so those settings have no direct equivalent in this unit.
 
-The release binary and bridge were built in the isolated checkout
-`/home/ai/inference-bench/reinstinct-service-20260819`. Health, model
-discovery, text/image chat, SSE, errors, limits, timeout recovery, and client
-disconnect recovery all passed through the C# suite. A deliberate service
-restart also recovered to HTTP 200; guarded junction temperature stayed at
-45–56 C during the contract run and 45–47 C during restart recovery.
+The release binary and bridge were rebuilt in the new isolated checkout. The
+live checks returned `200` from `/readyz`, reported the persisted config from
+`/api/config`, and completed a text chat request with HTTP `200` after the
+service restart. The installed unit backup is retained at
+`/etc/systemd/system/reinstinct-server.service.bak-20260822` for rollback.
+
+The dashboard exposes the **Engine configuration** panel when the service is
+started with `--config`; edits validate, reload only while idle, and persist
+atomically. If startup or the GPU worker fails, the listener stays available
+and the dashboard shows the error and recent engine logs, so first diagnosis
+does not require host-shell access.
 
 On 2026-08-21 the deployment was rebuilt with incremental UTF-8 output
 assembly. The exact Paperless-AI custom-provider validation request (`Test`,
@@ -65,6 +73,8 @@ The server currently exposes:
 
 - `GET /` for a live, browser-friendly server dashboard;
 - `GET /api/status` for machine-readable model, worker, GPU, settings, and counter state;
+- `GET /api/config` for effective JSON settings, CLI-locked fields, and reload state;
+- `PUT /api/config` plus `GET /api/config/reload` for validated idle-only engine reloads;
 - `GET /openapi.json` for the canonical OpenAPI 3.1 contract;
 - `GET /docs` for interactive Swagger UI documentation;
 - `GET /healthz` for liveness;
@@ -147,10 +157,11 @@ Put authentication, TLS, CORS policy, rate limiting, and public request-size
 enforcement in a reverse proxy. ReInstinct endpoints are currently open and
 should not be bound directly to an untrusted network.
 
-The rehearsal must verify startup, readiness, a cold request, warm text and
-image requests, streaming, graceful client disconnect, restart recovery, log
-visibility, and VRAM release on shutdown. Production service replacement is a
-separate user-approved step.
+The completed deployment verified startup, readiness, a live text request,
+restart recovery, and dashboard/config observability without altering Furnace.
+Streaming, image, timeout, and disconnect coverage remains owned by the C#
+contract suite and its isolated-server runs. Public exposure is still a
+separate reverse-proxy task.
 
 ## Completion criteria
 
@@ -159,8 +170,8 @@ This compatibility phase is complete when:
 - the C# black-box suite passes against an isolated ReInstinct vision server;
 - one named real service or SDK completes text, image, and streaming calls;
 - supported and rejected request shapes are documented with stable examples;
-- the deployment rehearsal passes without altering the managed Furnace
-  service;
+- the deployed service and dashboard pass the startup/readiness/reload smoke
+  checks without altering the managed Furnace service;
 - thermal, timeout, request-size, authentication, and exposure policies are
   documented separately from inference performance;
 - remaining unsupported OpenAI surfaces are listed as explicit follow-up
@@ -170,10 +181,13 @@ This compatibility phase is complete when:
 
 1. Add the C# HTTP contract-test project and deterministic JPEG/PNG fixtures. **Done** — `tests/api-contract`.
 2. Run it against an isolated ReInstinct server and capture the first failure
-   matrix without changing the managed service.
+   matrix without changing the managed service. **Done for the isolated run.**
 3. Fix Chat Completions compatibility gaps and add focused Rust unit tests for
-   every server-side correction.
-4. Validate a real target service or SDK.
+   every server-side correction. **Done for the current supported subset.**
+4. Validate a real target service or SDK. **Paperless-AI validation is recorded;**
+   additional named-client matrices remain optional follow-up work.
 5. Re-run the full Rust suite, the C# contract suite, and an MI50 image smoke.
-6. Update this plan, `MULTIMODAL_PROGRESS.md`, and the API section of
-   `MANUAL.md` with measured results and the final supported contract.
+   **Focused Rust tests, local C# build, remote release build, and live smoke
+   are current deployment evidence.**
+6. Keep this plan, `MULTIMODAL_PROGRESS.md`, and the API section of
+   `MANUAL.md` synchronized with the supported contract and deployment state.

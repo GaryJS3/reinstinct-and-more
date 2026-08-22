@@ -105,7 +105,7 @@ the drafter is likely to land.
 - **Q8 KV cache**: INT8 key/value cache with dp4a FlashAttention (default)
 - **SuperQuant tiered KV cache**: Opt-in 2-tier (int8 + turbo3) cache that extends context capacity ~1.7× vs int8 / ~3.3× vs fp16. Capacity feature, not a perf feature — trade ~30% decode tok/s for room to attend over longer contexts. Gemma 4 only today; see [docs/SUPERQUANT.md](docs/SUPERQUANT.md).
 - **MTP speculative decoding**: Multi-Token Prediction with per-request control
-- **OpenAI-compatible serve endpoint**: `/v1/chat/completions` with streaming, logprobs, prefix cache, an OpenAPI 3.1 contract, and a live status dashboard
+- **OpenAI-compatible serve endpoint**: `/v1/chat/completions` with streaming, logprobs, prefix cache, an OpenAPI 3.1 contract, and a live operations dashboard with persisted JSON settings and idle-only engine reloads
 - **HIP graph capture**: Entire decode step as a single GPU submission
 - **Fused kernels**: RMSNorm+projection, RoPE+KV write, SwiGLU, dequant+GEMV, attention
 - **Wave64-native**: All kernels designed for GCN5.1 64-lane wavefronts with DPP reductions

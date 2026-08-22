@@ -1,6 +1,6 @@
 # Multimodal progress
 
-Last updated: 2026-08-19
+Last updated: 2026-08-22
 
 Canonical speed results and the active bottleneck queue are tracked in
 [`PERFORMANCE.md`](PERFORMANCE.md).
@@ -33,6 +33,12 @@ Canonical speed results and the active bottleneck queue are tracked in
   vision/projector execution, and result-copy time. The warm HTTP path logs
   those fields alongside multimodal prefill, TTFT, decode, physical rows, and
   logical positions for every image request.
+- The deployed `reinstinct-server.service` now runs from the isolated
+  `reinstinct-service-20260822` checkout and loads `/etc/reinstinct/server.json`
+  by default. The dashboard validates and persists supported settings, then
+  reloads the engine while idle; port changes remain a service-restart concern.
+- Startup and GPU-worker failures remain visible through the dashboard and
+  `/api/logs` while the HTTP listener stays available for diagnosis.
 
 ## Important discovery
 
@@ -51,25 +57,26 @@ image, with a 6 MiB decoded-image cap and no remote URLs. It requires
 coherent description; the managed Furnace service was kept stopped throughout.
 
 The next gate is service compatibility rather than another engine-only image
-optimization. The planned C# black-box suite must validate discovery, text and
-image chat, non-streaming and SSE response shapes, usage, stable errors,
-request limits, timeouts, and client disconnects. It must also exercise at
-least one named real service or SDK. An isolated deployment rehearsal must
-pass before production rollout is considered. Full scope and acceptance
+optimization. The C# black-box suite covers discovery, text and image chat,
+non-streaming and SSE response shapes, usage, stable errors, request limits,
+timeouts, and client disconnects. The deployed dashboard/config reload path
+is now part of the operations contract; additional named-client matrices and
+reverse-proxy exposure remain follow-up work. Full scope and acceptance
 criteria are in [`API_COMPATIBILITY_PLAN.md`](API_COMPATIBILITY_PLAN.md).
 
-The standalone C#/.NET 8 HTTP contract suite is now implemented at
+The standalone C#/.NET 8 HTTP contract suite is implemented at
 `tests/api-contract`. It is dependency-free, uses deterministic JPEG/PNG
 fixtures, and validates the declared wire shapes plus error, limit, timeout,
 and disconnect-recovery behavior. It has passed a clean local Release build;
-the live isolated-server run, named reference service/SDK run, and deployment
-rehearsal are now complete for the isolated server. The service is
-`reinstinct-server.service` on `ai@10.0.0.41:8006`, enabled at boot, with the
-Qwen3.6-35B-A3B model/projector and 32k context. The C# suite passed all 11
-checks, restart recovery returned HTTP 200, and guarded junction temperature
-peaked at 56 C. The managed Furnace service remains enabled but intentionally
-inactive and was not changed. Public exposure is still gated on a reverse
-proxy for authentication, TLS, CORS, rate limiting, and request-size policy.
+the isolated-server run and deployment rehearsal are complete for the current
+supported subset. The live service is `reinstinct-server.service` on
+`ai@10.0.0.41:8006`, enabled at boot, with the Qwen3.6-35B-A3B
+model/projector and 32k context. After the deployment restart, `/readyz`
+returned HTTP 200, `/api/config` reported the persisted JSON path, and a text
+chat smoke returned HTTP 200. The managed Furnace service remains enabled but
+intentionally inactive and was not changed. Public exposure is still gated on
+a reverse proxy for authentication, TLS, CORS, rate limiting, and request-size
+policy.
 
 ## Latest validation
 

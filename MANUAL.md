@@ -547,6 +547,38 @@ counters, aggregate and last-run prompt/generation throughput, vision
 configuration, and HIP device/VRAM information. The page refreshes every two
 seconds without placing work on the GPU queue.
 
+If model, HIP device, or engine initialization fails, the listeners remain
+available and the dashboard changes to an **Engine startup failure** view. It
+shows the reported error directly and retains the detailed trace in the
+Engine logs panel, so the host shell is not required for the first diagnosis.
+An unexpected GPU-worker panic is converted into the same persistent error
+state while the HTTP dashboard remains alive; restart the service after
+correcting the cause.
+
+#### JSON server configuration
+
+`serve` can load the existing serve options from a JSON file:
+
+```bash
+./target/release/reinstinct-engine serve --config /etc/reinstinct/server.json
+```
+
+See `docs/serve-config.example.json` for the property names. Explicit CLI
+options override values from the file. Unknown properties and invalid vision
+combinations are rejected at startup. When `--config` is present, the
+dashboard's **Engine configuration** panel validates edits, requires an idle
+worker, writes the file atomically after a successful engine reload, and
+reports rollback failures. Context, model, drafter, and existing vision
+options reload in-process; port changes require a service restart. Without
+`--config`, the panel is read-only.
+
+`GET /api/config` returns effective values, CLI-locked fields, and reload
+state. `PUT /api/config` requires `X-ReInstinct-Action: update-config` and
+returns a reload ID; poll `GET /api/config/reload` for completion.
+
+For systemd deployments, `scripts/reinstinct-server.service.example` starts
+the service with `/etc/reinstinct/server.json` by default.
+
 The dashboard also exposes a short server-local flight recorder. `GET
 /api/runs` returns summaries for the newest 128 requests, including client IP,
 queued/active/completed/error state, token counts, stage timings, and

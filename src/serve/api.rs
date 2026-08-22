@@ -8,11 +8,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::Metrics;
+use super::config::ServeConfig;
 use serde_json::{Value, json};
 
 pub struct ApiStatus {
     pub started_at: u64,
-    pub max_seq: usize,
+    pub max_seq: Mutex<usize>,
     pub target: &'static str,
     pub port: u16,
     pub model: Mutex<ModelStatus>,
@@ -26,6 +27,22 @@ pub struct ApiStatus {
     pub catalog: Mutex<Option<CatalogCache>>,
     pub model_switch: Mutex<ModelSwitchStatus>,
     pub next_switch_id: AtomicU64,
+    pub config: Mutex<ServeConfig>,
+    pub config_reload: Mutex<ConfigReloadStatus>,
+    pub next_config_reload_id: AtomicU64,
+}
+
+#[derive(Clone)]
+pub struct ConfigReloadStatus {
+    pub id: u64,
+    pub state: &'static str,
+    pub accepted_at_ms: Option<u64>,
+    pub completed_at_ms: Option<u64>,
+    pub error: Option<String>,
+}
+
+impl Default for ConfigReloadStatus {
+    fn default() -> Self { Self { id: 0, state: "idle", accepted_at_ms: None, completed_at_ms: None, error: None } }
 }
 
 pub struct CatalogCache {
@@ -328,6 +345,49 @@ impl ApiStatus {
 
     pub fn switch_json(&self) -> String { self.switch_value().to_string() }
 
+    pub fn config_json(&self) -> String {
+        let cfg = self.config.lock().ok();
+        let reload = self.config_reload.lock().ok();
+        json!({
+            "path": cfg.as_ref().and_then(|c| c.config_path.clone()),
+            "persisted": cfg.as_ref().map(|c| c.config_path.is_some()).unwrap_or(false),
+            "effective": cfg.as_ref().map(|c| c.json_value()).unwrap_or(Value::Null),
+            "cli_locked": cfg.as_ref().map(|c| c.cli_locked.iter().cloned().collect::<Vec<_>>()).unwrap_or_default(),
+            "reload": reload.map(|r| json!({"id":r.id,"state":r.state,"accepted_at_ms":r.accepted_at_ms,"completed_at_ms":r.completed_at_ms,"error":r.error})).unwrap_or(Value::Null)
+        }).to_string()
+    }
+
+    pub fn queue_config_reload(&self, next: &ServeConfig) -> Result<u64, String> {
+        let phase = self.phase.lock().map_err(|_| "service state is unavailable")?;
+        if phase.name != "ready" { return Err(format!("service is {}", phase.name)); }
+        drop(phase);
+        if self.queued.load(Ordering::Relaxed) > 0 || self.active_request.load(Ordering::Relaxed) > 0 {
+            return Err("configuration reload requires an idle worker and empty queue".into());
+        }
+        if next.config_path.is_none() { return Err("server was not started with --config".into()); }
+        let id = self.next_config_reload_id.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Ok(mut state) = self.config_reload.lock() { *state = ConfigReloadStatus { id, state: "queued", accepted_at_ms: Some(unix_now_ms()), completed_at_ms: None, error: None }; }
+        self.set_phase("reloading", Some("Queued engine configuration reload".into()));
+        Ok(id)
+    }
+
+    pub fn start_config_reload(&self, id: u64) {
+        if let Ok(mut state) = self.config_reload.lock() { if state.id == id { state.state = "loading"; } }
+        self.set_phase("reloading", Some("Loading engine configuration".into()));
+    }
+
+    pub fn complete_config_reload(&self, id: u64, cfg: ServeConfig) {
+        if let Ok(mut max_seq) = self.max_seq.lock() { *max_seq = cfg.max_seq; }
+        if let Ok(mut current) = self.config.lock() { *current = cfg; }
+        if let Ok(mut state) = self.config_reload.lock() { if state.id == id { state.state = "complete"; state.completed_at_ms = Some(unix_now_ms()); } }
+        self.set_phase("ready", None);
+    }
+
+    pub fn fail_config_reload(&self, id: u64, error: String) {
+        if let Ok(mut state) = self.config_reload.lock() { if state.id == id { state.state = "failed"; state.completed_at_ms = Some(unix_now_ms()); state.error = Some(error.clone()); } }
+        self.set_phase("ready", Some("Configuration reload failed; previous engine restored".into()));
+    }
+
     fn switch_value(&self) -> Value {
         self.model_switch.lock().map(|s| json!({"id":s.id,"state":s.state,
             "requested_path":s.requested_path,"previous_model":s.previous_model,
@@ -367,7 +427,7 @@ impl ApiStatus {
             "status":phase,"status_detail":detail,"started_at":self.started_at,
             "uptime_seconds":super::unix_now().saturating_sub(self.started_at),
             "endpoint":{"target":self.target,"port":self.port},
-            "model":{"id":model.id,"path":model.path,"max_context_tokens":self.max_seq,
+            "model":{"id":model.id,"path":model.path,"max_context_tokens":self.max_seq.lock().map(|v| *v).unwrap_or(0),
                 "drafter":model.drafter,"vision":vision,"catalog_root":self.model_dir},
             "worker":{"queued_requests":self.queued.load(Ordering::Relaxed),
                 "active_request_id":match self.active_request.load(Ordering::Relaxed){0=>Value::Null,n=>json!(n)}},
@@ -376,7 +436,7 @@ impl ApiStatus {
             "network":network,
             "run_history":history_summary,
             "logs":logs_summary_json(),
-            "management":{"model_switch":self.switch_value(),"switch_requires_action_header":true},
+            "management":{"model_switch":self.switch_value(),"config_reload":self.config_reload.lock().map(|r| json!({"id":r.id,"state":r.state,"error":r.error})).unwrap_or(Value::Null),"switch_requires_action_header":true},
             "gpu":gpu_json(),
             "metrics":{"requests_total":metrics.requests_total.load(Ordering::Relaxed),
                 "http_requests_total":metrics.requests_total.load(Ordering::Relaxed),
@@ -646,6 +706,8 @@ pub fn openapi_json() -> String {
         "/healthz":{"get":{"summary":"Liveness","responses":{"200":{"description":"Alive","content":{"text/plain":{"schema":{"type":"string"}}}}}}},
         "/readyz":{"get":{"summary":"Readiness","responses":{"200":{"description":"Model ready","content":{"text/plain":{"schema":{"type":"string"}}}}},"503":{"description":"Loading or unavailable"}}},
         "/api/status":{"get":{"summary":"Live server status","responses":{"200":{"description":"Runtime, model, queue, GPU and counters","content":{"application/json":{"schema":{"$ref":"#/components/schemas/ServerStatus"}}}}}}},
+        "/api/config":{"get":{"summary":"Get effective server configuration"},"put":{"summary":"Validate, persist, and reload server configuration","parameters":[{"name":"X-ReInstinct-Action","in":"header","required":true,"schema":{"const":"update-config"}}],"responses":{"202":{"description":"Reload queued"},"400":{"description":"Invalid configuration"},"409":{"description":"Busy or restart required"}}}},
+        "/api/config/reload":{"get":{"summary":"Get configuration reload state"}},
         "/api/runs":{"get":{"summary":"List bounded in-memory inference run history","responses":{"200":{"description":"Newest retained runs first","content":{"application/json":{"schema":{"$ref":"#/components/schemas/RunList"}}}}}}},
         "/api/runs/{id}":{"get":{"summary":"Get one retained run with captured request and response","parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"integer"}}],"responses":{"200":{"description":"Run detail","content":{"application/json":{"schema":{"$ref":"#/components/schemas/RunDetail"}}}},"404":{"description":"Run was evicted or does not exist","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}}},
         "/api/logs":{"get":{"summary":"List bounded in-memory engine logs","responses":{"200":{"description":"Oldest-to-newest log lines"}}}},
@@ -765,13 +827,14 @@ async function refresh(){try{const [s,h]=await Promise.all([fetch('/api/status',
 function renderStatus(s,h){const g=s.gpu||{},m=g.memory||{},v=s.model.vision||{},p=s.performance||{},a=p.aggregate||{},l=p.last||{},runs=h.runs||[],runErrors=runs.filter(r=>r.state==='errored').length;version.textContent=`v${s.service.version} · ${s.model.id} · uptime ${s.uptime_seconds}s`;phase.textContent=s.status;phase.className='badge '+s.status;cards.innerHTML=card(1,'Prompt throughput',`<span class="accent">${rate(a.prompt_tokens_per_second)}</span> <small>tok/s aggregate</small>`,[['Last run',`<span class="accent">${rate(l.prompt_tokens_per_second)} tok/s</span>`],['Prompt tokens',e(s.metrics.prompt_tokens)]])+card(2,'Generation throughput',`<span class="cyan">${rate(a.generation_tokens_per_second)}</span> <small>tok/s aggregate</small>`,[['Last run',`<span class="cyan">${rate(l.generation_tokens_per_second)} tok/s</span>`],['Generated tokens',e(s.metrics.completion_tokens)]])+card(3,'Worker',s.worker.active_request_id?`<span class="cyan">ACTIVE #${e(s.worker.active_request_id)}</span>`:`<span class="accent">IDLE</span>`,[['Queued',e(s.worker.queued_requests)],['Completed',e(s.metrics.requests_ok)],['Retained errors',`<span class="${runErrors?'bad':''}">${runErrors}</span>`],['HTTP 4xx / 5xx',`${e(s.metrics.requests_4xx)} / ${e(s.metrics.requests_5xx)}`]])+card(4,'GPU',`<span>${gib(m.used_bytes)}</span> <small>used</small>`,[['Device',e(g.name)],['Architecture',e(g.architecture)],['Free',gib(m.free_bytes)],['Vision',v.enabled?`${e(v.device)} / ${e(v.threads)} threads`:'disabled']]);}
 function renderRuns(runs){runRows.innerHTML=runs.length?runs.map(r=>{const x=r.stats||{};return `<tr data-id="${r.id}"><td><b>#${r.id}</b><br><span style="color:var(--muted)">${clock(r.queued_at_ms)}</span></td><td>${e(r.client_ip)}</td><td>${e(r.request_type)}${r.path.includes('chat')?'<br><span style="color:var(--muted)">chat</span>':''}</td><td><span class="state ${e(r.state)}">${e(r.state)}</span>${r.status_code?`<br><span style="color:var(--muted)">HTTP ${r.status_code}</span>`:''}</td><td>${e(x.prompt_tokens)} / ${e(x.completion_tokens)}</td><td class="accent">${rate(x.prompt_tokens_per_second)}</td><td class="cyan">${rate(x.generation_tokens_per_second)}</td><td>${ms(x.ttft_ms)}</td><td>${ms(x.total_ms)}</td></tr>`}).join(''):'<tr><td colspan="9" class="empty">No inference runs retained yet.</td></tr>';}
 runRows.addEventListener('click',async ev=>{const row=ev.target.closest('tr[data-id]');if(!row)return;const r=await fetch('/api/runs/'+row.dataset.id,{cache:'no-store'}).then(x=>x.json()),x=r.stats||{};detailTitle.textContent=`Run #${r.id} · ${r.state}`;detailGrid.innerHTML=[['Client',r.client_ip],['Route',r.method+' '+r.path],['State',r.state+(r.status_code?' / HTTP '+r.status_code:'')],['Queued',ms(x.queue_ms)],['Prompt',x.prompt_tokens+' tok / '+rate(x.prompt_tokens_per_second)+' tok/s'],['Generation',x.completion_tokens+' tok / '+rate(x.generation_tokens_per_second)+' tok/s'],['TTFT',ms(x.ttft_ms)],['Total',ms(x.total_ms)]].map(v=>`<div><span>${e(v[0])}</span>${e(v[1])}</div>`).join('');requestPayload.textContent=JSON.stringify(r.request,null,2);responsePayload.textContent=JSON.stringify(r.response,null,2);detail.showModal()});
-refresh();setInterval(refresh,2000);
 </script></body></html>"#;
 
 pub const INDEX_HTML_V3: &str = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ReInstinct operations</title><style>
 :root{color-scheme:dark;--bg:#080d0b;--panel:#101814;--line:#2a3931;--ink:#e8efe9;--muted:#8b9991;--lime:#b7ff5a;--cyan:#62d9d1;--red:#ff6b6b;--amber:#ffc857;font:13px "Cascadia Code",monospace;background:var(--bg);color:var(--ink)}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 85% 0,#17352b,transparent 32%),linear-gradient(90deg,#b7ff5a08 1px,transparent 1px),linear-gradient(#b7ff5a06 1px,transparent 1px);background-size:auto,32px 32px,32px 32px}main{width:min(1500px,calc(100% - 32px));margin:auto;padding:28px 0 44px}header,.row,.section-head{display:flex;align-items:center;justify-content:space-between;gap:14px}header{align-items:flex-end;border-bottom:1px solid var(--line);padding-bottom:18px}.eyebrow,summary,.label{color:var(--muted);text-transform:uppercase;letter-spacing:.13em;font-size:10px}h1{font:700 clamp(38px,6vw,68px)/.9 Bahnschrift,sans-serif;text-transform:uppercase;margin:6px 0}.sub{color:var(--muted);font-size:11px}.badge,.btn,input{border:1px solid var(--line);background:#131d18;color:var(--ink);padding:8px 11px}.badge{text-transform:uppercase;letter-spacing:.12em;font-size:10px}.ready{color:var(--lime);border-color:#567a3c}.loading{color:var(--amber)}.error,.bad{color:var(--red)}.grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:9px;margin:18px 0}.card,details{background:linear-gradient(145deg,#141d19f5,#0b110ef5);border:1px solid var(--line)}.card{min-height:118px;padding:14px}.card h2{margin:0 0 13px;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em}.hero{font:28px Bahnschrift,sans-serif;margin-bottom:10px}.lime{color:var(--lime)}.cyan{color:var(--cyan)}dl{display:grid;grid-template-columns:1fr auto;gap:6px;margin:0;font-size:10px}dt{color:var(--muted)}dd{margin:0;text-align:right;overflow-wrap:anywhere}details{margin-top:12px}summary{cursor:pointer;padding:14px 16px;list-style:none;display:flex;justify-content:space-between}summary::-webkit-details-marker{display:none}summary:after{content:"+";color:var(--lime)}details[open]>summary{border-bottom:1px solid var(--line)}details[open]>summary:after{content:"−"}.summary-meta{margin-left:auto;margin-right:14px;color:var(--ink);letter-spacing:0;text-transform:none}.tools{padding:10px 14px;border-bottom:1px solid var(--line);display:flex;gap:9px;align-items:center;flex-wrap:wrap}.btn{cursor:pointer;font:11px inherit}.btn:hover{border-color:var(--cyan);color:var(--cyan)}input{min-width:260px;font:11px inherit}.progress{height:10px;border:1px solid var(--line);background:#070b09;overflow:hidden;margin-top:9px}.progress i{display:block;height:100%;background:linear-gradient(90deg,var(--cyan),var(--lime));transition:width .4s}.table-wrap{overflow:auto;max-height:500px}table{width:100%;border-collapse:collapse;white-space:nowrap;font-size:10px}th{position:sticky;top:0;background:#121b17;color:var(--muted);text-align:left;text-transform:uppercase;letter-spacing:.08em;padding:9px 11px}td{padding:10px 11px;border-top:1px solid #1c2822}tbody tr{cursor:pointer}tbody tr:hover{background:#19251f}.state{padding:3px 6px;border:1px solid var(--line);text-transform:uppercase}.state.complete{color:var(--lime)}.state.active{color:var(--cyan)}.state.errored{color:var(--red)}#logLines{height:360px;overflow:auto;margin:0;padding:14px;background:#060a08;white-space:pre-wrap;font:11px/1.55 "Cascadia Code",monospace;color:#b9c8bf}.model-list{padding:12px;display:grid;gap:8px}.model{border:1px solid var(--line);padding:11px;display:grid;grid-template-columns:1fr auto;gap:5px 15px}.model .path{color:var(--muted);font-size:10px;overflow-wrap:anywhere}.model.active-model{border-color:#567a3c}.model button{grid-row:1/4;grid-column:2;align-self:center}nav{display:flex;gap:16px;flex-wrap:wrap;margin-top:14px;font-size:10px}a{color:var(--cyan);text-decoration:none}.privacy{margin-left:auto;color:var(--muted)}dialog{width:min(900px,calc(100% - 24px));max-height:88vh;border:1px solid #53675d;background:#0d1411;color:var(--ink);padding:0}dialog::backdrop{background:#000c}.dialog-head{position:sticky;top:0;background:#121b17;border-bottom:1px solid var(--line);padding:13px 16px;display:flex;justify-content:space-between}.dialog-body{padding:16px}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:7px}.stats div{border:1px solid var(--line);padding:9px}.stats span{display:block;color:var(--muted);font-size:9px}pre.payload{max-height:280px;overflow:auto;background:#060a08;border:1px solid var(--line);padding:12px;white-space:pre-wrap;overflow-wrap:anywhere}@media(max-width:1050px){.grid{grid-template-columns:repeat(2,1fr)}}@media(max-width:580px){.grid{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,1fr)}header{align-items:flex-start}.privacy{margin-left:0}}
 </style></head><body><main><header><div><div class="eyebrow">gfx906 / operations console</div><h1>ReInstinct</h1><div id="version" class="sub">Connecting…</div></div><span id="phase" class="badge">connecting</span></header><section id="cards" class="grid"></section><section id="loadPanel" class="card" style="display:none"><div class="row"><div><div class="label">Model loading estimate</div><strong id="loadText"></strong></div><strong id="loadPct" class="cyan"></strong></div><div class="progress"><i id="loadBar"></i></div><div id="loadHint" class="sub" style="margin-top:8px"></div></section>
+<section id="errorPanel" class="card" style="display:none;border-color:var(--red)"><div class="label">Engine startup failure</div><pre id="errorText" style="margin-top:10px;color:var(--red);max-height:260px;white-space:pre-wrap;overflow:auto"></pre><div class="sub" style="margin-top:10px">The HTTP dashboard is still available. Fix the startup configuration or model, then restart the service.</div></section>
 <details id="modelsPanel"><summary>Model catalog <span id="modelSummary" class="summary-meta">not scanned</span></summary><div class="tools"><button id="scanModels" class="btn">Refresh models</button><input id="modelFilter" type="search" placeholder="Filter models or paths…"><span class="sub">NFS scan is cached until refreshed. Switching waits for an idle worker.</span></div><div id="modelList" class="model-list"></div></details>
+<details id="configPanel"><summary>Engine configuration <span id="configSummary" class="summary-meta">loading</span></summary><div class="tools"><span id="configPath" class="sub"></span><button id="configSave" class="btn">Save and reload</button><button id="configReset" class="btn">Reset form</button></div><div id="configNotice" class="sub" style="padding:0 14px 10px"></div><form id="configForm" class="config-form"></form></details>
 <details id="runsPanel" open><summary>Recent runs <span id="runSummary" class="summary-meta">0 retained</span></summary><div class="tools"><input id="runFilter" type="search" placeholder="Filter runs by IP, route, state…"></div><div class="table-wrap"><table><thead><tr><th>ID / time</th><th>Client</th><th>Type</th><th>State</th><th>Tokens p/g</th><th>Prompt tok/s</th><th>Gen tok/s</th><th>TTFT</th><th>Total</th></tr></thead><tbody id="runRows"></tbody></table></div></details>
 <details id="logsPanel"><summary>Engine logs <span id="logSummary" class="summary-meta">0 retained</span></summary><div class="tools"><input id="logFilter" type="search" placeholder="Filter logs (text or level)…"><button id="logTail" class="btn">Jump to latest</button></div><pre id="logLines">Open this panel to load captured logs.</pre></details>
 <nav><a href="/docs">API docs</a><a href="/openapi.json">OpenAPI</a><a href="/metrics">Prometheus</a><a href="/api/runs">Run JSON</a><a href="/api/logs">Log JSON</a><span class="privacy">memory-only telemetry · clears on restart</span></nav></main>
@@ -788,7 +851,12 @@ function renderLogs(){const q=$('logFilter').value.toLowerCase(),lines=cachedLog
 function filterModels(){const q=$('modelFilter').value.toLowerCase();document.querySelectorAll('.model').forEach(row=>row.hidden=!!q&&!row.textContent.toLowerCase().includes(q))}
 $('scanModels').onclick=async()=>{const b=$('scanModels');b.disabled=true;b.textContent='Refreshing…';try{const c=await fetch('/api/models?refresh=1',{cache:'no-store'}).then(r=>r.json());$('modelSummary').textContent=`${c.count} models · ${c.root} · ${c.scan_duration_ms} ms`;$('modelList').innerHTML=c.models.map(m=>`<div class="model ${m.id===window.currentModel?'active-model':''}"><strong>${esc(m.id)}</strong><button class="btn" data-path="${esc(m.path)}" ${m.id===window.currentModel?'disabled':''}>${m.id===window.currentModel?'Loaded':'Load model'}</button><span>${Number(m.size_gib).toFixed(2)} GiB · ${m.vision_capable?'image projector found':'text only'}</span><span class="path">${esc(m.path)}${m.image_projector?'<br>projector: '+esc(m.image_projector):''}</span></div>`).join('');filterModels()}catch(e){$('modelList').textContent='Catalog scan failed: '+e}finally{b.disabled=false;b.textContent='Refresh models'}};
 $('modelList').onclick=async e=>{const b=e.target.closest('button[data-path]');if(!b)return;const path=b.dataset.path;if(!confirm(`Unload the current model and load:\n${path}\n\nInference will pause during loading.`))return;b.disabled=true;b.textContent='Queued…';try{const r=await fetch('/api/models/switch',{method:'POST',headers:{'Content-Type':'application/json','X-ReInstinct-Action':'switch-model'},body:JSON.stringify({path})}),j=await r.json();if(!r.ok)throw new Error(j.error?.message||'switch failed');$('modelSummary').textContent=`switch #${j.id} queued`;refresh()}catch(e){alert(e.message)}finally{b.disabled=false}};
-refresh();setInterval(refresh,2000);
+let configSnapshot=null;const configFields=[['big','Big model','path'],['model_dir','Model catalog root','path'],['big_drafter','Big drafter (optional)','path'],['small','Small model (optional)','path'],['embed','Embedder (optional)','path'],['big_port','Big port','number'],['small_port','Small port','number'],['embed_port','Embed port','number'],['max_seq','Context size','number'],['mmproj','Vision projector (optional)','path'],['mtmd_bridge','Vision bridge (optional)','path'],['vision_threads','Vision threads','number'],['vision_min_tokens','Vision minimum tokens','number'],['vision_max_tokens','Vision maximum tokens','number'],['cpu_vision','CPU vision','bool']];
+function renderConfig(c){configSnapshot=c;const locked=new Set(c.cli_locked||[]);$('configPath').textContent=c.path?`file: ${c.path}`:'started without --config; settings are read-only';$('configSummary').textContent=c.reload?.state&&c.reload.state!=='idle'?`reload ${c.reload.state}`:(c.persisted?'saved':'read-only');$('configNotice').textContent=c.reload?.error||(!c.persisted?'Restart with --config PATH to enable dashboard persistence.':'Only engine settings can reload live; port changes require a service restart.');const v=c.effective||{};$('configForm').innerHTML=configFields.map(([key,label,type])=>{const lock=locked.has(key),val=v[key];if(type==='bool')return `<div class="config-field ${lock?'locked':''}"><label><input data-config="${key}" type="checkbox" ${val?'checked':''} ${lock?'disabled':''}> ${esc(label)}</label><small>${lock?'locked by CLI':'applies on reload'}</small></div>`;return `<div class="config-field ${lock?'locked':''}"><label for="cfg-${key}">${esc(label)}</label><input id="cfg-${key}" data-config="${key}" type="${type==='number'?'number':'text'}" value="${val==null?'':esc(val)}" ${lock?'disabled':''}><small>${lock?'locked by CLI':'applies on reload'}</small></div>`}).join('')}
+async function loadConfig(){try{const c=await fetch('/api/config',{cache:'no-store'}).then(r=>r.json());renderConfig(c)}catch(e){$('configNotice').textContent='Configuration unavailable: '+e}}
+$('configPanel').addEventListener('toggle',()=>{if($('configPanel').open)loadConfig()});$('configReset').onclick=()=>{if(configSnapshot)renderConfig(configSnapshot)};$('configSave').onclick=async()=>{if(!configSnapshot?.persisted){$('configNotice').textContent='Start the service with --config PATH before saving.';return}const body={};for(const el of document.querySelectorAll('[data-config]')){if(el.disabled)continue;body[el.dataset.config]=el.type==='checkbox'?el.checked:(el.type==='number'?(el.value===''?null:Number(el.value)):(el.value===''?null:el.value))}const b=$('configSave');b.disabled=true;b.textContent='Validating…';try{const r=await fetch('/api/config',{method:'PUT',headers:{'Content-Type':'application/json','X-ReInstinct-Action':'update-config'},body:JSON.stringify(body)}),j=await r.json();if(!r.ok)throw new Error(j.error?.message||'configuration update failed');$('configNotice').textContent=`Reload #${j.id} queued`;b.textContent='Reloading…';loadConfig()}catch(e){$('configNotice').textContent=e.message}finally{b.disabled=false;b.textContent='Save and reload'}};loadConfig();
+ async function refreshError(){try{const s=await fetch('/api/status',{cache:'no-store'}).then(r=>r.json());$('errorPanel').style.display=s.status==='error'?'block':'none';$('errorText').textContent=s.status==='error'?(s.status_detail||'Engine failed without a reported detail.'):''}catch(_){}}
+ refreshError();setInterval(refreshError,2000);refresh();setInterval(refresh,2000);
 </script></body></html>"#;
 
 #[cfg(test)]
@@ -802,6 +870,7 @@ mod tests {
         assert!(v["paths"]["/v1/chat/completions"].is_object());
         assert!(v["paths"]["/api/runs"].is_object());
         assert!(v["paths"]["/api/runs/{id}"].is_object());
+        assert!(v["paths"]["/api/config"]["put"].is_object());
     }
 
     #[test]

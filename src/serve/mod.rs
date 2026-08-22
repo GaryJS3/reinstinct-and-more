@@ -15,6 +15,7 @@
 mod http;
 mod json;
 mod api;
+pub mod config;
 
 pub use api::DashboardLogWriter;
 
@@ -402,9 +403,15 @@ struct ModelSwitch {
     projector: Option<PathBuf>,
 }
 
+struct ConfigReload {
+    id: u64,
+    config: config::ServeConfig,
+}
+
 enum WorkerCommand {
     Generate(Job),
     Switch(ModelSwitch),
+    ReloadConfig(ConfigReload),
 }
 
 // --- streaming helpers (SSE) --------------------------------------------
@@ -1525,10 +1532,19 @@ impl ServerModel {
 
 // --- the GPU worker ----------------------------------------------------
 
-fn worker(rx: mpsc::Receiver<WorkerCommand>, big: PathBuf, big_drafter: Option<PathBuf>,
-          small: Option<PathBuf>, max_seq: usize, vision: Option<VisionConfig>, metrics: Arc<Metrics>,
+fn worker(rx: mpsc::Receiver<WorkerCommand>, mut current_config: config::ServeConfig, metrics: Arc<Metrics>,
           statuses: Vec<Arc<api::ApiStatus>>)
 {
+    let mut big = current_config.big.clone();
+    let mut big_drafter = current_config.big_drafter.clone();
+    let mut small = current_config.small.clone();
+    let mut max_seq = current_config.max_seq;
+    let mut vision = match (current_config.mmproj.clone(), current_config.mtmd_bridge.clone()) {
+        (Some(mmproj), Some(bridge)) => Some(VisionConfig { mmproj, bridge, threads: current_config.vision_threads,
+            image_min_tokens: current_config.vision_min_tokens, image_max_tokens: current_config.vision_max_tokens,
+            use_gpu: !current_config.cpu_vision }),
+        _ => None,
+    };
     for status in &statuses {
         if status.target != "embed" { status.begin_loading(if status.target == "big" { &big } else { small.as_ref().unwrap_or(&big) }); }
     }
@@ -1560,7 +1576,7 @@ fn worker(rx: mpsc::Receiver<WorkerCommand>, big: PathBuf, big_drafter: Option<P
             Ok(m)
         };
         let big_m   = load("big",   &big,   big_drafter.as_ref(), vision.as_ref())?;
-        let small_m = match small {
+        let small_m = match small.clone() {
             Some(sp) => Some(load("small", &sp, None, None)?),
             None => None,
         };
@@ -1583,6 +1599,9 @@ fn worker(rx: mpsc::Receiver<WorkerCommand>, big: PathBuf, big_drafter: Option<P
                         for status in &statuses {
                             if status.target == "big" { status.fail_model_switch(switch.id, format!("model load failed: {e}"), false); }
                         }
+                    }
+                    WorkerCommand::ReloadConfig(reload) => {
+                        for status in &statuses { if status.target == "big" { status.fail_config_reload(reload.id, format!("model load failed: {e}")); } }
                     }
                 }
             }
@@ -1645,6 +1664,61 @@ fn worker(rx: mpsc::Receiver<WorkerCommand>, big: PathBuf, big_drafter: Option<P
                                     format!("model switch failed and rollback failed: {load_error}; {rollback_error}"), false);
                                 return;
                             }
+                        }
+                    }
+                }
+                continue;
+            }
+            WorkerCommand::ReloadConfig(reload) => {
+                let Some(status) = statuses.iter().find(|s| s.target == "big").cloned() else { continue; };
+                status.start_config_reload(reload.id);
+                let old_config = current_config.clone();
+                let old_big = big.clone();
+                let old_drafter = big_drafter.clone();
+                let old_small = small.clone();
+                let old_max_seq = max_seq;
+                let old_vision = vision.clone();
+                let new_vision = match (reload.config.mmproj.clone(), reload.config.mtmd_bridge.clone()) {
+                    (Some(mmproj), Some(bridge)) => Some(VisionConfig { mmproj, bridge, threads: reload.config.vision_threads,
+                        image_min_tokens: reload.config.vision_min_tokens, image_max_tokens: reload.config.vision_max_tokens,
+                        use_gpu: !reload.config.cpu_vision }),
+                    _ => None,
+                };
+                let load_one = |label: &str, path: &PathBuf, drafter: Option<&PathBuf>, vc: Option<&VisionConfig>, seq: usize| -> Result<ServerModel, String> {
+                    info!("loading {label:5} model {} ...", path.display());
+                    ServerModel::load(path, drafter, &cache, seq, vc)
+                };
+                drop(big_m.take());
+                drop(small_m.take());
+                let loaded = (|| {
+                    let b = load_one("big", &reload.config.big, reload.config.big_drafter.as_ref(), new_vision.as_ref(), reload.config.max_seq)?;
+                    let s = match reload.config.small.as_ref() { Some(p) => Some(load_one("small", p, None, None, reload.config.max_seq)?), None => None };
+                    Ok::<_, String>((b, s))
+                })();
+                match loaded {
+                    Ok((b, s)) => {
+                        let big_id = b.name().to_string();
+                        let small_id = s.as_ref().map(|m| m.name().to_string());
+                        big_m = Some(b); small_m = s;
+                        big = reload.config.big.clone(); big_drafter = reload.config.big_drafter.clone(); small = reload.config.small.clone();
+                        max_seq = reload.config.max_seq; vision = new_vision; current_config = reload.config.clone();
+                        if let Err(save_error) = current_config.persist() {
+                            status.fail_config_reload(reload.id, format!("engine reloaded but configuration could not be saved: {save_error}"));
+                        } else {
+                            status.finish_loading(api::ModelStatus { id: big_id, path: current_config.big.clone(), drafter: current_config.big_drafter.clone(), vision: current_config.mmproj.as_ref().zip(current_config.mtmd_bridge.as_ref()).map(|(projector, _)| api::VisionStatus { projector: projector.clone(), threads: current_config.vision_threads, min_tokens: current_config.vision_min_tokens, max_tokens: current_config.vision_max_tokens, device: if current_config.cpu_vision { "cpu" } else { "gpu" } }) });
+                            if let Some(id) = small_id { if let Some(small_status) = statuses.iter().find(|s| s.target == "small") { small_status.finish_loading(api::ModelStatus { id, path: current_config.small.clone().unwrap_or_default(), drafter: None, vision: None }); } }
+                            status.complete_config_reload(reload.id, current_config.clone());
+                            info!("dashboard configuration reload complete");
+                        }
+                    }
+                    Err(load_error) => {
+                        error!("configuration reload failed: {load_error}; attempting rollback");
+                        match (load_one("big", &old_big, old_drafter.as_ref(), old_vision.as_ref(), old_max_seq), old_small.as_ref().map(|p| load_one("small", p, None, None, old_max_seq)).transpose()) {
+                            (Ok(b), Ok(s)) => {
+                                big_m = Some(b); small_m = s; big = old_big; big_drafter = old_drafter; small = old_small; max_seq = old_max_seq; vision = old_vision; current_config = old_config;
+                                status.fail_config_reload(reload.id, format!("reload failed; previous engine restored: {load_error}"));
+                            }
+                            (Err(rb), _) | (_, Err(rb)) => { status.fail_config_reload(reload.id, format!("reload failed and rollback failed: {load_error}; {rb}")); return; }
                         }
                     }
                 }
@@ -2014,6 +2088,51 @@ fn handle_conn(mut stream: std::net::TcpStream, target: Target,
         let _ = http::write_response(&mut stream, 200, "OK", &body);
         return;
     }
+    if is_get && (path == "/api/config" || path == "/api/config/reload") {
+        let body = if path.ends_with("/reload") {
+            status.config_reload.lock().map(|r| serde_json::json!({"id":r.id,"state":r.state,"accepted_at_ms":r.accepted_at_ms,"completed_at_ms":r.completed_at_ms,"error":r.error}).to_string()).unwrap_or_else(|_| "null".into())
+        } else { status.config_json() };
+        let _ = http::write_response(&mut stream, 200, "OK", &body);
+        return;
+    }
+    if request.method.eq_ignore_ascii_case("PUT") && path == "/api/config" {
+        if request.headers.get("x-reinstinct-action").map(String::as_str) != Some("update-config") {
+            let body = error_body("configuration changes require X-ReInstinct-Action: update-config", "invalid_request_error");
+            let _ = http::write_response(&mut stream, 400, "Bad Request", &body);
+            return;
+        }
+        if target != Target::Big {
+            let body = error_body("configuration changes are available only on the big-model dashboard", "invalid_request_error");
+            let _ = http::write_response(&mut stream, 400, "Bad Request", &body);
+            return;
+        }
+        let update = match serde_json::from_str::<serde_json::Value>(&request.body) {
+            Ok(v) => v,
+            Err(e) => { let _ = http::write_response(&mut stream, 400, "Bad Request", &error_body(&format!("invalid configuration JSON: {e}"), "invalid_request_error")); return; }
+        };
+        let current = match status.config.lock() { Ok(c) => c.clone(), Err(_) => { let _ = http::write_response(&mut stream, 503, "Service Unavailable", &error_body("configuration state is unavailable", "server_error")); return; } };
+        let next = match current.apply_update(&update) {
+            Ok(v) => v,
+            Err(e) => { let _ = http::write_response(&mut stream, 400, "Bad Request", &error_body(&e, "invalid_request_error")); return; }
+        };
+        let restart = current.restart_required_fields(&next);
+        if !restart.is_empty() {
+            let _ = http::write_response(&mut stream, 409, "Conflict", &error_body(&format!("restart required for: {}", restart.join(", ")), "restart_required"));
+            return;
+        }
+        let reload_id = match status.queue_config_reload(&next) {
+            Ok(id) => id,
+            Err(e) => { let _ = http::write_response(&mut stream, 409, "Conflict", &error_body(&e, "config_reload_error")); return; }
+        };
+        if tx.send(WorkerCommand::ReloadConfig(ConfigReload { id: reload_id, config: next })).is_err() {
+            status.fail_config_reload(reload_id, "server worker is gone".into());
+            let _ = http::write_response(&mut stream, 503, "Service Unavailable", &error_body("server worker is gone", "server_error"));
+            return;
+        }
+        let body = serde_json::json!({"id":reload_id,"state":"queued","status_url":"/api/config/reload"}).to_string();
+        let _ = http::write_response(&mut stream, 202, "Accepted", &body);
+        return;
+    }
     if request.method.eq_ignore_ascii_case("POST") && path == "/api/models/switch" {
         if request.headers.get("x-reinstinct-action").map(String::as_str) != Some("switch-model") {
             let body = error_body("model switching requires X-ReInstinct-Action: switch-model", "invalid_request_error");
@@ -2289,15 +2408,31 @@ fn acceptor(port: u16, target: Target, tx: mpsc::Sender<WorkerCommand>,
 }
 
 /// Start the three-port multi-model server. Blocks forever.
-pub fn run(big: PathBuf, model_dir: Option<PathBuf>, big_drafter: Option<PathBuf>,
-           small: Option<PathBuf>, embed: Option<PathBuf>,
-           big_port: u16, small_port: u16, embed_port: u16, max_seq: usize,
-           mmproj: Option<PathBuf>, mtmd_bridge: Option<PathBuf>, vision_threads: i32,
-           vision_min_tokens: i32, vision_max_tokens: i32,
-           vision_use_gpu: bool)
+fn panic_detail(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() { (*message).to_string() }
+    else if let Some(message) = payload.downcast_ref::<String>() { message.clone() }
+    else { "unknown panic payload".into() }
+}
+
+pub fn run(overrides: config::ServeOverrides)
     -> Result<(), String>
 {
-    let model_dir = model_dir.unwrap_or_else(|| big.parent().unwrap_or(std::path::Path::new(".")).to_path_buf());
+    let effective = config::ServeConfig::from_overrides(overrides)?;
+    let big = effective.big.clone();
+    let model_dir = effective.model_dir.clone();
+    let big_drafter = effective.big_drafter.clone();
+    let small = effective.small.clone();
+    let embed = effective.embed.clone();
+    let big_port = effective.big_port;
+    let small_port = effective.small_port;
+    let embed_port = effective.embed_port;
+    let max_seq = effective.max_seq;
+    let vision_use_gpu = !effective.cpu_vision;
+    let mmproj = effective.mmproj.clone();
+    let mtmd_bridge = effective.mtmd_bridge.clone();
+    let vision_threads = effective.vision_threads;
+    let vision_min_tokens = effective.vision_min_tokens;
+    let vision_max_tokens = effective.vision_max_tokens;
     let vision = match (mmproj, mtmd_bridge) {
         (None, None) => None,
         (Some(mmproj), Some(bridge)) if vision_threads > 0 &&
@@ -2358,7 +2493,7 @@ pub fn run(big: PathBuf, model_dir: Option<PathBuf>, big_drafter: Option<PathBuf
     };
     let mk_status = |port, target: Target, model: &PathBuf, drafter: Option<PathBuf>,
                      vision: Option<&VisionConfig>| Arc::new(api::ApiStatus {
-        started_at: unix_now(), max_seq, target: target.label(), port,
+        started_at: unix_now(), max_seq: std::sync::Mutex::new(max_seq), target: target.label(), port,
         model: std::sync::Mutex::new(api::ModelStatus { id: stem(model), path: model.clone(), drafter,
         vision: vision.map(|v| api::VisionStatus {
             projector: v.mmproj.clone(), threads: v.threads,
@@ -2371,6 +2506,9 @@ pub fn run(big: PathBuf, model_dir: Option<PathBuf>, big_drafter: Option<PathBuf
         catalog: std::sync::Mutex::new(None),
         model_switch: std::sync::Mutex::new(api::ModelSwitchStatus::default()),
         next_switch_id: AtomicU64::new(0),
+        config: std::sync::Mutex::new(effective.clone()),
+        config_reload: std::sync::Mutex::new(api::ConfigReloadStatus::default()),
+        next_config_reload_id: AtomicU64::new(0),
         queued: AtomicU64::new(0), active_request: AtomicU64::new(0),
         history: std::sync::Mutex::new(api::RunHistory::new()),
     });
@@ -2393,13 +2531,27 @@ pub fn run(big: PathBuf, model_dir: Option<PathBuf>, big_drafter: Option<PathBuf
         ]
     };
 
-    let statuses = acceptors.iter().map(|(_, _, s)| Arc::clone(s)).collect();
+    let statuses: Vec<Arc<api::ApiStatus>> = acceptors.iter().map(|(_, _, s)| Arc::clone(s)).collect();
     let worker_handle = {
-        let (big, big_drafter, small, vision) =
-            (big.clone(), big_drafter.clone(), small.clone(), vision.clone());
         let metrics = Arc::clone(&metrics);
         thread::Builder::new().name("gpu-worker".into())
-            .spawn(move || worker(rx, big, big_drafter, small, max_seq, vision, metrics, statuses))
+            .spawn(move || {
+                let statuses_for_panic = statuses.clone();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    worker(rx, effective, metrics, statuses_for_panic.clone())
+                }));
+                if let Err(payload) = result {
+                    let detail = panic_detail(payload);
+                    error!("GPU worker panicked during startup or service: {detail}");
+                    for status in &statuses_for_panic {
+                        status.set_phase("error", Some(format!("GPU worker panic: {detail}")));
+                    }
+                    // Keep the process and dashboard alive so the operator
+                    // can read the failure and restart through the service
+                    // manager after correcting the cause.
+                    loop { thread::park(); }
+                }
+            })
             .map_err(|e| e.to_string())?
     };
 

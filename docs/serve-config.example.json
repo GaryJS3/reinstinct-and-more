@@ -1,0 +1,17 @@
+{
+  "big": "/models/qwen3.6-35b/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+  "model_dir": "/models/qwen3.6-35b",
+  "big_drafter": null,
+  "small": null,
+  "embed": null,
+  "big_port": 8006,
+  "small_port": 8081,
+  "embed_port": 8082,
+  "max_seq": 32000,
+  "mmproj": "/models/qwen3.6-35b/mmproj-F32.gguf",
+  "mtmd_bridge": "/opt/reinstinct/libreinstinct_mtmd.so",
+  "vision_threads": 8,
+  "vision_min_tokens": -1,
+  "vision_max_tokens": -1,
+  "cpu_vision": false
+}

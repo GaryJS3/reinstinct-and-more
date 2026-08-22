@@ -146,6 +146,7 @@ sealed class ContractSuite
         {
             ("status page and OpenAPI", StatusAndOpenApiAsync),
             ("operations telemetry and model catalog", OperationsAsync),
+            ("configuration discovery and guard", ConfigurationAsync),
             ("health", HealthAsync),
             ("readiness", ReadinessAsync),
             ("model discovery", ModelsAsync),
@@ -198,6 +199,7 @@ sealed class ContractSuite
             Check(html.Contains("Recent runs", StringComparison.Ordinal), "run history table missing");
             Check(html.Contains("Engine logs", StringComparison.Ordinal), "engine log panel missing");
             Check(html.Contains("Model catalog", StringComparison.Ordinal), "model catalog panel missing");
+            Check(html.Contains("Engine startup failure", StringComparison.Ordinal), "startup error panel missing");
         }
 
         using (var status = await _client.SendJsonAsync(HttpMethod.Get, "api/status", null))
@@ -281,6 +283,24 @@ sealed class ContractSuite
             new { path = "/outside/catalog/not-a-model.gguf" }, actionHeader: "switch-model");
         Check(invalidPath.StatusCode == HttpStatusCode.BadRequest,
             $"out-of-catalog switch expected 400, got {(int)invalidPath.StatusCode}");
+    }
+
+    private async Task ConfigurationAsync()
+    {
+        using (var response = await _client.SendJsonAsync(HttpMethod.Get, "api/config", null))
+        using (var document = await ReadJsonAsync(response, HttpStatusCode.OK))
+        {
+            var root = document.RootElement;
+            Check(root.TryGetProperty("effective", out var effective) && effective.ValueKind == JsonValueKind.Object,
+                "configuration effective object missing");
+            Check(root.TryGetProperty("reload", out var reload) && reload.ValueKind == JsonValueKind.Object,
+                "configuration reload state missing");
+        }
+
+        using var missingHeader = await _client.SendJsonAsync(HttpMethod.Put, "api/config",
+            new { max_seq = 4096 });
+        Check(missingHeader.StatusCode == HttpStatusCode.BadRequest,
+            $"missing-action config update expected 400, got {(int)missingHeader.StatusCode}");
     }
 
     private async Task HealthAsync()

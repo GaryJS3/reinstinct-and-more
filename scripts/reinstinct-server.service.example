@@ -1,0 +1,17 @@
+[Unit]
+Description=ReInstinct inference server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ai
+WorkingDirectory=/opt/reinstinct
+ExecStart=/opt/reinstinct/reinstinct-engine serve --config /etc/reinstinct/server.json
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=info
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target

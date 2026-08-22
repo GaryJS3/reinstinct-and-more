@@ -211,9 +211,12 @@ enum Command {
     /// Run a multi-model HTTP server: Big LLM, Small LLM, and Embedder,
     /// each on its own port, requests served in order through one GPU.
     Serve {
+        /// Optional JSON configuration file. Explicit CLI values override it.
+        #[arg(long)]
+        config: Option<PathBuf>,
         /// Big model GGUF (~30B dense — Qwen 3.x or Gemma 4 31B).
         #[arg(long)]
-        big: PathBuf,
+        big: Option<PathBuf>,
         /// Root directory recursively scanned by the dashboard model catalog.
         #[arg(long)]
         model_dir: Option<PathBuf>,
@@ -232,15 +235,15 @@ enum Command {
         /// port answers 503 until the encoder runtime lands.
         #[arg(long)]
         embed: Option<PathBuf>,
-        #[arg(long, default_value_t = 8080)]
-        big_port: u16,
-        #[arg(long, default_value_t = 8081)]
-        small_port: u16,
-        #[arg(long, default_value_t = 8082)]
-        embed_port: u16,
+        #[arg(long, help = "Big-model port (default: 8080)")]
+        big_port: Option<u16>,
+        #[arg(long, help = "Small-model port (default: 8081)")]
+        small_port: Option<u16>,
+        #[arg(long, help = "Embedder port (default: 8082)")]
+        embed_port: Option<u16>,
         /// Context window (prompt + generated tokens) per request.
-        #[arg(long, default_value_t = 4096)]
-        max_seq: usize,
+        #[arg(long, help = "Context window (default: 4096)")]
+        max_seq: Option<usize>,
         /// Qwen vision projector GGUF. Requires --mtmd-bridge; enables one
         /// local `data:image/jpeg|png;base64,...` input per chat request.
         #[arg(long)]
@@ -248,14 +251,14 @@ enum Command {
         /// Path to the optional Furnace/libmtmd bridge for server vision.
         #[arg(long)]
         mtmd_bridge: Option<PathBuf>,
-        #[arg(long, default_value_t = 8)]
-        vision_threads: i32,
+        #[arg(long, help = "Vision worker threads (default: 8)")]
+        vision_threads: Option<i32>,
         /// Dynamic-resolution image token minimum; -1 uses projector metadata.
-        #[arg(long, default_value_t = -1)]
-        vision_min_tokens: i32,
+        #[arg(long)]
+        vision_min_tokens: Option<i32>,
         /// Dynamic-resolution image token maximum; -1 uses projector metadata.
-        #[arg(long, default_value_t = -1)]
-        vision_max_tokens: i32,
+        #[arg(long)]
+        vision_max_tokens: Option<i32>,
         /// Run the mtmd vision encoder on CPU instead of the HIP device.
         #[arg(long)]
         cpu_vision: bool,
@@ -400,12 +403,14 @@ fn main() -> anyhow::Result<()> {
         Command::Bench { path, iters, token } => bench(&path, iters, token),
         Command::HipInfo { mb, iters } => hip_info(mb, iters),
         Command::GpuBench { path, iters, token } => gpu_bench(&path, iters, token),
-        Command::Serve { big, model_dir, big_drafter, small, embed,
+        Command::Serve { config, big, model_dir, big_drafter, small, embed,
                          big_port, small_port, embed_port, max_seq,
                          mmproj, mtmd_bridge, vision_threads, vision_min_tokens, vision_max_tokens, cpu_vision } =>
-            reinstinct_engine::serve::run(big, model_dir, big_drafter, small, embed,
+            reinstinct_engine::serve::run(reinstinct_engine::serve::config::ServeOverrides {
+                                          config, big, model_dir, big_drafter, small, embed,
                                           big_port, small_port, embed_port, max_seq,
-                                          mmproj, mtmd_bridge, vision_threads, vision_min_tokens, vision_max_tokens, !cpu_vision)
+                                          mmproj, mtmd_bridge, vision_threads, vision_min_tokens,
+                                          vision_max_tokens, cpu_vision })
                 .map_err(anyhow::Error::msg),
         Command::GenerateText { path, prompt, system, user, tokens, steps,
                                 temperature, top_k, seed, gpu } =>

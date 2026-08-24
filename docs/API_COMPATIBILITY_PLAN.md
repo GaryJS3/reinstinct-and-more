@@ -70,7 +70,10 @@ disturbing the running engine; **Reload** explicitly applies saved engine
 settings while idle. Port edits are saved but reported as requiring a service
 restart. If startup or the GPU worker fails, the listener stays available
 and the dashboard shows the error and recent engine logs, so first diagnosis
-does not require host-shell access.
+does not require host-shell access. A startup HIP no-device error is treated as
+a transient VM/device-discovery race: status reports `waiting_for_gpu`, queued
+requests receive 503, and model startup retries every 10 seconds. Other startup
+errors remain terminal.
 
 On 2026-08-21 the deployment was rebuilt with incremental UTF-8 output
 assembly. The exact Paperless-AI custom-provider validation request (`Test`,

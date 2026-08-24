@@ -19,6 +19,18 @@ The fork concentrates on practical multimodal serving and operating an MI50 as a
 
 This is not intended to replace upstream or to promise broad model or hardware compatibility. Upstream changes should be brought in deliberately and tested against the fork's multimodal and service behavior.
 
+## MI50 performance snapshot
+
+The MI50 was tested with the automatic GPU performance policy. The active ReInstinct service was restored afterward on its normal port (`8006`), with automatic performance policy confirmed.
+
+| Engine | Prefill | Decode |
+| --- | ---: | ---: |
+| Original ReInstinct | ~770 tok/s | 77.6 tok/s |
+| Our deployed ReInstinct fork | ~785 tok/s | 77.9 tok/s |
+| Furnace | 633.9 tok/s | 57.7 tok/s |
+
+In this comparison, the deployed fork was approximately 24% faster than Furnace in prefill and 35% faster in decode. It was only approximately 2% faster than the original ReInstinct build in prefill and effectively tied in decode. Furnace used three repetitions; the direct ReInstinct figures were warm single-run checks, so the small difference between the two ReInstinct builds is approximate rather than statistically significant. See [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) for the broader matched performance ledger.
+
 ## Operations dashboard
 
 The fork includes an embedded operations console for watching a live MI50 service. These screenshots are representative examples from the Qwen3.6 deployment:

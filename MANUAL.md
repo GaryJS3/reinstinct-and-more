@@ -558,13 +558,15 @@ monitoring began, the guard fails closed after five failed samples. No suitable
 startup sensor leaves inference available but exposes `unavailable` in status
 and the dashboard.
 
-If model, HIP device, or engine initialization fails, the listeners remain
-available and the dashboard changes to an **Engine startup failure** view. It
-shows the reported error directly and retains the detailed trace in the
-Engine logs panel, so the host shell is not required for the first diagnosis.
-An unexpected GPU-worker panic is converted into the same persistent error
-state while the HTTP dashboard remains alive; restart the service after
-correcting the cause.
+If HIP reports that no ROCm-capable device exists during startup, the listeners
+remain available, the dashboard reports `waiting_for_gpu`, and model startup is
+retried every 10 seconds. Requests receive 503 while waiting. This covers VM
+boot races where systemd starts the service before AMDGPU/KFD finishes device
+registration. Other model or engine initialization failures remain terminal
+and appear as an **Engine startup failure**, since retrying a missing model or
+VRAM exhaustion would hide an operator-actionable fault. An unexpected
+GPU-worker panic is converted into the same persistent error state while the
+HTTP dashboard remains alive; restart the service after correcting the cause.
 
 #### JSON server configuration
 

@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use json::Json;
 use serde_json::Value;
@@ -1573,6 +1573,65 @@ impl ServerModel {
 
 // --- the GPU worker ----------------------------------------------------
 
+const GPU_DISCOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+
+fn gpu_device_unavailable(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("no rocm-capable device")
+        || error.contains("hiperrornodevice")
+        || (error.contains("hipsetdevice") && error.contains("code 100"))
+}
+
+fn reject_startup_command(command: WorkerCommand, statuses: &[Arc<api::ApiStatus>], error: &str) {
+    match command {
+        WorkerCommand::Generate(job) => { let _ = job.reply.send(StreamMsg::Done(HttpReply {
+            status: 503, status_text: "Service Unavailable",
+            body: error_body(&format!("model load failed: {error}"), "server_error"),
+        })); }
+        WorkerCommand::Switch(switch) => {
+            for status in statuses {
+                if status.target == "big" { status.fail_model_switch(switch.id, format!("model load failed: {error}"), false); }
+            }
+        }
+        WorkerCommand::ReloadConfig(reload) => {
+            for status in statuses {
+                if status.target == "big" { status.fail_config_reload(reload.id, format!("model load failed: {error}")); }
+            }
+        }
+    }
+}
+
+fn wait_for_gpu_retry(rx: &mpsc::Receiver<WorkerCommand>, statuses: &[Arc<api::ApiStatus>], error: &str) -> bool {
+    let deadline = Instant::now() + GPU_DISCOVERY_RETRY_INTERVAL;
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else { return true; };
+        match rx.recv_timeout(remaining) {
+            Ok(command) => reject_startup_command(command, statuses, error),
+            Err(mpsc::RecvTimeoutError::Timeout) => return true,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod gpu_startup_recovery_tests {
+    use super::gpu_device_unavailable;
+
+    #[test]
+    fn recognizes_hip_no_device_errors() {
+        assert!(gpu_device_unavailable(
+            "hipSetDevice: no ROCm-capable device is detected (code 100)"));
+        assert!(gpu_device_unavailable("HIPErrorNoDevice while initializing runtime"));
+    }
+
+    #[test]
+    fn does_not_retry_permanent_model_load_errors() {
+        assert!(!gpu_device_unavailable("big model: file not found"));
+        assert!(!gpu_device_unavailable("hipMalloc: out of memory (code 2)"));
+        assert!(!gpu_device_unavailable("hipSetDevice: invalid device ordinal (code 101)"));
+    }
+}
+
 fn worker(rx: mpsc::Receiver<WorkerCommand>, mut current_config: config::ServeConfig, metrics: Arc<Metrics>,
           statuses: Vec<Arc<api::ApiStatus>>)
 {
@@ -1589,40 +1648,62 @@ fn worker(rx: mpsc::Receiver<WorkerCommand>, mut current_config: config::ServeCo
     for status in &statuses {
         if status.target != "embed" { status.begin_loading(if status.target == "big" { &big } else { small.as_ref().unwrap_or(&big) }); }
     }
-    let setup = (|| -> Result<(KernelCache, ServerModel, Option<ServerModel>), String> {
-        crate::hip::Device::set(0)?;
-        let cache = KernelCache::new()?;
-        let load = |label: &str, path: &PathBuf, drafter: Option<&PathBuf>, vision_config: Option<&VisionConfig>|
-            -> Result<ServerModel, String>
-        {
-            info!("loading {label:5} model {} ...", path.display());
-            let t = std::time::Instant::now();
-            let m = ServerModel::load(path, drafter, &cache, max_seq, vision_config)
-                .map_err(|e| {
-                    // VRAM-exhaustion → add a hint about model size vs VRAM.
-                    if e.to_lowercase().contains("memory") {
-                        let sz = std::fs::metadata(path).ok().map(|m| m.len()).unwrap_or(0);
-                        format!("{label} model: {e}\n\
-                                 [hint] model file is {:.1} GB on disk; \
-                                 with KV cache for max_seq={max_seq} the GPU needs roughly \
-                                 1.2-1.5× that. Check `rocm-smi --showmeminfo vram` \
-                                 against your model's expected resident size, or lower \
-                                 max_seq with --max-seq.",
-                                 sz as f64 / (1024.0 * 1024.0 * 1024.0))
-                    } else {
-                        format!("{label} model: {e}")
+    let setup = loop {
+        let attempt = (|| -> Result<(KernelCache, ServerModel, Option<ServerModel>), String> {
+            crate::hip::Device::set(0)?;
+            let cache = KernelCache::new()?;
+            let load = |label: &str, path: &PathBuf, drafter: Option<&PathBuf>, vision_config: Option<&VisionConfig>|
+                -> Result<ServerModel, String>
+            {
+                info!("loading {label:5} model {} ...", path.display());
+                let t = std::time::Instant::now();
+                let m = ServerModel::load(path, drafter, &cache, max_seq, vision_config)
+                    .map_err(|e| {
+                        // VRAM-exhaustion → add a hint about model size vs VRAM.
+                        if e.to_lowercase().contains("memory") {
+                            let sz = std::fs::metadata(path).ok().map(|m| m.len()).unwrap_or(0);
+                            format!("{label} model: {e}\n\
+                                     [hint] model file is {:.1} GB on disk; \
+                                     with KV cache for max_seq={max_seq} the GPU needs roughly \
+                                     1.2-1.5× that. Check `rocm-smi --showmeminfo vram` \
+                                     against your model's expected resident size, or lower \
+                                     max_seq with --max-seq.",
+                                     sz as f64 / (1024.0 * 1024.0 * 1024.0))
+                        } else {
+                            format!("{label} model: {e}")
+                        }
+                    })?;
+                info!("  loaded {} in {:.1}s", m.name(), t.elapsed().as_secs_f32());
+                Ok(m)
+            };
+            let big_m   = load("big",   &big,   big_drafter.as_ref(), vision.as_ref())?;
+            let small_m = match small.clone() {
+                Some(sp) => Some(load("small", &sp, None, None)?),
+                None => None,
+            };
+            Ok((cache, big_m, small_m))
+        })();
+        match attempt {
+            Ok(loaded) => break Ok(loaded),
+            Err(e) if gpu_device_unavailable(&e) => {
+                warn!("GPU is not available yet: {e}; retrying model startup in {} seconds",
+                    GPU_DISCOVERY_RETRY_INTERVAL.as_secs());
+                for status in &statuses {
+                    if status.target != "embed" {
+                        status.set_phase("waiting_for_gpu", Some(format!(
+                            "{e}; retrying in {} seconds", GPU_DISCOVERY_RETRY_INTERVAL.as_secs())));
                     }
-                })?;
-            info!("  loaded {} in {:.1}s", m.name(), t.elapsed().as_secs_f32());
-            Ok(m)
-        };
-        let big_m   = load("big",   &big,   big_drafter.as_ref(), vision.as_ref())?;
-        let small_m = match small.clone() {
-            Some(sp) => Some(load("small", &sp, None, None)?),
-            None => None,
-        };
-        Ok((cache, big_m, small_m))
-    })();
+                }
+                if !wait_for_gpu_retry(&rx, &statuses, &e) { return; }
+                for status in &statuses {
+                    if status.target != "embed" {
+                        status.begin_loading(if status.target == "big" { &big } else { small.as_ref().unwrap_or(&big) });
+                    }
+                }
+            }
+            Err(e) => break Err(e),
+        }
+    };
 
     let (cache, big_loaded, mut small_m) = match setup {
         Ok(v) => v,
@@ -1631,20 +1712,7 @@ fn worker(rx: mpsc::Receiver<WorkerCommand>, mut current_config: config::ServeCo
             for status in &statuses { status.set_phase("error", Some(e.clone())); }
             // Drain the queue with 503s so clients don't hang forever.
             for command in rx {
-                match command {
-                    WorkerCommand::Generate(job) => { let _ = job.reply.send(StreamMsg::Done(HttpReply {
-                        status: 503, status_text: "Service Unavailable",
-                        body: error_body(&format!("model load failed: {e}"), "server_error"),
-                    })); }
-                    WorkerCommand::Switch(switch) => {
-                        for status in &statuses {
-                            if status.target == "big" { status.fail_model_switch(switch.id, format!("model load failed: {e}"), false); }
-                        }
-                    }
-                    WorkerCommand::ReloadConfig(reload) => {
-                        for status in &statuses { if status.target == "big" { status.fail_config_reload(reload.id, format!("model load failed: {e}")); } }
-                    }
-                }
+                reject_startup_command(command, &statuses, &e);
             }
             return;
         }

@@ -32,9 +32,18 @@ when a client-specific compatibility claim is needed.
 
 The user-approved ReInstinct service is active on `ai@10.0.0.41` as
 `reinstinct-server.service`, enabled at boot on port `8006`. It runs from the
-isolated checkout `/home/ai/inference-bench/reinstinct-service-20260822` and
+isolated checkout `/home/ai/inference-bench/reinstinct-service-20260822-9b0524d` and
 loads `/etc/reinstinct/server.json` by default. Furnace remains a separate
-enabled-but-inactive unit on port `8000`; it was not restarted or modified.
+disabled/inactive unit on port `8000` so it cannot race ReInstinct for the GPU
+after a VM reboot.
+
+The 2026-08-24 deployment of commit `70886e2` adds automatic recovery from the
+observed VM boot race: HIP no-device startup failures report
+`waiting_for_gpu` and retry every 10 seconds. Furnace was disabled and stopped,
+the release binary was rebuilt in the exact systemd checkout, and only
+`reinstinct-server.service` was restarted. `/readyz` reached HTTP 200 after
+normal model loading, a live chat request returned HTTP 200, and the full C#
+HTTP contract suite passed all 20 checks.
 
 The unit mirrors the applicable Furnace settings: the same Qwen3.6-35B-A3B
 UD-Q4_K_XL model and F32 projector, a 32,000-token context, GPU vision, eight

@@ -6,7 +6,7 @@ The current deployed service includes separate configuration Save/Reload
 actions, PCI-keyed GPU telemetry, and the thermal interlock. It runs on
 `ai@10.0.0.41:8006` as the enabled `reinstinct-server.service`, from the
 isolated checkout
-`/home/ai/inference-bench/reinstinct-service-20260822-aaf38b2`.
+`/home/ai/inference-bench/reinstinct-service-20260822-9b0524d`.
 
 - Default service configuration: `/etc/reinstinct/server.json`.
 - Unit rollback copy: `/etc/systemd/system/reinstinct-server.service.bak-20260822`.
@@ -18,11 +18,13 @@ isolated checkout
   require a service restart and are surfaced separately. Startup and GPU-worker
   failures remain visible in the dashboard and engine-log panel while the HTTP
   listener stays available.
-- Furnace remains enabled but inactive and was not restarted or modified.
+- Furnace is disabled and inactive so it cannot claim the GPU during a VM
+  reboot. ReInstinct commit `70886e2` retries HIP no-device startup failures
+  every 10 seconds while reporting `waiting_for_gpu` through the dashboard.
 
-The deployed checks passed after restart: `/readyz` returned `200 ready`, the
-20-check C# HTTP contract suite passed, repeated dashboard samples retained
-thermal labels and consistent error counts, and Furnace remained inactive.
+The 2026-08-24 deployed checks passed after restart: `/readyz` returned `200
+ready`, a live chat request returned HTTP 200, and the 20-check C# HTTP
+contract suite passed with Furnace disabled/inactive.
 The local worktree still contains unrelated `Cargo.toml`, `images/`, and
 `media/` changes; keep them out of service/docs commits.
 

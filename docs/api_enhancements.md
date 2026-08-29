@@ -105,12 +105,15 @@ subset that has actually passed its compatibility gates.
 - [x] Expose categorized HIP VRAM sections (model weights, reserved context,
   runtime, scratch, vision, and residual) plus separate context positions used
   versus reserved capacity in `/api/status` and the operations dashboard.
+- [x] Surface current-process DRM GTT residency in `/api/status` and warn in
+  the dashboard when GPU-accessible system RAM is active, including its size
+  and the driver's per-category attribution limitation.
 
 ### Completions
 
 - [x] `POST /v1/completions` raw text, non-streaming and SSE.
 - [x] `POST /v1/chat/completions` text chat with server-side templates.
-- [x] Chat roles: `system`, `user`, and `assistant`.
+- [x] Chat roles: `system`, `developer`, `user`, `assistant`, and `tool`.
 - [x] Non-streaming `chat.completion` response with usage.
 - [x] SSE `chat.completion.chunk`, initial assistant role, content deltas,
   finish reason, optional usage chunk, and `data: [DONE]`.
@@ -120,12 +123,17 @@ subset that has actually passed its compatibility gates.
 - [~] Common request fields are now classified for the first compatibility
   slice: `max_completion_tokens`, up to four `stop` strings, and `n=1` are
   implemented; `user`, `metadata`, and bearer auth are accepted/ignored;
-  tools, functions, `parallel_tool_calls`, and `response_format` are rejected
-  explicitly until their work packages land. The full field matrix remains.
-- [ ] Function/tool calling.
+  modern function tools and `parallel_tool_calls` are implemented for the
+  Qwen 3.5/3.6 chat path; legacy functions and `response_format` remain
+  explicitly rejected. The full field matrix remains.
+- [~] Function/tool calling: request parsing, Qwen tool prompting, Qwen XML
+  output parsing, non-streaming `tool_calls`, and OpenAI-shaped SSE deltas are
+  implemented; live Opencode acceptance and long-prompt/multi-round coverage
+  remain.
 - [ ] Enforced structured JSON output.
 - [x] Stop sequences, `n`, `user`, and `metadata` now have explicit behavior;
-  `n>1` and tool/structured-output fields return stable 400 errors.
+  `n>1`, legacy function fields, and structured-output fields return stable
+  400 errors.
 - [ ] `service_tier` and other commonly emitted SDK fields still need an
   explicit behavior matrix.
 
@@ -148,7 +156,7 @@ subset that has actually passed its compatibility gates.
 | Paperless-ngx RAG | Embeddings plus Chat Completions | deterministic fixed-width vectors, batch input, correct model/dimensions | Blocked: embeddings returns 503 |
 | paperless-gpt metadata | Chat Completions | generic `OPENAI_BASE_URL`, reliable JSON, longer documents | Partial |
 | paperless-gpt OCR/vision | Chat Completions image input | base64 image content, JSON result, predictable error behavior | Partial: one JPEG/PNG works; real client gate missing |
-| Home Assistant Local OpenAI LLM | Streaming Chat Completions and tools | `tools`, `tool_choice`, multi-round tool results, streamed `tool_calls`, long contexts | Missing tool calling |
+| Home Assistant Local OpenAI LLM | Streaming Chat Completions and tools | `tools`, `tool_choice`, multi-round tool results, streamed `tool_calls`, long contexts | Qwen protocol implemented; live integration pending |
 | Extended OpenAI Conversation | Chat Completions functions/tools | legacy `functions`/`function_call` may be sent | Missing |
 | SparkyFitness | Chat Completions, likely JSON | exact source fixtures still required | Discovery incomplete |
 | OpenAI SDK smoke | Models and Chat Completions | auth header tolerated, sync/async, stream parsing, error decoding | Not yet run |
@@ -241,23 +249,25 @@ supported schema; no post-hoc repair is needed.
 infrastructure with WP2. **Primary files:** new `src/serve/tools.rs`, chat
 template code, sampling/decode integration, and response shapers.
 
-- [ ] Parse modern `tools: [{"type":"function","function":...}]`.
-- [ ] Parse `tool_choice` values `none`, `auto`, `required`, and named function.
-- [ ] Parse `parallel_tool_calls`; initially support false or a single call and
-  return a clear compatibility error when multiple calls are requested.
-- [ ] Accept assistant messages containing `tool_calls` and subsequent
-  `role: "tool"` messages with `tool_call_id`.
+- [x] Parse modern `tools: [{"type":"function","function":...}]` for the
+  Qwen 3.5/3.6 serve path, including bounded schemas and duplicate-name
+  validation.
+- [x] Parse `tool_choice` values `none`, `auto`, `required`, and named function.
+- [x] Parse `parallel_tool_calls`; reject more than one model-emitted call when
+  the client explicitly disables parallel calls.
+- [x] Accept assistant messages containing `tool_calls` and subsequent
+  `role: "tool"` messages with `tool_call_id`, validating call-ID linkage.
 - [ ] Add legacy `functions` and `function_call` translation if WP0 shows an
   active target still uses them.
-- [ ] Extend chat templates with the model-family-specific tool definitions and
+- [x] Extend the Qwen 3.5/3.6 chat template with model-family-specific tool definitions and
   tool-result turns. Do not inject a generic format without testing the Qwen
   and Gemma templates/models.
-- [ ] Parse or constrain model output into OpenAI tool calls with stable IDs,
+- [x] Parse Qwen XML model output into OpenAI tool calls with stable IDs,
   names, and JSON argument strings.
-- [ ] Non-streaming responses must use `finish_reason: "tool_calls"` and
+- [x] Non-streaming responses use `finish_reason: "tool_calls"` and
   `message.tool_calls` with `content: null` when appropriate.
-- [ ] Streaming must emit `delta.tool_calls[index].{index,id,type,function}` and
-  incremental `function.arguments`, followed by `finish_reason: "tool_calls"`.
+- [x] Streaming emits `delta.tool_calls[index].{index,id,type,function}` and
+  a valid `function.arguments` delta, followed by `finish_reason: "tool_calls"`.
 - [ ] Preserve the worker across the multi-round sequence; the client remains
   responsible for executing tools and sending results back.
 - [ ] Add Home Assistant-shaped fixtures with many entity tools and long system

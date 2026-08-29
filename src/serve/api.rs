@@ -783,6 +783,7 @@ fn gpu_json(inventory: &GpuInventory, thermal: &ThermalGuard,
                 let capacity = context_capacity_tokens as u64;
                 let used_tokens = context_used_tokens.min(capacity);
                 let reserved = tracked.context_bytes;
+                let system_memory = super::gpu::process_drm_memory_json();
                 json!({
                     "free_bytes":free,"used_bytes":used,"total_bytes":total,
                     "tracked_bytes":tracked_bytes,
@@ -802,7 +803,8 @@ fn gpu_json(inventory: &GpuInventory, thermal: &ThermalGuard,
                         "utilization_fraction": if capacity > 0 { used_tokens as f64 / capacity as f64 } else { 0.0 },
                         "reserved_bytes": reserved,
                         "used_equivalent_bytes": if capacity > 0 { reserved.saturating_mul(used_tokens) / capacity } else { 0 }
-                    }
+                    },
+                    "system_memory": system_memory
                 })
             });
             let architecture = std::env::var("REINSTINCT_OFFLOAD_ARCH")
@@ -836,11 +838,13 @@ pub fn openapi_json() -> String {
         "/v1/models":{"get":{"summary":"List models","responses":{"200":{"description":"Models available on this port","content":{"application/json":{}}}}}},
         "/v1/models/{model}":{"get":{"summary":"Retrieve a model","parameters":[{"name":"model","in":"path","required":true,"schema":{"type":"string"}}],"responses":{"200":{"description":"Selected model","content":{"application/json":{}}},"404":{"description":"Model not found","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}}},
         "/v1/completions":{"post":{"summary":"Create a text completion","requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/CompletionRequest"}}}},"responses":response_set()}},
-        "/v1/chat/completions":{"post":{"summary":"Create a chat completion","description":"Text plus one JPEG/PNG data-URL image in user content.","requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/ChatCompletionRequest"}}}},"responses":response_set()}}
+        "/v1/chat/completions":{"post":{"summary":"Create a chat completion","description":"Text, function tools, and one JPEG/PNG data-URL image in user content.","requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/ChatCompletionRequest"}}}},"responses":response_set()}}
       },"components":{"schemas":{
         "CompletionRequest":{"type":"object","required":["prompt"],"properties":common_request(json!({"prompt":{"type":"string"}}))},
-        "ChatCompletionRequest":{"type":"object","required":["messages"],"properties":common_request(json!({"messages":{"type":"array","minItems":1,"items":{"$ref":"#/components/schemas/ChatMessage"}}}))},
-        "ChatMessage":{"type":"object","required":["role","content"],"properties":{"role":{"type":"string","enum":["system","user","assistant"]},"content":{"oneOf":[{"type":"string"},{"type":"array","items":{"oneOf":[{"$ref":"#/components/schemas/TextPart"},{"$ref":"#/components/schemas/ImagePart"}]}}]}}},
+        "ChatCompletionRequest":{"type":"object","required":["messages"],"properties":chat_request(json!({"messages":{"type":"array","minItems":1,"items":{"$ref":"#/components/schemas/ChatMessage"}}}))},
+        "ChatMessage":{"type":"object","required":["role"],"properties":{"role":{"type":"string","enum":["system","developer","user","assistant","tool"]},"content":{"oneOf":[{"type":"string"},{"type":"null"},{"type":"array","items":{"oneOf":[{"$ref":"#/components/schemas/TextPart"},{"$ref":"#/components/schemas/ImagePart"}]}}]},"tool_calls":{"type":"array","items":{"$ref":"#/components/schemas/AssistantToolCall"}},"tool_call_id":{"type":"string"}}},
+        "FunctionTool":{"type":"object","required":["type","function"],"properties":{"type":{"const":"function"},"function":{"type":"object","required":["name"],"properties":{"name":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$"},"description":{"type":"string"},"parameters":{"type":"object"},"strict":{"type":"boolean"}}}}},
+        "AssistantToolCall":{"type":"object","required":["id","type","function"],"properties":{"id":{"type":"string"},"type":{"const":"function"},"function":{"type":"object","required":["name","arguments"],"properties":{"name":{"type":"string"},"arguments":{"type":"string"}}}}},
         "TextPart":{"type":"object","required":["type","text"],"properties":{"type":{"const":"text"},"text":{"type":"string"}}},
         "ImagePart":{"type":"object","required":["type","image_url"],"properties":{"type":{"const":"image_url"},"image_url":{"type":"object","required":["url"],"properties":{"url":{"type":"string","pattern":"^data:image/(jpeg|png);base64,"}}}}},
         "ServerStatus":{"type":"object","additionalProperties":true},
@@ -908,6 +912,18 @@ fn common_request(mut v: Value) -> Value {
             json!({"type":"number","minimum":0.1,"maximum":600}),
         ),
     ]));
+    v
+}
+
+fn chat_request(mut v: Value) -> Value {
+    v = common_request(v);
+    if let Value::Object(ref mut m) = v {
+        m.extend(serde_json::Map::from_iter([
+            ("tools".into(), json!({"type":"array","items":{"$ref":"#/components/schemas/FunctionTool"}})),
+            ("tool_choice".into(), json!({"oneOf":[{"type":"string","enum":["none","auto","required"]},{"type":"object"}]})),
+            ("parallel_tool_calls".into(), json!({"type":"boolean","default":true})),
+        ]));
+    }
     v
 }
 fn response_set() -> Value {
@@ -997,13 +1013,13 @@ pub fn dashboard_html() -> String {
     let mut html = INDEX_HTML_V3.replace(
         "</style></head>",
         r#"<style>
-  .power-control{flex:1 1 390px;min-width:280px;display:grid;grid-template-columns:1fr auto;gap:6px 12px;align-items:center}.power-control label{color:var(--muted);font-size:10px;letter-spacing:.1em;text-transform:uppercase}.power-control output{font:18px Bahnschrift,sans-serif;color:var(--lime);white-space:nowrap}.power-control input[type=range]{grid-column:1/-1;width:100%;min-width:220px;accent-color:var(--lime);cursor:pointer}.power-control input[type=range]:disabled{cursor:not-allowed;opacity:.4}.power-meta{grid-column:1/-1;display:flex;justify-content:space-between;gap:12px;color:var(--muted);font-size:10px}.power-meta strong{color:var(--ink);font-weight:400}
+  .power-control{flex:1 1 390px;min-width:280px;display:grid;grid-template-columns:1fr auto;gap:6px 12px;align-items:center}.power-control label{color:var(--muted);font-size:10px;letter-spacing:.1em;text-transform:uppercase}.power-control output{font:18px Bahnschrift,sans-serif;color:var(--lime);white-space:nowrap}.power-control input[type=range]{grid-column:1/-1;width:100%;min-width:220px;accent-color:var(--lime);cursor:pointer}.power-control input[type=range]:disabled{cursor:not-allowed;opacity:.4}.power-meta{grid-column:1/-1;display:flex;justify-content:space-between;gap:12px;color:var(--muted);font-size:10px}.power-meta strong{color:var(--ink);font-weight:400}.tuning-control{display:flex;align-items:center;gap:7px;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.08em}.tuning-control select{margin-left:2px}.control-help{flex:1 1 100%;display:grid;gap:4px;color:var(--muted);font-size:10px;line-height:1.45}.control-help b{color:var(--ink);font-weight:600}.mutation-result{flex:1 1 100%;min-height:16px;color:var(--cyan);font-size:10px}.mutation-result.error{color:var(--red)}
   .thermal-body{padding:14px 16px}.thermal-settings{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1px;background:#26352e}.thermal-field{background:#0e1612;padding:12px;display:grid;gap:7px}.thermal-field label{color:#b7c4bd;font-size:10px;text-transform:uppercase;letter-spacing:.08em}.thermal-field input{width:100%;min-width:0;background:#0a100d;border-color:#34463d;padding:9px 10px;font:11px inherit}.thermal-field input:focus{outline:1px solid var(--cyan);outline-offset:1px}.thermal-field.checkbox{display:flex;align-items:center}.thermal-field.checkbox label{display:flex;align-items:center;gap:9px;text-transform:none;letter-spacing:0}.thermal-field.checkbox input{width:auto;accent-color:var(--lime)}.thermal-field.locked{opacity:.58}.thermal-actions{display:flex;align-items:center;gap:9px;margin-top:12px}.thermal-notice{color:var(--muted);font-size:10px}.thermal-notice.warn{color:var(--amber)}.thermal-notice.error{color:var(--red)}.gpu-meters{display:grid;gap:8px;margin-top:14px}.gpu-meter{display:grid;gap:4px}.meter-label{display:flex;justify-content:space-between;gap:10px;color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:.08em}.meter-label b{color:var(--ink);font-weight:400;letter-spacing:0;text-transform:none}.meter{height:7px;border:1px solid var(--line);background:#070b09;overflow:hidden}.meter i{display:block;height:100%;background:linear-gradient(90deg,var(--cyan),var(--lime));transition:width .4s}.meter i.warn{background:linear-gradient(90deg,var(--amber),#ff8f5a)}.meter i.bad{background:var(--red)}
 </style></head>"#,
     );
     html = html.replace(
         "</style></head>",
-        r#"<style>.memory-panel{margin:0 0 12px;padding:14px 16px;background:linear-gradient(145deg,#141d19f5,#0b110ef5);border:1px solid var(--line)}.memory-head{display:flex;justify-content:space-between;align-items:baseline;gap:12px}.memory-title{color:var(--muted);font-size:10px;letter-spacing:.13em;text-transform:uppercase}.memory-total{font:22px Bahnschrift,sans-serif}.memory-total small{font:10px inherit;color:var(--muted)}.memory-bar,.context-bar{display:flex;height:18px;margin:11px 0 8px;background:#070b09;border:1px solid var(--line);overflow:hidden}.context-bar{height:8px;margin-top:8px}.memory-segment{height:100%;min-width:1px}.memory-legend{display:flex;flex-wrap:wrap;gap:7px 15px;color:var(--muted);font-size:10px}.memory-legend span:before{content:"";display:inline-block;width:8px;height:8px;margin-right:5px;background:var(--swatch);border-radius:2px}.memory-detail{display:grid;grid-template-columns:1fr auto;gap:5px;margin-top:9px;font-size:10px}.memory-detail b{text-align:right;color:var(--ink);font-weight:400}</style></head>"#,
+        r#"<style>.memory-panel{margin:0 0 12px;padding:14px 16px;background:linear-gradient(145deg,#141d19f5,#0b110ef5);border:1px solid var(--line)}.memory-head{display:flex;justify-content:space-between;align-items:baseline;gap:12px}.memory-title{color:var(--muted);font-size:10px;letter-spacing:.13em;text-transform:uppercase}.memory-total{font:22px Bahnschrift,sans-serif}.memory-total small{font:10px inherit;color:var(--muted)}.memory-bar,.context-bar{display:flex;height:18px;margin:11px 0 8px;background:#070b09;border:1px solid var(--line);overflow:hidden}.context-bar{height:8px;margin-top:8px}.memory-segment{height:100%;min-width:1px}.memory-legend{display:flex;flex-wrap:wrap;gap:7px 15px;color:var(--muted);font-size:10px}.memory-legend span:before{content:"";display:inline-block;width:8px;height:8px;margin-right:5px;background:var(--swatch);border-radius:2px}.memory-detail{display:grid;grid-template-columns:1fr auto;gap:5px;margin-top:9px;font-size:10px}.memory-detail b{text-align:right;color:var(--ink);font-weight:400}.ram-warning{display:flex;align-items:center;gap:10px;margin:0 0 13px;padding:10px 12px;border:1px solid #bd742d;background:linear-gradient(90deg,#3a2415,#20170f);color:#ffd08a;font-size:11px}.ram-warning:before{content:"!";display:grid;place-items:center;flex:0 0 22px;height:22px;border-radius:50%;background:var(--amber);color:#151009;font-weight:800}.ram-warning b{color:#fff2d2}.ram-warning small{display:block;margin-top:2px;color:#d8ad75}</style></head>"#,
     );
     html = html.replace(
         r#"<details id="thermalPanel"><summary>Thermal guard <span id="thermalSummary" class="summary-meta">loading</span></summary><div class="tools"><span id="thermalDetail" class="sub">The inference GPU is monitored at one-second intervals.</span></div></details>"#,
@@ -1034,9 +1050,34 @@ pub fn dashboard_html() -> String {
         r#"<input id="amdWatts" type="range" min="0" max="1" step="0.1" value="0" disabled aria-label="Power limit in watts">"#,
     );
     html = html.replace(
+        r#"<button id="amdPower" class="btn primary">Apply power</button><button id="amdTune" class="btn">Apply tuning</button>"#,
+        r#"<button id="amdPower" class="btn primary">Set power limit</button><button id="amdTune" class="btn">Set performance mode</button>"#,
+    );
+    html = html.replace(
+        r#"<select id="amdLevel" class="btn"><option value="auto">auto</option><option value="low">low</option><option value="high">high</option><option value="manual">manual</option></select>"#,
+        r#"<label class="tuning-control">Performance mode <select id="amdLevel" class="btn"><option value="auto">auto</option><option value="low">low</option><option value="high">high</option><option value="manual">manual</option></select></label>"#,
+    );
+    html = html.replace(
+        r#"<button id="amdReset" class="btn">Reset</button>"#,
+        r#"<button id="amdReset" class="btn">Reset GPU settings</button>"#,
+    );
+    html = html.replace(
+        r#"<span class="sub">Runtime-only, driver-bounded, and subject to the thermal interlock. Confirm each mutation.</span>"#,
+        r#"<div class="control-help"><span><b>Set power limit</b> changes the numeric GPU board-power cap in watts.</span><span><b>Set performance mode</b> changes the driver clock/performance policy; it does not change the watt limit.</span><span>Runtime-only, driver-bounded, and subject to the thermal interlock. Confirm each mutation.</span></div><div id="amdResult" class="mutation-result" role="status" aria-live="polite"></div>"#,
+    );
+    html = html.replace(r#"encodeURIComponent(pci)"#, "pci");
+    html = html.replace(
+        r#"if(!confirm(`Apply runtime ${operation} to ${pci}? The thermal guard remains authoritative.`))return"#,
+        r#"if(!confirm(`Change ${operation==='power'?'the power limit':operation==='tuning'?'the performance mode':'GPU settings'} for ${pci}? Power changes the watt cap; tuning changes the clock policy. Changes are runtime-only and the thermal guard remains authoritative.`))return"#,
+    );
+    html = html.replace(
+        r#"$('amdSummary').textContent=r.ok?`Applied ${operation}; readback ${JSON.stringify(j.readback||j)}`:`${r.status}: ${j.error?.message||'operation failed'}`;refreshGpus();refreshAmd()"#,
+        r#"$('amdSummary').textContent=r.ok?`Applied ${operation}`:`${r.status}: ${j.error?.message||'operation failed'}`;$('amdResult').textContent=r.ok?`Readback confirmed: ${JSON.stringify(j.readback||j)}`:`Operation failed: ${j.error?.message||'operation failed'}`;$('amdResult').className='mutation-result'+(r.ok?'':' error');refreshGpus();refreshAmd()"#,
+    );
+    html = html.replace(
         "</script></body></html>",
          r#"</script><script>
- function renderMemory(s){const m=s.gpu?.memory||{},sec=m.sections||{},total=Number(m.total_bytes)||0,used=Number(m.used_bytes)||0,free=Number(m.free_bytes)||0;const rows=[['Model weights',Number(sec.model_weights_bytes)||0,'#b7ff5a'],['Context reserved',Number(sec.context_reserved_bytes)||0,'#62d9d1'],['Runtime',Number(sec.runtime_bytes)||0,'#a78bfa'],['Scratch / pools',Number(sec.scratch_bytes)||0,'#ffc857'],['Vision',Number(sec.vision_bytes)||0,'#fb923c'],['Unattributed',Number(sec.unattributed_bytes)||0,'#718096'],['Free',free,'#26332c']];const pct=v=>total>0?Math.max(0,Math.min(100,v/total*100)):0;const fmt=v=>`${(v/1073741824).toFixed(2)} GiB`;const c=m.context||{},contextPct=Number(c.utilization_fraction)||0;const panel=document.getElementById('memoryPanel');if(!panel)return;panel.innerHTML=`<div class="memory-head"><div class="memory-title">VRAM allocation</div><div class="memory-total">${fmt(used)} <small>/ ${fmt(total)} used</small></div></div><div class="memory-bar" role="img" aria-label="VRAM allocation breakdown">${rows.map(r=>`<i class="memory-segment" style="width:${pct(r[1])}%;background:${r[2]}" title="${r[0]}: ${fmt(r[1])}"></i>`).join('')}</div><div class="memory-legend">${rows.map(r=>`<span style="--swatch:${r[2]}">${r[0]}</span>`).join('')}</div><div class="memory-title" style="margin-top:16px">Context capacity</div><div class="context-bar" role="progressbar" aria-valuenow="${c.used_tokens||0}" aria-valuemax="${c.capacity_tokens||0}"><i class="memory-segment" style="width:${Math.max(0,Math.min(100,contextPct*100))}%;background:#62d9d1"></i></div><div class="memory-detail"><span>Positions used</span><b>${c.used_tokens??'—'} / ${c.capacity_tokens??'—'} · ${(contextPct*100).toFixed(1)}%</b><span>Reserved context VRAM</span><b>${fmt(Number(c.reserved_bytes)||0)} · used equivalent ${fmt(Number(c.used_equivalent_bytes)||0)}</b></div><div class="sub" style="margin-top:10px">Categorized ${fmt(Number(m.tracked_bytes)||0)} · residual ${fmt(Number(m.unattributed_bytes)||0)}</div>`}
+ function renderMemory(s){const m=s.gpu?.memory||{},sec=m.sections||{},total=Number(m.total_bytes)||0,used=Number(m.used_bytes)||0,free=Number(m.free_bytes)||0,sys=m.system_memory||{},gtt=Number(sys.gtt_bytes)||0;const rows=[['Model weights',Number(sec.model_weights_bytes)||0,'#b7ff5a'],['Context reserved',Number(sec.context_reserved_bytes)||0,'#62d9d1'],['Runtime',Number(sec.runtime_bytes)||0,'#a78bfa'],['Scratch / pools',Number(sec.scratch_bytes)||0,'#ffc857'],['Vision',Number(sec.vision_bytes)||0,'#fb923c'],['Unattributed',Number(sec.unattributed_bytes)||0,'#718096'],['Free',free,'#26332c']];const pct=v=>total>0?Math.max(0,Math.min(100,v/total*100)):0;const fmt=v=>`${(v/1073741824).toFixed(2)} GiB`;const c=m.context||{},contextPct=Number(c.utilization_fraction)||0;const panel=document.getElementById('memoryPanel');if(!panel)return;const warning=sys.available&&gtt>0?`<div class="ram-warning" role="alert"><div><b>GPU-accessible system RAM active · ${fmt(gtt)}</b><small>Current ReInstinct DRM client GTT residency. The driver cannot attribute these bytes to weights, context, or runtime.</small></div></div>`:'';panel.innerHTML=warning+`<div class="memory-head"><div class="memory-title">VRAM allocation</div><div class="memory-total">${fmt(used)} <small>/ ${fmt(total)} used</small></div></div><div class="memory-bar" role="img" aria-label="VRAM allocation breakdown">${rows.map(r=>`<i class="memory-segment" style="width:${pct(r[1])}%;background:${r[2]}" title="${r[0]}: ${fmt(r[1])}"></i>`).join('')}</div><div class="memory-legend">${rows.map(r=>`<span style="--swatch:${r[2]}">${r[0]}</span>`).join('')}</div><div class="memory-title" style="margin-top:16px">Context capacity</div><div class="context-bar" role="progressbar" aria-valuenow="${c.used_tokens||0}" aria-valuemax="${c.capacity_tokens||0}"><i class="memory-segment" style="width:${Math.max(0,Math.min(100,contextPct*100))}%;background:#62d9d1"></i></div><div class="memory-detail"><span>Positions used</span><b>${c.used_tokens??'—'} / ${c.capacity_tokens??'—'} · ${(contextPct*100).toFixed(1)}%</b><span>Reserved context VRAM</span><b>${fmt(Number(c.reserved_bytes)||0)} · used equivalent ${fmt(Number(c.used_equivalent_bytes)||0)}</b></div><div class="sub" style="margin-top:10px">Categorized ${fmt(Number(m.tracked_bytes)||0)} · residual ${fmt(Number(m.unattributed_bytes)||0)}</div>`}
  const _renderStatus=renderStatus;renderStatus=s=>{_renderStatus(s);renderMemory(s)};
  (() => {
   const input = document.getElementById('amdWatts');
@@ -1185,6 +1226,11 @@ mod tests {
         assert!(dashboard.contains("Current limit"));
         assert!(dashboard.contains("Driver range"));
         assert!(dashboard.contains("input.type = 'range'"));
+        assert!(dashboard.contains("Set power limit"));
+        assert!(dashboard.contains("Set performance mode"));
+        assert!(dashboard.contains("Power changes the watt cap; tuning changes the clock policy."));
+        assert!(dashboard.contains("amdResult"));
+        assert!(!dashboard.contains("encodeURIComponent(pci)"));
         assert!(dashboard.contains(r#"<details id="runsPanel">"#));
         assert!(!dashboard.contains(r#"<details id="runsPanel" open>"#));
         assert!(dashboard.contains("thermalForm"));
@@ -1192,6 +1238,7 @@ mod tests {
         assert!(dashboard.contains("Pause threshold °C"));
         assert!(dashboard.contains("memoryPanel"));
         assert!(dashboard.contains("Context capacity"));
+        assert!(dashboard.contains("GPU-accessible system RAM active"));
         assert!(dashboard.contains("Model weights"));
         assert!(dashboard.contains("tok/s average"));
         assert!(dashboard.contains("['Max'"));

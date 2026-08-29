@@ -12,6 +12,7 @@ The fork concentrates on practical multimodal serving and operating an MI50 as a
 
 - Qwen3.6 image input through a pinned Furnace/libmtmd bridge, including position-correct M-RoPE and external image-embedding prefill.
 - OpenAI-shaped text and image chat requests with streaming responses, bounded request handling, and an OpenAPI 3.1 description.
+- Qwen 3.5/3.6 OpenAI function-tool request parsing and `tool_calls` response shaping for agent clients such as Opencode.
 - A standalone C#/.NET 8 HTTP contract suite under [`tests/api-contract`](tests/api-contract) for black-box API checks.
 - A live operations dashboard with GPU/VRAM telemetry, thermal interlocks, persisted JSON configuration, and guarded engine reloads.
 - Matched multimodal profiling and performance notes covering projector time, prefill, TTFT, decode, thermal limits, and Furnace comparisons.

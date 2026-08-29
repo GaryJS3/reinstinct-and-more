@@ -677,6 +677,14 @@ buffers are allocated for their configured capacity, while each runtime state
 reports the physical positions currently populated. The dashboard therefore
 shows both reserved context bytes and a separate positions-used bar.
 
+The server also reads the current process's DRM fdinfo memory counters. Any
+resident AMDGPU `gtt` bytes are GPU-accessible system RAM and trigger a
+dashboard warning with the measured amount. DRM cannot attribute GTT residency
+to weights, context, or runtime, so the warning stays explicitly unclassified.
+ReInstinct's categorized buffers use `hipMalloc`, not managed allocations;
+ordinary VRAM exhaustion is expected to fail allocation rather than silently
+spill those buffers into system RAM.
+
 ### KernelCache (`runtime/mod.rs`)
 
 Single-file responsibility: turn HIP C++ source strings into `.hsaco`

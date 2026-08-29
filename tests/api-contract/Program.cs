@@ -160,6 +160,7 @@ sealed class ContractSuite
             ("PNG image chat", () => ImageChatAsync("png")),
             ("invalid request errors", InvalidRequestsAsync),
             ("request compatibility", RequestCompatibilityAsync),
+            ("tool request validation", ToolRequestValidationAsync),
             ("decoded-image limit", DecodedImageLimitAsync),
             ("request-size limit", RequestSizeLimitAsync),
             ("timeout recovery", TimeoutRecoveryAsync),
@@ -218,6 +219,11 @@ sealed class ContractSuite
                 "context reserved memory section missing");
             Check(memory.GetProperty("context").GetProperty("used_tokens").GetInt64() >= 0,
                 "context used memory metadata missing");
+            var systemMemory = memory.GetProperty("system_memory");
+            Check(systemMemory.GetProperty("available").ValueKind is JsonValueKind.True or JsonValueKind.False,
+                "system memory availability missing");
+            Check(systemMemory.TryGetProperty("gtt_bytes", out _),
+                "GPU-accessible system RAM telemetry missing");
             var performance = root.GetProperty("performance");
             Check(performance.ValueKind == JsonValueKind.Object,
                 "status performance object missing");
@@ -577,13 +583,73 @@ sealed class ContractSuite
         await AssertErrorAsync("v1/chat/completions",
             BasicChatPayload("Reply briefly.", n: 2),
             HttpStatusCode.BadRequest, "multiple choices");
-        await AssertErrorAsync("v1/chat/completions",
-            new
+        using (var response = await _client.SendJsonAsync(HttpMethod.Post, "v1/chat/completions",
+                   new
+                   {
+                       model = _model,
+                       messages = new[] { new { role = "user", content = "Reply briefly." } },
+                       tools = Array.Empty<object>(),
+                   }))
+        using (var document = await ReadJsonAsync(response, HttpStatusCode.OK))
+        {
+            ValidateChatCompletion(document.RootElement);
+        }
+    }
+
+    private async Task ToolRequestValidationAsync()
+    {
+        var read = new
+        {
+            type = "function",
+            function = new
             {
-                model = _model,
-                messages = new[] { new { role = "user", content = "Reply briefly." } },
-                tools = Array.Empty<object>(),
-            }, HttpStatusCode.BadRequest, "unsupported tools");
+                name = "read",
+                description = "Read a file",
+                parameters = new
+                {
+                    type = "object",
+                    properties = new { path = new { type = "string" } },
+                    required = new[] { "path" },
+                },
+            },
+        };
+        await AssertErrorAsync("v1/chat/completions", new
+        {
+            model = _model,
+            messages = new[] { new { role = "user", content = "Read hello.txt." } },
+            tools = new[] { read },
+            tool_choice = new { type = "function", function = new { name = "missing" } },
+        }, HttpStatusCode.BadRequest, "unknown function");
+
+        await AssertErrorAsync("v1/chat/completions", new
+        {
+            model = _model,
+            messages = new[] { new { role = "tool", content = "result" } },
+            tools = new[] { read },
+        }, HttpStatusCode.BadRequest, "tool_call_id");
+
+        await AssertErrorAsync("v1/chat/completions", new
+        {
+            model = _model,
+            messages = new[]
+            {
+                new
+                {
+                    role = "assistant",
+                    content = (string?)null,
+                    tool_calls = new[]
+                    {
+                        new
+                        {
+                            id = "call-1",
+                            type = "function",
+                            function = new { name = "read", arguments = "not-json" },
+                        },
+                    },
+                },
+            },
+            tools = new[] { read },
+        }, HttpStatusCode.BadRequest, "valid JSON");
     }
 
     private async Task RequestSizeLimitAsync()

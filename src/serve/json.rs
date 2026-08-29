@@ -1,7 +1,7 @@
 //! Minimal JSON — just enough to parse OpenAI-shaped requests and emit
 //! responses. Recursive-descent parser, escaping emitter; no dependency.
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Json {
     Null,
     Bool(bool),

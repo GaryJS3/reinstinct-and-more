@@ -230,6 +230,44 @@ mod tests {
         assert!(!ChatTemplateFamily::Llama3.supported_by_serve());
         assert!(!ChatTemplateFamily::Mistral.supported_by_serve());
     }
+
+    #[test]
+    fn qwen_tool_template_keeps_definition_and_tool_result_turns() {
+        let options = crate::serve::tools::ChatToolOptions {
+            tools: vec![crate::serve::tools::FunctionTool {
+                name: "read".into(),
+                description: Some("Read a file".into()),
+                parameters: crate::serve::json::Json::Obj(vec![
+                    ("type".into(), crate::serve::json::Json::Str("object".into())),
+                ]),
+                strict: None,
+            }],
+            choice: crate::serve::tools::ToolChoice::Auto,
+            parallel: true,
+        };
+        let messages = vec![
+            crate::serve::tools::ToolChatMessage::System("Be concise.".into()),
+            crate::serve::tools::ToolChatMessage::User("Read hello.txt.".into()),
+            crate::serve::tools::ToolChatMessage::Assistant {
+                content: None,
+                tool_calls: vec![crate::serve::tools::ToolCall {
+                    id: "call-1".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"hello.txt"}"#.into(),
+                }],
+            },
+            crate::serve::tools::ToolChatMessage::Tool {
+                tool_call_id: "call-1".into(),
+                content: "hello".into(),
+            },
+        ];
+        let rendered = format_qwen3_tools_text(&messages, &options, true).unwrap();
+        assert!(rendered.contains("<tools>"));
+        assert!(rendered.contains("\"name\":\"read\""));
+        assert!(rendered.contains("<tool_call>"));
+        assert!(rendered.contains("<tool_response>"));
+        assert!(rendered.ends_with("<|im_start|>assistant\n<think>\n"));
+    }
 }
 
 /// Render `messages` into a Qwen 3.5/3.6 chat-template token sequence,
@@ -266,6 +304,135 @@ pub fn format_qwen3(tok: &Tokenizer, messages: &[ChatMessage],
         out.push(role_id);
         out.push(QWEN_NEWLINE);
     }
+    Ok(out)
+}
+
+/// Render the Qwen 3.5/3.6 XML function-calling variant used by the
+/// model-family chat template.  This is intentionally separate from the
+/// basic renderer above: OpenAI tool turns contain protocol information that
+/// must not be flattened into ordinary assistant text.
+pub(crate) fn format_qwen3_tools(
+    tok: &Tokenizer,
+    messages: &[crate::serve::tools::ToolChatMessage],
+    options: &crate::serve::tools::ChatToolOptions,
+    add_generation_prompt: bool,
+) -> Result<Vec<u32>, String> {
+    let rendered = format_qwen3_tools_text(messages, options, add_generation_prompt)?;
+    Ok(tok.encode(&rendered))
+}
+
+pub(crate) fn format_qwen3_tools_text(
+    messages: &[crate::serve::tools::ToolChatMessage],
+    options: &crate::serve::tools::ChatToolOptions,
+    add_generation_prompt: bool,
+) -> Result<String, String> {
+    let mut out = String::new();
+    if !options.tools.is_empty() {
+        out.push_str("<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>");
+        for tool in &options.tools {
+            out.push('\n');
+            out.push_str(&tool_definition_json(tool));
+        }
+        out.push_str("\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format.\n- Required parameters MUST be specified.\n- If there is no function call available, answer the question normally.\n</IMPORTANT>");
+        if let crate::serve::tools::ToolChoice::Required = options.choice {
+            out.push_str("\nYou MUST call an available function before answering.\n");
+        } else if let crate::serve::tools::ToolChoice::Function(ref name) = options.choice {
+            out.push_str("\nYou MUST call the function ");
+            out.push_str(name);
+            out.push_str(" before answering.\n");
+        }
+        out.push_str("<|im_end|>\n");
+    }
+    for message in messages {
+        match message {
+            crate::serve::tools::ToolChatMessage::System(content) => {
+                // The tool preamble is the system turn.  Preserve the
+                // caller's system instruction in the same turn.
+                if options.tools.is_empty() {
+                    out.push_str("<|im_start|>system\n");
+                    out.push_str(content);
+                    out.push_str("<|im_end|>\n");
+                } else if !content.is_empty() {
+                    let marker = "<|im_end|>\n";
+                    if !out.ends_with(marker) {
+                        return Err("qwen3 tool template: system preamble is malformed".into());
+                    }
+                    let insert_at = out.len() - marker.len();
+                    out.insert_str(insert_at, "\n\n");
+                    out.insert_str(insert_at + 2, content);
+                }
+            }
+            crate::serve::tools::ToolChatMessage::User(content) => {
+                out.push_str("<|im_start|>user\n");
+                out.push_str(content);
+                out.push_str("<|im_end|>\n");
+            }
+            crate::serve::tools::ToolChatMessage::Assistant { content, tool_calls } => {
+                out.push_str("<|im_start|>assistant\n");
+                if let Some(content) = content {
+                    out.push_str(content);
+                }
+                for (call_index, call) in tool_calls.iter().enumerate() {
+                    if content.as_deref().is_some_and(|value| !value.is_empty()) || call_index > 0 {
+                        out.push_str("\n\n");
+                    }
+                    out.push_str(&render_qwen_tool_call(call)?);
+                }
+                out.push_str("<|im_end|>\n");
+            }
+            crate::serve::tools::ToolChatMessage::Tool { content, .. } => {
+                out.push_str("<|im_start|>user\n<tool_response>\n");
+                out.push_str(content);
+                out.push_str("\n</tool_response><|im_end|>\n");
+            }
+        }
+    }
+    if add_generation_prompt {
+        out.push_str("<|im_start|>assistant\n<think>\n");
+    }
+    Ok(out)
+}
+
+fn tool_definition_json(tool: &crate::serve::tools::FunctionTool) -> String {
+    let mut function = vec![("name".into(), crate::serve::json::Json::Str(tool.name.clone()))];
+    if let Some(description) = &tool.description {
+        function.push(("description".into(), crate::serve::json::Json::Str(description.clone())));
+    }
+    function.push(("parameters".into(), tool.parameters.clone()));
+    let mut value = vec![
+        ("type".into(), crate::serve::json::Json::Str("function".into())),
+        ("function".into(), crate::serve::json::Json::Obj(function)),
+    ];
+    if let Some(strict) = tool.strict {
+        if let crate::serve::json::Json::Obj(ref mut fields) = value[1].1 {
+            fields.push(("strict".into(), crate::serve::json::Json::Bool(strict)));
+        }
+    }
+    crate::serve::json::Json::Obj(value).to_string()
+}
+
+fn render_qwen_tool_call(call: &crate::serve::tools::ToolCall) -> Result<String, String> {
+    let args = crate::serve::json::Json::parse(&call.arguments)
+        .map_err(|e| format!("tool call arguments are not valid JSON: {e}"))?;
+    let fields = match args {
+        crate::serve::json::Json::Obj(fields) => fields,
+        _ => return Err("qwen3 tool call arguments must be a JSON object".into()),
+    };
+    let mut out = String::new();
+    out.push_str("<tool_call>\n<function=");
+    out.push_str(&call.name);
+    out.push_str(">\n");
+    for (name, value) in fields {
+        out.push_str("<parameter=");
+        out.push_str(&name);
+        out.push_str(">\n");
+        match value {
+            crate::serve::json::Json::Str(value) => out.push_str(&value),
+            value => out.push_str(&value.to_string()),
+        }
+        out.push_str("\n</parameter>\n");
+    }
+    out.push_str("</function>\n</tool_call>");
     Ok(out)
 }
 

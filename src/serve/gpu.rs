@@ -14,6 +14,71 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
+/// Per-process GPU memory residency reported by DRM fdinfo. AMDGPU calls its
+/// GPU-accessible system-memory region `gtt`. This is deliberately separate
+/// from ordinary process RSS: only memory the GPU driver attributes to this
+/// DRM client is counted.
+pub fn process_drm_memory_json() -> Value {
+    process_drm_memory_from(Path::new("/proc/self/fdinfo"))
+}
+
+fn process_drm_memory_from(root: &Path) -> Value {
+    let mut clients = BTreeMap::<String, (u64, u64)>::new();
+    let Some(entries) = fs::read_dir(root).ok() else {
+        return json!({"available":false,"vram_bytes":null,"gtt_bytes":null});
+    };
+    for entry in entries.flatten() {
+        let Ok(text) = fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let fields: BTreeMap<_, _> = text
+            .lines()
+            .filter_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                Some((key.trim(), value.trim()))
+            })
+            .collect();
+        let Some(client) = fields.get("drm-client-id") else {
+            continue;
+        };
+        let key = format!(
+            "{}:{}",
+            fields.get("drm-pdev").copied().unwrap_or("unknown"),
+            client
+        );
+        let vram = drm_bytes(&fields, "vram").unwrap_or(0);
+        let gtt = drm_bytes(&fields, "gtt").unwrap_or(0);
+        clients.entry(key).or_insert((vram, gtt));
+    }
+    if clients.is_empty() {
+        json!({"available":false,"vram_bytes":null,"gtt_bytes":null})
+    } else {
+        let (vram, gtt) = clients.values().fold((0u64, 0u64), |sum, value| {
+            (sum.0.saturating_add(value.0), sum.1.saturating_add(value.1))
+        });
+        json!({"available":true,"vram_bytes":vram,"gtt_bytes":gtt,
+            "client_count":clients.len(),"scope":"current_process"})
+    }
+}
+
+fn drm_bytes(fields: &BTreeMap<&str, &str>, region: &str) -> Option<u64> {
+    // drm-memory-* is AMDGPU's deprecated alias for drm-resident-*; prefer
+    // the standardized spelling if a newer kernel exposes both.
+    let resident_key = format!("drm-resident-{region}");
+    let memory_key = format!("drm-memory-{region}");
+    let value = fields
+        .get(resident_key.as_str())
+        .or_else(|| fields.get(memory_key.as_str()))?;
+    let mut parts = value.split_whitespace();
+    let amount = parts.next()?.parse::<u64>().ok()?;
+    match parts.next() {
+        None => Some(amount),
+        Some("KiB") => amount.checked_mul(1024),
+        Some("MiB") => amount.checked_mul(1024 * 1024),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SensorReading {
     pub temperature_c: Option<f64>,
@@ -528,6 +593,21 @@ mod tests {
             json["gpus"]["0000:04:00.0"]["controls"]["power_limit_writable"],
             false
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn drm_fdinfo_reports_process_gtt_without_double_counting_client_fds() {
+        let root = std::env::temp_dir().join(format!("reinstinct-fdinfo-test-{}", now_ms()));
+        create_dir_all(&root).unwrap();
+        let body = "drm-driver:\tamdgpu\ndrm-client-id:\t7\ndrm-pdev:\t0000:03:00.0\ndrm-memory-vram:\t12 MiB\ndrm-memory-gtt:\t640 KiB\n";
+        write(root.join("12"), body).unwrap();
+        write(root.join("13"), body).unwrap();
+        let memory = process_drm_memory_from(&root);
+        assert_eq!(memory["available"], true);
+        assert_eq!(memory["client_count"], 1);
+        assert_eq!(memory["vram_bytes"], 12 * 1024 * 1024);
+        assert_eq!(memory["gtt_bytes"], 640 * 1024);
         let _ = fs::remove_dir_all(root);
     }
 }

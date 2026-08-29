@@ -13,8 +13,9 @@
 //! answers 503 until then.
 
 mod http;
-mod json;
+pub(crate) mod json;
 mod api;
+pub(crate) mod tools;
 pub(crate) mod gpu;
 pub(crate) mod thermal;
 pub mod config;
@@ -140,6 +141,10 @@ impl Target {
 enum PromptInput {
     Raw(String),
     Chat(Vec<crate::chat::ChatMessage>),
+    /// Tool-aware chat messages are kept separate from the legacy basic-chat
+    /// representation so the CLI/template callers that only need plain text
+    /// remain source-compatible while the HTTP path preserves tool turns.
+    ChatTools { messages: Vec<tools::ToolChatMessage>, options: tools::ChatToolOptions },
     /// One OpenAI structured-content image, retained as decoded bytes until
     /// the serialized GPU worker passes it to the mtmd bridge.
     ChatVision { messages: Vec<crate::chat::ChatMessage>, image: Vec<u8> },
@@ -223,11 +228,12 @@ enum StreamMsg {
 }
 
 impl GenReq {
-    fn is_chat(&self) -> bool { matches!(self.prompt, PromptInput::Chat(_) | PromptInput::ChatVision { .. }) }
+    fn is_chat(&self) -> bool { matches!(self.prompt, PromptInput::Chat(_) | PromptInput::ChatTools { .. } | PromptInput::ChatVision { .. }) }
 }
 
 struct GenerationOutput {
     text: String,
+    tool_calls: Vec<tools::ToolCall>,
     prompt_tokens: usize,
     completion_tokens: usize,
     hit_stop: bool,
@@ -343,8 +349,7 @@ fn parse_common_fields(j: &Json, defaults: SamplerDefaults)
     } else if j.get("n").is_some() {
         return Err("field 'n' must be the integer 1".into());
     }
-    for key in ["tools", "tool_choice", "functions", "function_call",
-                "parallel_tool_calls", "response_format"] {
+    for key in ["response_format"] {
         if j.get(key).is_some() {
             return Err(format!("field '{key}' is not supported yet"));
         }
@@ -487,6 +492,35 @@ fn chat_stream_chunk(id: &str, model: &str, delta: ChatDelta,
 
 struct ChatDelta<'a> { role: Option<&'a str>, content: Option<&'a str> }
 
+/// One incremental tool-call streaming chunk. Qwen's native XML is withheld
+/// from the client and represented in the OpenAI `delta.tool_calls` shape.
+/// The identity/name and argument body are emitted as separate deltas so an
+/// SDK that incrementally assembles arguments sees the normal wire pattern.
+fn chat_tool_call_stream_chunk(id: &str, model: &str, index: usize,
+                               call: &tools::ToolCall, initial: bool,
+                               arguments: &str) -> String {
+    let mut function = Vec::new();
+    if initial { function.push(("name".into(), Json::Str(call.name.clone()))); }
+    function.push(("arguments".into(), Json::Str(arguments.to_owned())));
+    let mut delta = vec![("index".into(), Json::Num(index as f64))];
+    if initial {
+        delta.push(("id".into(), Json::Str(call.id.clone())));
+        delta.push(("type".into(), Json::Str("function".into())));
+    }
+    delta.push(("function".into(), Json::Obj(function)));
+    Json::Obj(vec![
+        ("id".into(), Json::Str(id.to_string())),
+        ("object".into(), Json::Str("chat.completion.chunk".into())),
+        ("created".into(), Json::Num(unix_now() as f64)),
+        ("model".into(), Json::Str(model.to_string())),
+        ("choices".into(), Json::Arr(vec![Json::Obj(vec![
+            ("index".into(), Json::Num(0.0)),
+            ("delta".into(), Json::Obj(vec![("tool_calls".into(), Json::Arr(vec![Json::Obj(delta)]))])),
+            ("finish_reason".into(), Json::Null),
+        ])])),
+    ]).to_string()
+}
+
 /// Convert a `SampleResult` into a `TokenLogprob` by decoding each token
 /// id through the caller-provided decoder. The "delta" text we surface
 /// for an alternative is the standalone decode of that token id — which
@@ -561,6 +595,11 @@ fn parse_completions(body: &str) -> Result<GenReq, (u16, &'static str, String)> 
     let prompt = j.get("prompt").and_then(Json::as_str)
         .ok_or_else(|| bad("missing string field 'prompt'".into()))?
         .to_string();
+    for key in ["tools", "tool_choice", "functions", "function_call", "parallel_tool_calls"] {
+        if j.get(key).is_some() {
+            return Err(bad(format!("field '{key}' is not supported for /v1/completions")));
+        }
+    }
     let (max_tokens, stop, sampler, use_speculative, speculative_k, speculative_p_min,
          request_timeout, stream, stream_include_usage, top_logprobs_n) =
         parse_common_fields(&j, COMPLETION_DEFAULTS).map_err(&bad)?;
@@ -594,20 +633,31 @@ fn parse_chat_completions(body: &str) -> Result<GenReq, (u16, &'static str, Stri
     if arr.is_empty() {
         return Err(bad("'messages' must contain at least one message".into()));
     }
+    let tool_options = tools::parse_options(&j).map_err(&bad)?;
+    let rich_messages = !tool_options.tools.is_empty()
+        || j.get("tool_choice").is_some()
+        || j.get("parallel_tool_calls").is_some()
+        || arr.iter().any(|m| matches!(m.get("role").and_then(Json::as_str), Some("tool"))
+            || m.get("tool_calls").is_some());
     let mut messages: Vec<ChatMessage> = Vec::with_capacity(arr.len());
+    let mut rich: Vec<tools::ToolChatMessage> = Vec::with_capacity(arr.len());
     let mut image: Option<Vec<u8>> = None;
     for (i, m) in arr.iter().enumerate() {
         let role_s = m.get("role").and_then(Json::as_str)
             .ok_or_else(|| bad(format!("messages[{i}]: missing string 'role'")))?;
         let role = match role_s {
             "system"    => Role::System,
+            "developer" => Role::System,
             "user"      => Role::User,
             "assistant" => Role::Assistant,
+            "tool"      if rich_messages => Role::Assistant,
             other => return Err(bad(format!(
-                "messages[{i}]: unknown role '{other}' (want system|user|assistant)"))),
+                "messages[{i}]: unknown role '{other}' (want system|user|assistant|tool)"))),
         };
         let content = match m.get("content") {
             Some(Json::Str(text)) => text.clone(),
+            Some(Json::Null) if rich_messages && role_s == "assistant" => String::new(),
+            None if rich_messages && role_s == "assistant" => String::new(),
             Some(Json::Arr(parts)) => {
                 if role != Role::User {
                     return Err(bad(format!("messages[{i}]: structured content is supported only for user messages")));
@@ -633,16 +683,96 @@ fn parse_chat_completions(body: &str) -> Result<GenReq, (u16, &'static str, Stri
             }
             _ => return Err(bad(format!("messages[{i}]: content must be a string or array"))),
         };
-        messages.push(ChatMessage { role, content });
+        if rich_messages {
+            let rich_message = match role_s {
+                "system" | "developer" => tools::ToolChatMessage::System(content),
+                "user" => tools::ToolChatMessage::User(content),
+                "assistant" => {
+                    let assistant_content = match m.get("content") {
+                        Some(Json::Str(value)) => Some(value.clone()),
+                        Some(Json::Null) | None => None,
+                        Some(_) => return Err(bad(format!(
+                            "messages[{i}].content must be a string or null"))),
+                    };
+                    let tool_calls = match m.get("tool_calls") {
+                        Some(_) => tools::parse_assistant_tool_calls(m, i).map_err(&bad)?,
+                        None => Vec::new(),
+                    };
+                    if assistant_content.is_none() && tool_calls.is_empty() {
+                        return Err(bad(format!(
+                            "messages[{i}]: assistant message needs content or tool_calls")));
+                    }
+                    tools::ToolChatMessage::Assistant { content: assistant_content, tool_calls }
+                }
+                "tool" => {
+                    let tool_call_id = m.get("tool_call_id").and_then(Json::as_str)
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| bad(format!(
+                            "messages[{i}]: tool message needs string 'tool_call_id'")))?;
+                    let value = m.get("content").and_then(Json::as_str)
+                        .ok_or_else(|| bad(format!(
+                            "messages[{i}]: tool message content must be a string")))?;
+                    tools::ToolChatMessage::Tool {
+                        tool_call_id: tool_call_id.to_owned(), content: value.to_owned(),
+                    }
+                }
+                _ => unreachable!(),
+            };
+            rich.push(rich_message);
+        } else {
+            messages.push(ChatMessage { role, content });
+        }
     }
-    let media_markers: usize = messages.iter().map(|m| m.content.matches("<__media__>").count()).sum();
+    let media_markers: usize = if rich_messages {
+        rich.iter().map(|m| match m {
+            tools::ToolChatMessage::System(s)
+            | tools::ToolChatMessage::User(s) => s.matches("<__media__>").count(),
+            tools::ToolChatMessage::Assistant { content: Some(s), .. }
+            | tools::ToolChatMessage::Tool { content: s, .. } => s.matches("<__media__>").count(),
+            _ => 0,
+        }).sum()
+    } else {
+        messages.iter().map(|m| m.content.matches("<__media__>").count()).sum()
+    };
     if media_markers != usize::from(image.is_some()) {
         return Err(bad("reserved media marker is not allowed in text".into()));
+    }
+    if rich_messages && image.is_some() {
+        return Err(bad("tool-enabled multimodal chat is not supported yet".into()));
+    }
+    if rich_messages {
+        let mut pending_calls: Vec<String> = Vec::new();
+        for (i, message) in rich.iter().enumerate() {
+            match message {
+                tools::ToolChatMessage::Assistant { tool_calls, .. } => {
+                    for call in tool_calls {
+                        if pending_calls.iter().any(|id| id == &call.id) {
+                            return Err(bad(format!(
+                                "messages[{i}].tool_calls contains duplicate id '{}'", call.id)));
+                        }
+                        pending_calls.push(call.id.clone());
+                    }
+                }
+                tools::ToolChatMessage::Tool { tool_call_id, .. } => {
+                    let Some(position) = pending_calls.iter().position(|id| id == tool_call_id) else {
+                        return Err(bad(format!(
+                            "messages[{i}].tool_call_id '{}' has no preceding assistant tool call",
+                            tool_call_id)));
+                    };
+                    pending_calls.remove(position);
+                }
+                _ => {}
+            }
+        }
     }
     let (max_tokens, stop, sampler, use_speculative, speculative_k, speculative_p_min,
          request_timeout, stream, stream_include_usage, top_logprobs_n) =
         parse_common_fields(&j, CHAT_DEFAULTS).map_err(&bad)?;
-    let prompt = match image { Some(image) => PromptInput::ChatVision { messages, image }, None => PromptInput::Chat(messages) };
+    let prompt = if rich_messages {
+        PromptInput::ChatTools { messages: rich, options: tool_options }
+    } else {
+        match image { Some(image) => PromptInput::ChatVision { messages, image }, None => PromptInput::Chat(messages) }
+    };
     Ok(GenReq { prompt, model, max_tokens, stop, sampler,
                 use_speculative, speculative_k, speculative_p_min,
                 request_timeout, stream, stream_include_usage, top_logprobs_n })
@@ -823,6 +953,13 @@ fn strip_thinking_channels(text: &str) -> &str {
     }
 }
 
+fn clean_chat_text(text: &str) -> &str {
+    let text = strip_thinking_channels(text).trim_end();
+    text.strip_suffix("<|im_end|>")
+        .map(str::trim_end)
+        .unwrap_or(text)
+}
+
 /// Streaming-aware version of the same stripper. Buffers incoming text
 /// until either a closing marker is seen (then emits everything after
 /// it and switches to passthrough), or until enough text has been
@@ -894,21 +1031,35 @@ impl ThinkingStripStream {
 
 /// raw-completion shape, but the choice carries a `message` object
 /// instead of a flat `text` field — what every chat SDK expects.
-fn chat_completion_response(model: &str, text: &str, n_prompt: usize,
-                            n_completion: usize, hit_eos: bool,
-                            logprobs: &[TokenLogprob]) -> String {
-    let text = strip_thinking_channels(text);
+fn chat_completion_response_with_tools(model: &str, text: &str, n_prompt: usize,
+                                       n_completion: usize, hit_eos: bool,
+                                       logprobs: &[TokenLogprob],
+                                       tool_calls: &[tools::ToolCall]) -> String {
+    let text = clean_chat_text(text);
     let id = format!("chatcmpl-{}", REQ_COUNTER.fetch_add(1, Ordering::Relaxed));
-    let message = Json::Obj(vec![
+    let has_tools = !tool_calls.is_empty();
+    let rendered_calls = if has_tools {
+        Json::Arr(tool_calls.iter().map(|call| Json::Obj(vec![
+            ("id".into(), Json::Str(call.id.clone())),
+            ("type".into(), Json::Str("function".into())),
+            ("function".into(), Json::Obj(vec![
+                ("name".into(), Json::Str(call.name.clone())),
+                ("arguments".into(), Json::Str(call.arguments.clone())),
+            ])),
+        ])).collect())
+    } else { Json::Null };
+    let mut message_fields = vec![
         ("role".into(),    Json::Str("assistant".into())),
-        ("content".into(), Json::Str(text.to_string())),
-    ]);
+        ("content".into(), if has_tools { Json::Null } else { Json::Str(text.to_string()) }),
+    ];
+    if has_tools { message_fields.push(("tool_calls".into(), rendered_calls)); }
+    let message = Json::Obj(message_fields);
     let choice = Json::Obj(vec![
         ("index".into(),         Json::Num(0.0)),
         ("message".into(),       message),
         ("logprobs".into(),      render_chat_logprobs(logprobs)),
         ("finish_reason".into(), Json::Str(
-            if hit_eos { "stop" } else { "length" }.to_string())),
+            if has_tools { "tool_calls" } else if hit_eos { "stop" } else { "length" }.to_string())),
     ]);
     Json::Obj(vec![
         ("id".into(),      Json::Str(id)),
@@ -1219,6 +1370,9 @@ impl ServerModel {
                         // with assistant turn primed.
                         crate::chat::format_qwen3(tok, msgs, true)?
                     }
+                    PromptInput::ChatTools { messages, options } => {
+                        crate::chat::format_qwen3_tools(tok, messages, options, true)?
+                    }
                     PromptInput::ChatVision { messages, .. } => {
                         // The bridge tokenizes the formatted text itself so it can
                         // replace the marker with image embeddings.  We count its
@@ -1286,6 +1440,7 @@ impl ServerModel {
                 let mut matched_text_stop = false;
                 let mut all_lp: Vec<TokenLogprob> = Vec::new();
                 let mut client_open = true;
+                let tool_mode = matches!(&req.prompt, PromptInput::ChatTools { .. });
                 let decode_started = std::time::Instant::now();
                 let thermal_wait_before_decode = thermal_wait_ms;
                 let mut first_token_ms = None;
@@ -1312,7 +1467,7 @@ impl ServerModel {
                         Some(decode_token_logprob(|ids| tok.decode(ids), t, &res))
                     } else { None };
                     let (visible_end, matched_stop) = stop_visible_end(&full_text, &req.stop);
-                    if visible_end > prev_text_len {
+                    if !tool_mode && visible_end > prev_text_len {
                         let delta = &full_text[prev_text_len..visible_end];
                         let ok = on_token(delta, tlp.as_ref());
                         if let Some(t) = tlp { all_lp.push(t); }
@@ -1323,6 +1478,8 @@ impl ServerModel {
                             break;
                         }
                         prev_text_len = visible_end;
+                    } else if !tool_mode && let Some(t) = tlp {
+                        all_lp.push(t);
                     } else if let Some(t) = tlp {
                         all_lp.push(t);
                     }
@@ -1338,9 +1495,15 @@ impl ServerModel {
                 if !matched_text_stop {
                     full_text = String::from_utf8_lossy(&full_bytes).into_owned();
                 }
-                if client_open && prev_text_len < full_text.len() {
+                if client_open && !tool_mode && prev_text_len < full_text.len() {
                     let _ = on_token(&full_text[prev_text_len..], None);
                 }
+                let (text, tool_calls) = if let PromptInput::ChatTools { options, .. } = &req.prompt {
+                    let parsed = tools::parse_qwen_output(&full_text, options, request_id)?;
+                    (parsed.content, parsed.tool_calls)
+                } else {
+                    (full_text, Vec::new())
+                };
                 let generation_ms = (decode_started.elapsed().as_secs_f64() * 1e3
                     - (thermal_wait_ms - thermal_wait_before_decode)).max(0.0);
                 let ttft_ms = first_token_ms.unwrap_or(prefill_ms);
@@ -1350,7 +1513,7 @@ impl ServerModel {
                         mtmd.encode_ms, mtmd.copy_ms, mtmd_ms, prefill_ms,
                         ttft_ms, generation_ms, out.len());
                 }
-                Ok(GenerationOutput { text: full_text, prompt_tokens: prompt_rows,
+                Ok(GenerationOutput { text, tool_calls, prompt_tokens: prompt_rows,
                     completion_tokens: out.len(), hit_stop: hit_eos, logprobs: all_lp,
                     prefill_ms, ttft_ms, generation_ms, thermal_wait_ms })
             }
@@ -1369,6 +1532,8 @@ impl ServerModel {
                         // accept rate over raw user text.
                         crate::chat::format_gemma4(tok, msgs, true)?
                     }
+                    PromptInput::ChatTools { .. } => return Err(
+                        "tool calling is currently supported only by a Qwen 3.5/3.6 server".into()),
                     PromptInput::ChatVision { .. } => return Err(
                         "image input is supported only by a Qwen server started with --mmproj and --mtmd-bridge".into()),
                 };
@@ -1503,7 +1668,7 @@ impl ServerModel {
                     }
                     let generation_ms = (decode_started.elapsed().as_secs_f64() * 1e3
                         - (thermal_wait_ms - thermal_wait_before_decode)).max(0.0);
-                    return Ok(GenerationOutput { text: full_text, prompt_tokens: prompt.len(),
+                    return Ok(GenerationOutput { text: full_text, tool_calls: Vec::new(), prompt_tokens: prompt.len(),
                         completion_tokens: out.len(), hit_stop: hit_eos, logprobs: all_lp,
                         prefill_ms, ttft_ms: ttft_ms.unwrap_or(prefill_ms), generation_ms,
                         thermal_wait_ms });
@@ -1562,7 +1727,7 @@ impl ServerModel {
                 }
                 // No per-token logprobs from spec-decode today; the response
                 // shaper renders `logprobs: null` when the vec is empty.
-                Ok(GenerationOutput { text: tok.decode(&gen_toks), prompt_tokens: prompt.len(),
+                Ok(GenerationOutput { text: tok.decode(&gen_toks), tool_calls: Vec::new(), prompt_tokens: prompt.len(),
                     completion_tokens: gen_toks.len(), hit_stop: stats.hit_eos,
                     logprobs: Vec::new(), prefill_ms, ttft_ms: prefill_ms, generation_ms,
                     thermal_wait_ms })
@@ -1884,6 +2049,7 @@ fn worker(rx: mpsc::Receiver<WorkerCommand>, mut current_config: config::ServeCo
                     let t = std::time::Instant::now();
                     let is_chat = req.is_chat();
                     let is_stream = req.stream;
+                    let tool_mode = matches!(&req.prompt, PromptInput::ChatTools { .. });
                     // For streaming requests, build a one-shot SSE id +
                     // first-chunk role frame (chat) up front so the
                     // per-token callback can emit just text deltas.
@@ -1956,7 +2122,11 @@ fn worker(rx: mpsc::Receiver<WorkerCommand>, mut current_config: config::ServeCo
                         Ok(Ok(output)) => {
                             let GenerationOutput { text, prompt_tokens: n_p,
                                 completion_tokens: n_c, hit_stop: eos, logprobs: lp,
+                                tool_calls,
                                 prefill_ms, ttft_ms, generation_ms, thermal_wait_ms } = output;
+                            let finish_reason = if !tool_calls.is_empty() {
+                                "tool_calls"
+                            } else if eos { "stop" } else { "length" };
                             let wall_us = t.elapsed().as_micros() as u64;
                             metrics.requests_ok.fetch_add(1, Ordering::Relaxed);
                             if let Some(status) = job_status.as_ref() {
@@ -1993,13 +2163,15 @@ fn worker(rx: mpsc::Receiver<WorkerCommand>, mut current_config: config::ServeCo
                                 if is_chat { "chat" } else { "completion" },
                                 n_p, n_c, wall_us as f64 / 1000.0, prefill_ms, ttft_ms,
                                 prompt_tok_per_s, tok_per_s,
-                                if eos { "stop" } else { "length" }, is_stream);
+                                finish_reason, is_stream);
                             if is_stream {
                                 // Flush any text still buffered by the
                                 // thinking-marker stripper (e.g. model
                                 // emitted an opener with no matching
                                 // closer — show the user what we have).
-                                let tail = stripper.borrow_mut().flush();
+                                let tail = if tool_calls.is_empty() {
+                                    stripper.borrow_mut().flush()
+                                } else { String::new() };
                                 if !tail.is_empty() {
                                     let frame = if is_chat {
                                         chat_stream_chunk(&stream_id, &model_name,
@@ -2010,14 +2182,30 @@ fn worker(rx: mpsc::Receiver<WorkerCommand>, mut current_config: config::ServeCo
                                     };
                                     let _ = reply_tx.send(StreamMsg::Chunk(frame));
                                 }
+                                if !tool_calls.is_empty() {
+                                    for (index, call) in tool_calls.iter().enumerate() {
+                                        let start = chat_tool_call_stream_chunk(
+                                            &stream_id, &model_name, index, call, true, "");
+                                        let args = chat_tool_call_stream_chunk(
+                                            &stream_id, &model_name, index, call, false, &call.arguments);
+                                        let _ = reply_tx.send(StreamMsg::Chunk(start));
+                                        let _ = reply_tx.send(StreamMsg::Chunk(args));
+                                    }
+                                } else if tool_mode && is_chat {
+                                    let clean = clean_chat_text(&text);
+                                    if !clean.is_empty() {
+                                        let frame = chat_stream_chunk(&stream_id, &model_name,
+                                            ChatDelta { role: None, content: Some(clean) }, None, None);
+                                        let _ = reply_tx.send(StreamMsg::Chunk(frame));
+                                    }
+                                }
                                 // Final SSE frame: empty delta + finish_reason.
-                                let fin = if eos { "stop" } else { "length" };
                                 let frame = if is_chat {
                                     chat_stream_chunk(&stream_id, &model_name,
-                                        ChatDelta { role: None, content: None }, Some(fin), None)
+                                        ChatDelta { role: None, content: None }, Some(finish_reason), None)
                                 } else {
                                     completion_stream_chunk(&stream_id, &model_name,
-                                        "", Some(fin), None)
+                                        "", Some(finish_reason), None)
                                 };
                                 let _ = reply_tx.send(StreamMsg::Chunk(frame));
                                 // Optional usage chunk per OpenAI spec
@@ -2084,14 +2272,13 @@ fn worker(rx: mpsc::Receiver<WorkerCommand>, mut current_config: config::ServeCo
                                 captured_response = Some(Json::Obj(vec![
                                     ("stream".into(), Json::Bool(true)),
                                     ("assembled_text".into(), Json::Str(text.clone())),
-                                    ("finish_reason".into(), Json::Str(
-                                        if eos { "stop" } else { "length" }.into())),
+                                    ("finish_reason".into(), Json::Str(finish_reason.into())),
                                 ]).to_string());
                                 HttpReply { status: 200, status_text: "OK",
                                             body: String::new() }
                             } else {
                                 let body = if is_chat {
-                                    chat_completion_response(&model_name, &text, n_p, n_c, eos, &lp)
+                                    chat_completion_response_with_tools(&model_name, &text, n_p, n_c, eos, &lp, &tool_calls)
                                 } else {
                                     completion_response(&model_name, &text, n_p, n_c, eos, &lp)
                                 };
@@ -2143,6 +2330,38 @@ fn worker(rx: mpsc::Receiver<WorkerCommand>, mut current_config: config::ServeCo
 }
 
 // --- connection handling ----------------------------------------------
+
+fn percent_decode_path_segment(input: &str) -> Result<String, &'static str> {
+    fn hex_digit(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let bytes = input.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            decoded.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        if index + 2 >= bytes.len() {
+            return Err("invalid percent-encoded GPU PCI address");
+        }
+        let high = hex_digit(bytes[index + 1])
+            .ok_or("invalid percent-encoded GPU PCI address")?;
+        let low = hex_digit(bytes[index + 2])
+            .ok_or("invalid percent-encoded GPU PCI address")?;
+        decoded.push((high << 4) | low);
+        index += 3;
+    }
+    String::from_utf8(decoded).map_err(|_| "GPU PCI address is not valid UTF-8")
+}
 
 fn handle_conn(mut stream: std::net::TcpStream, target: Target,
                tx: mpsc::Sender<WorkerCommand>, metrics: Arc<Metrics>,
@@ -2199,9 +2418,16 @@ fn handle_conn(mut stream: std::net::TcpStream, target: Target,
     if (request.method.eq_ignore_ascii_case("PUT") || request.method.eq_ignore_ascii_case("POST"))
         && path.starts_with("/api/gpus/") {
         let remainder = &path["/api/gpus/".len()..];
-        let Some((pci, operation)) = remainder.split_once('/') else {
+        let Some((raw_pci, operation)) = remainder.split_once('/') else {
             let _ = http::write_response(&mut stream, 404, "Not Found", &error_body("GPU operation path is incomplete", "invalid_request_error"));
             return;
+        };
+        let pci = match percent_decode_path_segment(raw_pci) {
+            Ok(pci) => pci,
+            Err(message) => {
+                let _ = http::write_response(&mut stream, 400, "Bad Request", &error_body(message, "invalid_request_error"));
+                return;
+            }
         };
         let (expected, helper_action) = match (request.method.as_str(), operation) {
             ("PUT", "power-limit") => ("set-power-limit", "set-power-limit"),
@@ -2216,7 +2442,7 @@ fn handle_conn(mut stream: std::net::TcpStream, target: Target,
             let _ = http::write_response(&mut stream, 400, "Bad Request", &error_body(&format!("GPU mutation requires X-ReInstinct-Action: {expected}"), "invalid_request_error")); return;
         }
         let inventory = status.inventory.json();
-        let Some(gpu) = inventory["gpus"].get(pci) else {
+        let Some(gpu) = inventory["gpus"].get(pci.as_str()) else {
             let _ = http::write_response(&mut stream, 404, "Not Found", &error_body("exact PCI GPU identity was not found", "gpu_not_found")); return;
         };
         if gpu["vendor"].as_str() != Some("AMD") {
@@ -2234,7 +2460,7 @@ fn handle_conn(mut stream: std::net::TcpStream, target: Target,
             let min = gpu["power"]["minimum_watts"].as_f64().unwrap_or(0.0);
             if !watts.is_finite() || watts < min || max.is_some_and(|m| watts > m) { let _ = http::write_response(&mut stream, 400, "Bad Request", &error_body("power limit is outside the driver-reported range", "invalid_request_error")); return; }
         }
-        match gpu::control(pci, helper_action, &payload) {
+        match gpu::control(&pci, helper_action, &payload) {
             Ok(reply) => { let _ = http::write_response(&mut stream, 200, "OK", &reply.to_string()); }
             Err(e) => { let _ = http::write_response(&mut stream, 503, "Service Unavailable", &error_body(&e, "gpu_helper_unavailable")); }
         }
@@ -2779,6 +3005,30 @@ pub fn run(overrides: config::ServeOverrides)
 mod logprobs_tests {
     use super::*;
 
+    #[test]
+    fn percent_decodes_encoded_pci_address() {
+        assert_eq!(
+            percent_decode_path_segment("0000%3A01%3A00.0").unwrap(),
+            "0000:01:00.0"
+        );
+        assert_eq!(
+            percent_decode_path_segment("0000%3a01%3a00.0").unwrap(),
+            "0000:01:00.0"
+        );
+    }
+
+    #[test]
+    fn percent_decode_rejects_malformed_escape() {
+        assert!(percent_decode_path_segment("0000%3A01%3A00.%").is_err());
+        assert!(percent_decode_path_segment("0000%ZZ01").is_err());
+    }
+
+    #[test]
+    fn clean_chat_text_removes_qwen_end_marker_after_thinking() {
+        assert_eq!(clean_chat_text("<think>internal</think>\nHello<|im_end|>\n"), "Hello");
+        assert_eq!(clean_chat_text("Hello<|im_end|>"), "Hello");
+    }
+
     fn parse_lp(body: &str) -> usize {
         // tuple positions 0..8: max_tokens, sampler, use_speculative,
         // speculative_k, speculative_p_min, request_timeout, stream,
@@ -2873,6 +3123,61 @@ mod logprobs_tests {
             {"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}}
         ]}]}"#;
         assert!(parse_chat_completions(two).is_err());
+    }
+
+    #[test]
+    fn chat_tools_parse_initial_and_follow_up_turns() {
+        let initial = parse_chat_completions(r#"{
+            "messages":[{"role":"user","content":"Read hello.txt."}],
+            "tools":[{"type":"function","function":{"name":"read","parameters":{"type":"object"}}}],
+            "tool_choice":"auto"
+        }"#).unwrap();
+        match initial.prompt {
+            PromptInput::ChatTools { messages, options } => {
+                assert_eq!(messages.len(), 1);
+                assert_eq!(options.tools[0].name, "read");
+                assert_eq!(options.choice, tools::ToolChoice::Auto);
+            }
+            _ => panic!("expected tool-aware chat request"),
+        }
+
+        let follow_up = parse_chat_completions(r#"{
+            "messages":[
+              {"role":"user","content":"Read hello.txt."},
+              {"role":"assistant","content":null,"tool_calls":[{"id":"call-1","type":"function","function":{"name":"read","arguments":"{\"path\":\"hello.txt\"}"}}]},
+              {"role":"tool","tool_call_id":"call-1","content":"hello"}
+            ],
+            "tools":[{"type":"function","function":{"name":"read","parameters":{"type":"object"}}}]
+        }"#).unwrap();
+        assert!(matches!(follow_up.prompt, PromptInput::ChatTools { .. }));
+    }
+
+    #[test]
+    fn chat_tools_reject_unlinked_result_and_shape_response() {
+        let error = parse_chat_completions(r#"{
+            "messages":[{"role":"tool","tool_call_id":"missing","content":"no"}],
+            "tools":[]
+        }"#).err().expect("unlinked result must fail");
+        assert!(error.2.contains("no preceding assistant tool call"));
+
+        let body = chat_completion_response_with_tools("qwen", "", 10, 4, true, &[], &[
+            tools::ToolCall { id: "call-1".into(), name: "read".into(), arguments: r#"{"path":"hello.txt"}"#.into() }
+        ]);
+        let value = Json::parse(&body).unwrap();
+        let choice = &value.get("choices").unwrap().as_array().unwrap()[0];
+        assert_eq!(choice.get("finish_reason").and_then(Json::as_str), Some("tool_calls"));
+        let message = choice.get("message").unwrap();
+        assert!(matches!(message.get("content"), Some(Json::Null)));
+        assert_eq!(message.get("tool_calls").unwrap().as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn chat_tool_stream_shape_contains_index_and_arguments() {
+        let call = tools::ToolCall { id: "call-1".into(), name: "read".into(), arguments: r#"{"path":"hello.txt"}"#.into() };
+        let frame = chat_tool_call_stream_chunk("chatcmpl-1", "qwen", 0, &call, false, &call.arguments);
+        assert!(frame.contains("\"tool_calls\""));
+        assert!(frame.contains("\"index\":0"));
+        assert!(frame.contains("\\\"path\\\":\\\"hello.txt\\\""));
     }
 
     #[test]

@@ -114,7 +114,7 @@ The server currently exposes:
 - `GET /healthz` for liveness;
 - `GET /v1/models` for model discovery;
 - `POST /v1/completions` for raw text prompts;
-- `POST /v1/chat/completions` for text chat and one structured image input;
+- `POST /v1/chat/completions` for text chat, modern function tools, and one structured image input;
 - OpenAI-shaped non-streaming responses and errors;
 - SSE streaming terminated by `data: [DONE]`, with optional usage chunks.
 - UTF-8-safe output assembly when one character spans multiple generated
@@ -126,8 +126,10 @@ changed live with the four `gpu_*` settings. Thermal hold time is retained as
 `thermal_wait_ms` in run history and is not included in inference timing.
 
 The OpenAPI document describes the implemented subset rather than claiming
-the entire OpenAI API. Responses, Conversations, tool calling, and structured
-output remain out of scope until their routes and semantics are implemented.
+the entire OpenAI API. Responses, Conversations, and structured output remain
+out of scope until their routes and semantics are implemented. Tool calling is
+currently limited to the Qwen 3.5/3.6 Chat Completions path and remains subject
+to real-client acceptance testing.
 
 Image input currently means exactly one user `image_url` part containing a
 base64 JPEG or PNG data URL. The decoded image is limited to 6 MiB and the HTTP
@@ -177,7 +179,6 @@ The following require explicit scope decisions and are not implied by this
 phase:
 
 - `POST /v1/responses`;
-- tool or function calling;
 - structured-output or JSON-schema enforcement;
 - remote image fetching or multipart uploads;
 - multiple images per turn;

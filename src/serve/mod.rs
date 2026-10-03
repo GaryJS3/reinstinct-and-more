@@ -200,6 +200,14 @@ struct GenReq {
     /// `logprobs: null`. Disable spec-decode (`use_speculative: false`)
     /// if you need logprobs.
     top_logprobs_n: usize,
+    /// Qwen chat-template reasoning mode. Normal chat uses the model's
+    /// native thinking channel (stripped from user-visible output); compact
+    /// title-generation calls use the template's non-thinking suffix.
+    qwen_enable_thinking: bool,
+    /// A concise last-resort title derived from the conversation. Qwen can
+    /// occasionally sample EOS as its first token in non-thinking mode; title
+    /// clients such as OpenCode otherwise keep the session untitled.
+    title_fallback: Option<String>,
 }
 
 /// Per-token logprob diagnostic for the OpenAI `logprobs:true` field.
@@ -605,7 +613,8 @@ fn parse_completions(body: &str) -> Result<GenReq, (u16, &'static str, String)> 
         parse_common_fields(&j, COMPLETION_DEFAULTS).map_err(&bad)?;
     Ok(GenReq { prompt: PromptInput::Raw(prompt), model, max_tokens, stop, sampler,
                 use_speculative, speculative_k, speculative_p_min,
-                request_timeout, stream, stream_include_usage, top_logprobs_n })
+                request_timeout, stream, stream_include_usage, top_logprobs_n,
+                qwen_enable_thinking: true, title_fallback: None })
 }
 
 fn parse_model(j: &Json) -> Result<Option<String>, String> {
@@ -642,6 +651,7 @@ fn parse_chat_completions(body: &str) -> Result<GenReq, (u16, &'static str, Stri
     let mut messages: Vec<ChatMessage> = Vec::with_capacity(arr.len());
     let mut rich: Vec<tools::ToolChatMessage> = Vec::with_capacity(arr.len());
     let mut image: Option<Vec<u8>> = None;
+    let mut force_no_think = false;
     for (i, m) in arr.iter().enumerate() {
         let role_s = m.get("role").and_then(Json::as_str)
             .ok_or_else(|| bad(format!("messages[{i}]: missing string 'role'")))?;
@@ -683,6 +693,7 @@ fn parse_chat_completions(body: &str) -> Result<GenReq, (u16, &'static str, Stri
             }
             _ => return Err(bad(format!("messages[{i}]: content must be a string or array"))),
         };
+        force_no_think |= content.contains("[REINSTINCT_NO_THINK]");
         if rich_messages {
             let rich_message = match role_s {
                 "system" | "developer" => tools::ToolChatMessage::System(content),
@@ -723,6 +734,50 @@ fn parse_chat_completions(body: &str) -> Result<GenReq, (u16, &'static str, Stri
             messages.push(ChatMessage { role, content });
         }
     }
+    let explicit_thinking = match j.get("chat_template_kwargs") {
+        None => None,
+        Some(Json::Obj(_)) => match j.get("chat_template_kwargs").and_then(|value| value.get("enable_thinking")) {
+            None => None,
+            Some(Json::Bool(value)) => Some(*value),
+            Some(_) => return Err(bad("chat_template_kwargs.enable_thinking must be a boolean".into())),
+        },
+        Some(_) => return Err(bad("chat_template_kwargs must be an object".into())),
+    };
+    let title_request = arr.iter().any(|message| {
+        let role = message.get("role").and_then(Json::as_str);
+        if !matches!(role, Some("system" | "developer")) { return false; }
+        let Some(content) = message.get("content").and_then(Json::as_str) else { return false; };
+        let content = content.to_ascii_lowercase();
+        content.contains("title generator")
+            || content.contains("thread title")
+            || content.contains("generate a title")
+            || content.contains("create a title")
+            || content.contains("conversation title")
+            || content.contains("session title")
+            || (content.contains("title")
+                && (content.contains("conversation") || content.contains("session")))
+    });
+    // The exact message marker is a per-request override, including when
+    // chat_template_kwargs explicitly enables thinking. No template reload.
+    let qwen_enable_thinking = !force_no_think && explicit_thinking.unwrap_or(!title_request);
+    let title_fallback = title_request.then(|| {
+        arr.iter().rev().filter_map(|message| {
+            if message.get("role").and_then(Json::as_str) != Some("user") { return None; }
+            let content = message.get("content").and_then(Json::as_str)?;
+            let compact = content.split_whitespace().collect::<Vec<_>>().join(" ");
+            if compact.is_empty()
+                || compact.to_ascii_lowercase().starts_with("generate a title for this conversation")
+            {
+                None
+            } else {
+                let trimmed = compact.trim_matches(['\"', '\'', ' ']);
+                let mut end = trimmed.len().min(50);
+                while end > 0 && !trimmed.is_char_boundary(end) { end -= 1; }
+                Some(trimmed[..end].trim_end().to_string())
+            }
+        }).next().filter(|title| !title.is_empty())
+            .unwrap_or_else(|| "Conversation".to_string())
+    });
     let media_markers: usize = if rich_messages {
         rich.iter().map(|m| match m {
             tools::ToolChatMessage::System(s)
@@ -775,7 +830,8 @@ fn parse_chat_completions(body: &str) -> Result<GenReq, (u16, &'static str, Stri
     };
     Ok(GenReq { prompt, model, max_tokens, stop, sampler,
                 use_speculative, speculative_k, speculative_p_min,
-                request_timeout, stream, stream_include_usage, top_logprobs_n })
+                request_timeout, stream, stream_include_usage, top_logprobs_n,
+                qwen_enable_thinking, title_fallback })
 }
 
 /// Return the visible byte end and whether a stop string has completed.
@@ -1018,14 +1074,21 @@ impl ThinkingStripStream {
         String::new()
     }
 
-    /// Flush whatever is in the buffer at end-of-stream. The model may
-    /// have stopped mid-thinking (rare) or emitted an opener with no
-    /// matching closer — emit what we have so the user sees the response.
+    /// Flush whatever is in the buffer at end-of-stream. Never expose an
+    /// unfinished reasoning channel: clients have been observed using the
+    /// leading `<think>` as a title when a model reaches its token limit
+    /// before emitting `</think>`.
     pub fn flush(&mut self) -> String {
         if self.passthrough { return String::new(); }
         let out = std::mem::take(&mut self.buf);
         self.passthrough = true;
-        out
+        if ["<think>", "<|channel>", "<|thought|>"]
+            .iter().any(|opener| out.contains(opener))
+        {
+            String::new()
+        } else {
+            out
+        }
     }
 }
 
@@ -1368,10 +1431,11 @@ impl ServerModel {
                         // Qwen 3.5/3.6: render via the qwen template
                         // (no BOS — qwen expects to start at <|im_start|>),
                         // with assistant turn primed.
-                        crate::chat::format_qwen3(tok, msgs, true)?
+                        crate::chat::format_qwen3(tok, msgs, true, req.qwen_enable_thinking)?
                     }
                     PromptInput::ChatTools { messages, options } => {
-                        crate::chat::format_qwen3_tools(tok, messages, options, true)?
+                        crate::chat::format_qwen3_tools(
+                            tok, messages, options, true, req.qwen_enable_thinking)?
                     }
                     PromptInput::ChatVision { messages, .. } => {
                         // The bridge tokenizes the formatted text itself so it can
@@ -1441,6 +1505,16 @@ impl ServerModel {
                 let mut all_lp: Vec<TokenLogprob> = Vec::new();
                 let mut client_open = true;
                 let tool_mode = matches!(&req.prompt, PromptInput::ChatTools { .. });
+                // Qwen occasionally spells a special token as ordinary text
+                // instead of sampling the configured EOS id. Treat either
+                // next-turn delimiter as an internal stop so ChatML control
+                // text and fabricated follow-up turns cannot reach clients.
+                let mut qwen_stops = req.stop.clone();
+                for marker in ["<|im_end|>", "<|im_start|>"] {
+                    if !qwen_stops.iter().any(|stop| stop == marker) {
+                        qwen_stops.push(marker.to_owned());
+                    }
+                }
                 let decode_started = std::time::Instant::now();
                 let thermal_wait_before_decode = thermal_wait_ms;
                 let mut first_token_ms = None;
@@ -1466,7 +1540,7 @@ impl ServerModel {
                     let tlp = if want_lp > 0 {
                         Some(decode_token_logprob(|ids| tok.decode(ids), t, &res))
                     } else { None };
-                    let (visible_end, matched_stop) = stop_visible_end(&full_text, &req.stop);
+                    let (visible_end, matched_stop) = stop_visible_end(&full_text, &qwen_stops);
                     if !tool_mode && visible_end > prev_text_len {
                         let delta = &full_text[prev_text_len..visible_end];
                         let ok = on_token(delta, tlp.as_ref());
@@ -2124,6 +2198,12 @@ fn worker(rx: mpsc::Receiver<WorkerCommand>, mut current_config: config::ServeCo
                                 completion_tokens: n_c, hit_stop: eos, logprobs: lp,
                                 tool_calls,
                                 prefill_ms, ttft_ms, generation_ms, thermal_wait_ms } = output;
+                            let visible_text_empty = is_chat && clean_chat_text(&text).trim().is_empty();
+                            let response_text = if visible_text_empty {
+                                req.title_fallback.as_deref().unwrap_or(&text)
+                            } else {
+                                &text
+                            };
                             let finish_reason = if !tool_calls.is_empty() {
                                 "tool_calls"
                             } else if eos { "stop" } else { "length" };
@@ -2182,6 +2262,18 @@ fn worker(rx: mpsc::Receiver<WorkerCommand>, mut current_config: config::ServeCo
                                     };
                                     let _ = reply_tx.send(StreamMsg::Chunk(frame));
                                 }
+                                if visible_text_empty {
+                                    if let Some(fallback) = req.title_fallback.as_deref() {
+                                        let frame = if is_chat {
+                                            chat_stream_chunk(&stream_id, &model_name,
+                                                ChatDelta { role: None, content: Some(fallback) }, None, None)
+                                        } else {
+                                            completion_stream_chunk(&stream_id, &model_name,
+                                                fallback, None, None)
+                                        };
+                                        let _ = reply_tx.send(StreamMsg::Chunk(frame));
+                                    }
+                                }
                                 if !tool_calls.is_empty() {
                                     for (index, call) in tool_calls.iter().enumerate() {
                                         let start = chat_tool_call_stream_chunk(
@@ -2192,7 +2284,7 @@ fn worker(rx: mpsc::Receiver<WorkerCommand>, mut current_config: config::ServeCo
                                         let _ = reply_tx.send(StreamMsg::Chunk(args));
                                     }
                                 } else if tool_mode && is_chat {
-                                    let clean = clean_chat_text(&text);
+                                    let clean = clean_chat_text(response_text);
                                     if !clean.is_empty() {
                                         let frame = chat_stream_chunk(&stream_id, &model_name,
                                             ChatDelta { role: None, content: Some(clean) }, None, None);
@@ -2271,16 +2363,16 @@ fn worker(rx: mpsc::Receiver<WorkerCommand>, mut current_config: config::ServeCo
                                 // write "data: [DONE]\n\n" and close.
                                 captured_response = Some(Json::Obj(vec![
                                     ("stream".into(), Json::Bool(true)),
-                                    ("assembled_text".into(), Json::Str(text.clone())),
+                                    ("assembled_text".into(), Json::Str(response_text.to_string())),
                                     ("finish_reason".into(), Json::Str(finish_reason.into())),
                                 ]).to_string());
                                 HttpReply { status: 200, status_text: "OK",
                                             body: String::new() }
                             } else {
                                 let body = if is_chat {
-                                    chat_completion_response_with_tools(&model_name, &text, n_p, n_c, eos, &lp, &tool_calls)
+                                    chat_completion_response_with_tools(&model_name, response_text, n_p, n_c, eos, &lp, &tool_calls)
                                 } else {
-                                    completion_response(&model_name, &text, n_p, n_c, eos, &lp)
+                                    completion_response(&model_name, response_text, n_p, n_c, eos, &lp)
                                 };
                                 captured_response = Some(body.clone());
                                 HttpReply { status: 200, status_text: "OK", body }
@@ -2730,6 +2822,8 @@ fn handle_conn(mut stream: std::net::TcpStream, target: Target,
                 stream: false,
                 stream_include_usage: false,
                 top_logprobs_n: 0,
+                qwen_enable_thinking: true,
+                title_fallback: None,
             })
         }
         Some("chat") => parse_chat_completions(&request.body),
@@ -3029,6 +3123,13 @@ mod logprobs_tests {
         assert_eq!(clean_chat_text("Hello<|im_end|>"), "Hello");
     }
 
+    #[test]
+    fn streaming_never_exposes_unclosed_thinking_as_a_title() {
+        let mut stream = ThinkingStripStream::new();
+        assert_eq!(stream.push("<think>drafting a title"), "");
+        assert_eq!(stream.flush(), "");
+    }
+
     fn parse_lp(body: &str) -> usize {
         // tuple positions 0..8: max_tokens, sampler, use_speculative,
         // speculative_k, speculative_p_min, request_timeout, stream,
@@ -3188,6 +3289,69 @@ mod logprobs_tests {
         }"#).unwrap();
         assert_eq!(req.max_tokens, 17);
         assert_eq!(req.stop, ["END", "DONE"]);
+    }
+
+    #[test]
+    fn no_think_marker_overrides_explicit_thinking() {
+        for role in ["system", "developer", "user", "assistant"] {
+            let body = format!(r#"{{"messages":[{{"role":"{role}","content":"Answer directly [REINSTINCT_NO_THINK]"}}],"chat_template_kwargs":{{"enable_thinking":true}}}}"#);
+            let req = parse_chat_completions(&body).unwrap();
+            assert!(!req.qwen_enable_thinking, "role: {role}");
+            assert!(req.title_fallback.is_none());
+        }
+        let structured = parse_chat_completions(r#"{
+            "messages":[{"role":"user","content":[{"type":"text","text":"[REINSTINCT_NO_THINK] Answer directly"}]}]
+        }"#).unwrap();
+        assert!(!structured.qwen_enable_thinking);
+        let tools = parse_chat_completions(r#"{
+            "messages":[
+                {"role":"assistant","content":null,"tool_calls":[{"id":"call-1","type":"function","function":{"name":"read","arguments":"{}"}}]},
+                {"role":"tool","tool_call_id":"call-1","content":"[REINSTINCT_NO_THINK]"}
+            ]
+        }"#).unwrap();
+        assert!(!tools.qwen_enable_thinking);
+        let ordinary = parse_chat_completions(r#"{
+            "messages":[{"role":"user","content":"[reinstinct_no_think]"}]
+        }"#).unwrap();
+        assert!(ordinary.qwen_enable_thinking);
+    }
+
+    #[test]
+    fn title_requests_disable_thinking_and_explicit_setting_wins() {
+        let title = parse_chat_completions(r#"{
+            "messages":[
+              {"role":"system","content":"Generate a concise title for this conversation. Return only the title."},
+              {"role":"user","content":"tell me about this project"}
+            ]
+        }"#).unwrap();
+        assert!(!title.qwen_enable_thinking);
+        assert_eq!(title.title_fallback.as_deref(), Some("tell me about this project"));
+
+        let opencode = parse_chat_completions(r#"{
+            "messages":[
+              {"role":"system","content":"You are a title generator. You output ONLY a thread title. Nothing else."},
+              {"role":"user","content":"Generate a title for this conversation:\n"},
+              {"role":"user","content":"tell me about this project"}
+            ]
+        }"#).unwrap();
+        assert!(!opencode.qwen_enable_thinking);
+        assert_eq!(opencode.title_fallback.as_deref(), Some("tell me about this project"));
+
+        let explicit = parse_chat_completions(r#"{
+            "messages":[
+              {"role":"system","content":"Generate a title for this conversation."},
+              {"role":"user","content":"hello"}
+            ],
+            "chat_template_kwargs":{"enable_thinking":true}
+        }"#).unwrap();
+        assert!(explicit.qwen_enable_thinking);
+        assert_eq!(explicit.title_fallback.as_deref(), Some("hello"));
+
+        let ordinary = parse_chat_completions(r#"{
+            "messages":[{"role":"user","content":"Test"}]
+        }"#).unwrap();
+        assert!(ordinary.qwen_enable_thinking);
+        assert!(ordinary.title_fallback.is_none());
     }
 
     #[test]

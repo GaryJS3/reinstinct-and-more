@@ -186,6 +186,12 @@ pub fn format_gemma4_user_turn(tok: &GemmaTokenizer, content: &str)
 const QWEN_IM_START: u32 = 248045;   // <|im_start|>
 const QWEN_IM_END:   u32 = 248046;   // <|im_end|>
 const QWEN_NEWLINE:  u32 = 198;      // \n
+const QWEN_TEMPLATE_SPECIALS: &[&str] = &[
+    "<|im_start|>", "<|im_end|>",
+    "<tool_call>", "</tool_call>",
+    "<tool_response>", "</tool_response>",
+    "<think>", "</think>",
+];
 
 #[cfg(test)]
 mod tests {
@@ -261,25 +267,49 @@ mod tests {
                 content: "hello".into(),
             },
         ];
-        let rendered = format_qwen3_tools_text(&messages, &options, true).unwrap();
+        let rendered = format_qwen3_tools_text(&messages, &options, true, false).unwrap();
         assert!(rendered.contains("<tools>"));
         assert!(rendered.contains("\"name\":\"read\""));
         assert!(rendered.contains("<tool_call>"));
         assert!(rendered.contains("<tool_response>"));
-        assert!(rendered.ends_with("<|im_start|>assistant\n<think>\n"));
+        assert!(rendered.contains("<parameter=example_parameter_2>"));
+        assert!(rendered.contains("an inner <function=...></function> block"));
+        assert!(rendered.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+    }
+
+    #[test]
+    fn qwen_tool_template_groups_consecutive_results_like_native_jinja() {
+        let options = crate::serve::tools::ChatToolOptions {
+            tools: Vec::new(),
+            choice: crate::serve::tools::ToolChoice::None,
+            parallel: true,
+        };
+        let messages = vec![
+            crate::serve::tools::ToolChatMessage::Tool {
+                tool_call_id: "call-1".into(), content: "one".into(),
+            },
+            crate::serve::tools::ToolChatMessage::Tool {
+                tool_call_id: "call-2".into(), content: "two".into(),
+            },
+        ];
+        let rendered = format_qwen3_tools_text(&messages, &options, false, false).unwrap();
+        assert_eq!(rendered.matches("<|im_start|>user").count(), 1);
+        assert_eq!(rendered.matches("<tool_response>").count(), 2);
+        assert_eq!(rendered.matches("<|im_end|>").count(), 1);
     }
 }
 
 /// Render `messages` into a Qwen 3.5/3.6 chat-template token sequence,
-/// matching `Qwen3.5-*/chat_template.jinja` for the basic chat case
-/// (system / user / assistant; no tool calls, no `<think>` channel).
+/// matching `Qwen3.5-*/chat_template.jinja` for the basic chat case.
 ///
 /// Qwen's chat template does **not** prepend BOS — the model expects to
 /// start with `<|im_start|>` directly. If `add_generation_prompt` is
-/// true, ends with `<|im_start|>assistant\n` so the model decodes the
-/// assistant turn directly.
+/// true, ends with the template's `enable_thinking=false` generation
+/// preamble.  The empty, already-closed thinking block is significant:
+/// without it Qwen3.6 may start an unbounded `<think>` response even when
+/// the OpenAI caller did not request reasoning.
 pub fn format_qwen3(tok: &Tokenizer, messages: &[ChatMessage],
-                    add_generation_prompt: bool) -> Result<Vec<u32>, String>
+                    add_generation_prompt: bool, enable_thinking: bool) -> Result<Vec<u32>, String>
 {
     let approx = 8 + messages.iter().map(|m| 8 + m.content.len() / 2).sum::<usize>();
     let mut out = Vec::with_capacity(approx);
@@ -303,6 +333,14 @@ pub fn format_qwen3(tok: &Tokenizer, messages: &[ChatMessage],
         out.push(QWEN_IM_START);
         out.push(role_id);
         out.push(QWEN_NEWLINE);
+        out.push(tok.token_id("<think>").ok_or("qwen3 chat: '<think>' not in vocab")?);
+        out.push(QWEN_NEWLINE);
+        if !enable_thinking {
+            out.push(QWEN_NEWLINE);
+            out.push(tok.token_id("</think>").ok_or("qwen3 chat: '</think>' not in vocab")?);
+            out.push(QWEN_NEWLINE);
+            out.push(QWEN_NEWLINE);
+        }
     }
     Ok(out)
 }
@@ -316,15 +354,17 @@ pub(crate) fn format_qwen3_tools(
     messages: &[crate::serve::tools::ToolChatMessage],
     options: &crate::serve::tools::ChatToolOptions,
     add_generation_prompt: bool,
+    enable_thinking: bool,
 ) -> Result<Vec<u32>, String> {
-    let rendered = format_qwen3_tools_text(messages, options, add_generation_prompt)?;
-    Ok(tok.encode(&rendered))
+    let rendered = format_qwen3_tools_text(messages, options, add_generation_prompt, enable_thinking)?;
+    tok.encode_with_special_tokens(&rendered, QWEN_TEMPLATE_SPECIALS)
 }
 
 pub(crate) fn format_qwen3_tools_text(
     messages: &[crate::serve::tools::ToolChatMessage],
     options: &crate::serve::tools::ChatToolOptions,
     add_generation_prompt: bool,
+    enable_thinking: bool,
 ) -> Result<String, String> {
     let mut out = String::new();
     if !options.tools.is_empty() {
@@ -333,7 +373,7 @@ pub(crate) fn format_qwen3_tools_text(
             out.push('\n');
             out.push_str(&tool_definition_json(tool));
         }
-        out.push_str("\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format.\n- Required parameters MUST be specified.\n- If there is no function call available, answer the question normally.\n</IMPORTANT>");
+        out.push_str("\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>");
         if let crate::serve::tools::ToolChoice::Required = options.choice {
             out.push_str("\nYou MUST call an available function before answering.\n");
         } else if let crate::serve::tools::ToolChoice::Function(ref name) = options.choice {
@@ -343,7 +383,15 @@ pub(crate) fn format_qwen3_tools_text(
         }
         out.push_str("<|im_end|>\n");
     }
-    for message in messages {
+    let last_query_index = messages.iter().rposition(|message|
+        matches!(message, crate::serve::tools::ToolChatMessage::User(_))
+    ).unwrap_or(0);
+    let mut tool_group_open = false;
+    for (message_index, message) in messages.iter().enumerate() {
+        if tool_group_open && !matches!(message, crate::serve::tools::ToolChatMessage::Tool { .. }) {
+            out.push_str("<|im_end|>\n");
+            tool_group_open = false;
+        }
         match message {
             crate::serve::tools::ToolChatMessage::System(content) => {
                 // The tool preamble is the system turn.  Preserve the
@@ -364,13 +412,16 @@ pub(crate) fn format_qwen3_tools_text(
             }
             crate::serve::tools::ToolChatMessage::User(content) => {
                 out.push_str("<|im_start|>user\n");
-                out.push_str(content);
+                out.push_str(content.trim());
                 out.push_str("<|im_end|>\n");
             }
             crate::serve::tools::ToolChatMessage::Assistant { content, tool_calls } => {
                 out.push_str("<|im_start|>assistant\n");
+                if message_index > last_query_index {
+                    out.push_str("<think>\n\n</think>\n\n");
+                }
                 if let Some(content) = content {
-                    out.push_str(content);
+                    out.push_str(content.trim());
                 }
                 for (call_index, call) in tool_calls.iter().enumerate() {
                     if content.as_deref().is_some_and(|value| !value.is_empty()) || call_index > 0 {
@@ -381,14 +432,24 @@ pub(crate) fn format_qwen3_tools_text(
                 out.push_str("<|im_end|>\n");
             }
             crate::serve::tools::ToolChatMessage::Tool { content, .. } => {
-                out.push_str("<|im_start|>user\n<tool_response>\n");
-                out.push_str(content);
-                out.push_str("\n</tool_response><|im_end|>\n");
+                if !tool_group_open {
+                    out.push_str("<|im_start|>user");
+                    tool_group_open = true;
+                }
+                out.push_str("\n<tool_response>\n");
+                out.push_str(content.trim());
+                out.push_str("\n</tool_response>");
             }
         }
     }
+    if tool_group_open {
+        out.push_str("<|im_end|>\n");
+    }
     if add_generation_prompt {
         out.push_str("<|im_start|>assistant\n<think>\n");
+        if !enable_thinking {
+            out.push_str("\n</think>\n\n");
+        }
     }
     Ok(out)
 }

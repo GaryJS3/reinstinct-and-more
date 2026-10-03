@@ -153,6 +153,40 @@ impl Tokenizer {
         out
     }
 
+    /// Encode ordinary text while preserving selected literal vocabulary
+    /// entries as single tokens. Qwen chat templates contain user-defined
+    /// tokens such as `<think>` and `<tool_call>` (GGUF token type 4); plain
+    /// byte-BPE encoding does not select those ids automatically.
+    pub fn encode_with_special_tokens(
+        &self,
+        text: &str,
+        specials: &[&str],
+    ) -> Result<Vec<u32>, String> {
+        let mut resolved = Vec::with_capacity(specials.len());
+        for &special in specials {
+            let id = self.token_id(special)
+                .ok_or_else(|| format!("special token {special:?} is not in the vocabulary"))?;
+            resolved.push((special, id));
+        }
+        let mut out = Vec::new();
+        let mut cursor = 0;
+        while cursor < text.len() {
+            let next = resolved.iter().filter_map(|&(special, id)| {
+                text[cursor..].find(special).map(|relative| (cursor + relative, special, id))
+            }).min_by_key(|&(position, special, _)| (position, std::cmp::Reverse(special.len())));
+            let Some((position, special, id)) = next else {
+                out.extend(self.encode(&text[cursor..]));
+                break;
+            };
+            if position > cursor {
+                out.extend(self.encode(&text[cursor..position]));
+            }
+            out.push(id);
+            cursor = position + special.len();
+        }
+        Ok(out)
+    }
+
     /// BPE-encode one pre-token chunk, appending ids to `out`.
     fn encode_chunk(&self, chunk: &str, out: &mut Vec<u32>) {
         if chunk.is_empty() { return; }
@@ -467,6 +501,23 @@ mod tests {
         let tok = Tokenizer::from_gguf(&g).expect("load tokenizer");
         eprintln!("vocab = {}, eos = {}", tok.vocab_size(), tok.eos_id);
         assert!(tok.vocab_size() > 200_000);
+    }
+
+    #[test]
+    fn qwen_template_markers_encode_as_single_special_tokens() {
+        let Some(p) = fixture_path() else { eprintln!("skip"); return };
+        let g = GgufFile::open(&p).unwrap();
+        let tok = Tokenizer::from_gguf(&g).unwrap();
+        let specials = ["<|im_start|>", "<think>", "</think>", "<|im_end|>"];
+        let ids = tok.encode_with_special_tokens(
+            "<|im_start|><think></think><|im_end|>",
+            &specials,
+        ).unwrap();
+        let expected: Vec<u32> = specials.iter()
+            .map(|special| tok.token_id(special).unwrap())
+            .collect();
+        assert_eq!(ids, expected);
+        assert_eq!(tok.decode(&ids), "<|im_start|><think></think><|im_end|>");
     }
 
     #[test]

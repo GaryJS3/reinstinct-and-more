@@ -988,7 +988,7 @@ fn generate_text(path: &std::path::Path, prompt_text: Option<String>,
             msgs.push(ChatMessage { role: Role::System, content: s.clone() });
         }
         msgs.push(ChatMessage { role: Role::User, content: user_text });
-        format_qwen3(&tok, &msgs, true).map_err(anyhow::Error::msg)?
+        format_qwen3(&tok, &msgs, true, true).map_err(anyhow::Error::msg)?
     } else if let Some(text) = &prompt_text {
         let tok = Tokenizer::from_gguf(&g).map_err(anyhow::Error::msg)?;
         let ids = tok.encode(text);

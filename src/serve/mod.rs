@@ -1369,15 +1369,18 @@ impl ServerModel {
             let model = Qwen35Model::load(&g).map_err(|e| e.to_string())?;
             let eos = model.config.eos_token_id;
             let gpu = GpuQwen35::new(&model, &g, cache, max_seq)?;
-            let state = Qwen35GpuState::new(&model, max_seq)?;
+            let mut state = Qwen35GpuState::new(&model, max_seq)?;
             let tok = Tokenizer::from_gguf(&g)?;
             let vision = match vision_config {
                 Some(v) => {
                     info!("loading mtmd bridge {} ...", v.bridge.display());
-                    Some(crate::multimodal::MtmdProcessor::load(
+                    let mut processor = crate::multimodal::MtmdProcessor::load(
                         &v.bridge, path, &v.mmproj, model.config.hidden_size as usize,
                         v.use_gpu, v.threads, v.image_min_tokens, v.image_max_tokens,
-                    )?)
+                    )?;
+                    info!("reserving maximum Qwen vision workspace before readiness ...");
+                    processor.reserve_qwen_vision_workspace(&v.mmproj, v.image_max_tokens)?;
+                    Some(processor)
                 }
                 None => None,
             };
@@ -1385,6 +1388,8 @@ impl ServerModel {
                 warn!("--big-drafter ignored on qwen35 target \
                        (no supported drafter; see gemma4-mtp memory file)");
             }
+            info!("reserving Qwen context and serving workspace before readiness ...");
+            gpu.reserve_serving_workspace(&mut state)?;
             Ok(ServerModel::Qwen { gpu, state, tok, eos, max_seq, name, vision })
         }
     }
@@ -1407,6 +1412,7 @@ impl ServerModel {
     /// decode path (which doesn't surface per-token softmax probs today).
     fn generate(&mut self, req: &GenReq, request_id: u64,
                 thermal: &thermal::ThermalGuard,
+                status: Option<&api::ApiStatus>,
                 mut on_token: impl FnMut(&str, Option<&TokenLogprob>) -> bool)
         -> Result<GenerationOutput, String>
     {
@@ -1454,6 +1460,7 @@ impl ServerModel {
                     return Err("prompt encoded to zero tokens".into());
                 }
                 state.reset()?;
+                if let Some(status) = status { status.set_context_used(0); }
                 let mut vision_profile = None;
                 let prefill_started = std::time::Instant::now();
                 let thermal_wait_before_prefill = thermal_wait_ms;
@@ -1493,6 +1500,7 @@ impl ServerModel {
                 let prefill_ms = (prefill_started.elapsed().as_secs_f64() * 1e3
                     - (thermal_wait_ms - thermal_wait_before_prefill)).max(0.0);
                 let prefill_logical_pos = state.rope_pos;
+                if let Some(status) = status { status.set_context_used(state.kv_pos); }
                 let vocab = logits.len();
                 let mut counts: Vec<u16> = if sp.frequency_penalty != 0.0
                     || sp.presence_penalty != 0.0 { vec![0u16; vocab] } else { Vec::new() };
@@ -1565,6 +1573,7 @@ impl ServerModel {
                     }
                     checkpoint!();
                     logits = gpu.forward_token(t, state)?;
+                    if let Some(status) = status { status.set_context_used(state.kv_pos); }
                 }
                 if !matched_text_stop {
                     full_text = String::from_utf8_lossy(&full_bytes).into_owned();
@@ -2191,7 +2200,7 @@ fn worker(rx: mpsc::Receiver<WorkerCommand>, mut current_config: config::ServeCo
                         reply_for_cb.send(StreamMsg::Chunk(frame)).is_ok()
                     };
                     let result = std::panic::catch_unwind(
-                        std::panic::AssertUnwindSafe(|| model.generate(&req, job.request_id, &status_thermal, on_token)));
+                        std::panic::AssertUnwindSafe(|| model.generate(&req, job.request_id, &status_thermal, job_status.as_deref(), on_token)));
                     match result {
                         Ok(Ok(output)) => {
                             let GenerationOutput { text, prompt_tokens: n_p,
@@ -2210,11 +2219,11 @@ fn worker(rx: mpsc::Receiver<WorkerCommand>, mut current_config: config::ServeCo
                             let wall_us = t.elapsed().as_micros() as u64;
                             metrics.requests_ok.fetch_add(1, Ordering::Relaxed);
                             if let Some(status) = job_status.as_ref() {
-                                // The generated state contains the prompt plus
-                                // accepted decode positions. This is a
-                                // conservative status snapshot; the runtime
-                                // allocator remains authoritative for bytes.
-                                status.set_context_used(n_p.saturating_add(n_c));
+                                let occupied = match &model {
+                                    ServerModel::Qwen { state, .. } => state.kv_pos,
+                                    _ => n_p.saturating_add(n_c),
+                                };
+                                status.set_context_used(occupied);
                             }
                             metrics.prompt_tokens.fetch_add(n_p as u64, Ordering::Relaxed);
                             metrics.completion_tokens.fetch_add(n_c as u64, Ordering::Relaxed);

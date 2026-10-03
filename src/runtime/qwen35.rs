@@ -423,6 +423,12 @@ const MOE_PREFILL_CHUNK: usize = 256;
 /// also uses it. 16 covers any sane k.
 const VERIFY_MAX_TOKENS: usize = 16;
 
+/// Maximum number of rows sent through the batched prefill kernels at once.
+/// The GDN head-dim=128 fast path stages `2 * n_rows` floats in dynamic LDS;
+/// bounding the batch avoids an invalid HIP launch for long tool prompts and
+/// keeps activation scratch proportional to the chunk.
+const PREFILL_CHUNK: usize = 2048;
+
 /// A free-list pool of `DeviceBuf<T>` keyed by element count. Replaces
 /// per-call `hipMalloc` in the batched prefill / verify path: the first
 /// pass allocates, every later pass reuses. `take` hands out a
@@ -432,23 +438,50 @@ const VERIFY_MAX_TOKENS: usize = 16;
 /// what makes the per-round spec-decode verify cheap.
 pub(crate) struct DeviceBufPool<T> {
     free: std::cell::RefCell<std::collections::HashMap<usize, Vec<DeviceBuf<T>>>>,
+    reserved_rows: std::cell::Cell<usize>,
+    sealed: std::cell::Cell<bool>,
 }
 
 impl<T: Copy> DeviceBufPool<T> {
     pub(crate) fn new() -> Self {
-        Self { free: std::cell::RefCell::new(std::collections::HashMap::new()) }
+        Self { free: std::cell::RefCell::new(std::collections::HashMap::new()),
+               reserved_rows: std::cell::Cell::new(0), sealed: std::cell::Cell::new(false) }
     }
 
     /// A buffer of exactly `len` elements — reused from the pool when
     /// available, freshly allocated otherwise. Contents are unspecified
     /// (same contract as `DeviceBuf::new`).
     pub(crate) fn take(&self, len: usize) -> Result<PooledBuf<'_, T>, String> {
-        let reused = self.free.borrow_mut().get_mut(&len).and_then(|v| v.pop());
-        let buf = match reused {
+        self.take_capacity(len, len)
+    }
+
+    fn take_rows(&self, rows: usize, width: usize) -> Result<PooledBuf<'_, T>, String> {
+        let reserved = self.reserved_rows.get();
+        if reserved > 0 && rows > reserved {
+            return Err(format!("scratch batch {rows} exceeds reserved capacity {reserved}"));
+        }
+        self.take_capacity(rows * width, rows.max(reserved) * width)
+    }
+
+    fn take_capacity(&self, len: usize, capacity: usize) -> Result<PooledBuf<'_, T>, String> {
+        let reused = self.free.borrow_mut().get_mut(&capacity).and_then(|v| v.pop());
+        let mut buf = match reused {
             Some(b) => b,
-            None    => DeviceBuf::new_in(len, MemoryCategory::Scratch)?,
+            None if self.sealed.get() => return Err(format!(
+                "reserved scratch exhausted: need {capacity} elements; request-time allocation disabled")),
+            None    => DeviceBuf::new_in(capacity, MemoryCategory::Scratch)?,
         };
-        Ok(PooledBuf { buf: Some(buf), pool: self, len })
+        buf.set_logical_len(len);
+        let borrowed_bytes = len * std::mem::size_of::<T>();
+        hip::account_scratch_borrow(borrowed_bytes, true);
+        Ok(PooledBuf { buf: Some(buf), pool: self, len: capacity, borrowed_bytes })
+    }
+
+    /// Drop all returned buffers. The owning stream must be synchronized
+    /// first when a kernel chain may still be using a buffer.
+    pub(crate) fn clear(&self) {
+        if self.sealed.get() { return; }
+        self.free.borrow_mut().clear();
     }
 }
 
@@ -458,11 +491,13 @@ pub(crate) struct PooledBuf<'a, T> {
     buf:  Option<DeviceBuf<T>>,
     pool: &'a DeviceBufPool<T>,
     len:  usize,
+    borrowed_bytes: usize,
 }
 
 impl<T> Drop for PooledBuf<'_, T> {
     fn drop(&mut self) {
         if let Some(b) = self.buf.take() {
+            hip::account_scratch_borrow(self.borrowed_bytes, false);
             self.pool.free.borrow_mut().entry(self.len).or_default().push(b);
         }
     }
@@ -981,6 +1016,7 @@ pub struct GpuQwen35 {
     /// (must be pooled so the prefill chain can be HIP-graph-captured —
     /// hipMalloc is forbidden during capture).
     pool_u16: DeviceBufPool<u16>,
+    pool_positions: DeviceBufPool<u32>,
     /// Token-counts whose prefill pools have been fully warmed. The
     /// first prefill at a new `n` runs uncaptured (allocating into the
     /// pools); subsequent prefills at that `n` capture+launch.
@@ -1345,7 +1381,7 @@ impl GpuQwen35 {
         Ok(Self {
             token_embd, output_norm, output_proj,
             hidden_a, hidden_b, mtp_scratch, mtp_chain_hid, verify_hidden,
-            pool_f32, pool_u8, pool_u16, prefill_warm_p, ffn_a, ffn_b,
+            pool_f32, pool_u8, pool_u16, pool_positions: DeviceBufPool::new(), prefill_warm_p, ffn_a, ffn_b,
             q_raw, q_buf, gate_buf, k_raw, v_raw, k_norm, attn_concat, logits,
             attn_o_partial, attn_m_partial, attn_l_partial, use_old_attn,
             d_kv_pos, d_rope_pos, d_mrope_positions, d_mrope_sections,
@@ -3681,11 +3717,11 @@ impl GpuQwen35 {
             dq = Some(b);
         }
         // X → fp16. Pooled (capture-safe; pooled buffers aren't freed).
-        let x_f16 = self.pool_u16.take(n_rows * in_d)?;
+        let x_f16 = self.pool_u16.take_rows(n_rows, in_d)?;
         self.launch_cvt("cvt_f32_to_f16", x_f32, x_f16.raw_ptr(), (n_rows * in_d) as u32)?;
         // GEMM. rocBLAS handle shares self.stream, so it serialises after
         // the dequant + cvt launches above — no explicit sync needed.
-        let y_f16 = self.pool_u16.take(n_rows * out_d)?;
+        let y_f16 = self.pool_u16.take_rows(n_rows, out_d)?;
         unsafe {
             self.rocblas.gemm_f16_f32acc(
                 RocblasOp::Transpose, RocblasOp::None,
@@ -3721,7 +3757,7 @@ impl GpuQwen35 {
             _              => (&self.matvec_q4k_batched_module, "matvec_q4k_repacked_batched_f32"),
         };
         // Quantise the activation rows → BlockQ8 [n_rows, in_dim/32].
-        let xq8 = self.pool_u8.take(n_rows * (in_d / 32) * 40)?;
+        let xq8 = self.pool_u8.take_rows(n_rows, (in_d / 32) * 40)?;
         self.launch_quantize_q8_into(x_f32, xq8.raw_ptr(), in_d as u32, n_rows as u32)?;
         // grid.x = ceil(out_dim / 8) — the kernel emits 8 output rows/WG.
         let f = module.function(kname)?;
@@ -3753,7 +3789,7 @@ impl GpuQwen35 {
             _              => (&self.mmq_q4k_module, "mmq_gemm_q4k_repacked_f32"),
         };
         // Quantise the activation rows → BlockQ8 [n_rows, in_dim/32].
-        let xq8 = self.pool_u8.take(n_rows * (in_d / 32) * 40)?;
+        let xq8 = self.pool_u8.take_rows(n_rows, (in_d / 32) * 40)?;
         self.launch_quantize_q8_into(x_f32, xq8.raw_ptr(), in_d as u32, n_rows as u32)?;
 
         // MMQ GEMM — BM=64 output rows × BN=64 tokens per workgroup.
@@ -3866,17 +3902,84 @@ impl GpuQwen35 {
                           (block, 1, 1), smem, Some(&self.stream), &mut args) }
     }
 
-    /// Batched prefill: process all `tokens` in one pass, advancing each
+    /// Batched prefill: process `tokens` in bounded chunks, advancing each
     /// block's state, and return the logits at the LAST position.
+    ///
+    /// The chunk boundary is transparent to the caller: full-attention
+    /// chunks attend to the already-populated KV cache and GDN chunks thread
+    /// the recurrent state forward. Keeping the bound here is required by
+    /// the dynamic-LDS GDN prefill kernel on gfx906.
     ///
     /// Mirrors `forward_tokens` but batches every matmul into a single
     /// rocBLAS GEMM (weight read once, reused across N rows). The GDN
     /// recurrent + conv steps stay sequential per position — that's an
     /// inherent data dependency — but their projections are batched.
+    /// Reserve the serving workspace before readiness. Context state has
+    /// already been allocated; warm the largest bounded prefill and decode
+    /// paths, then forbid further pool allocations. Small prompts use logical
+    /// prefixes of the same allocations, rather than growing per-size caches.
+    pub fn reserve_serving_workspace(&self, state: &mut Qwen35GpuState)
+        -> Result<(), String>
+    {
+        let rows = self.max_seq.min(PREFILL_CHUNK);
+        self.pool_f32.reserved_rows.set(rows);
+        self.pool_u8.reserved_rows.set(rows);
+        self.pool_u16.reserved_rows.set(rows);
+        self.pool_positions.reserved_rows.set(rows);
+        let warmup = (|| {
+            drop(self.pool_positions.take_rows(rows, 4)?);
+            self.forward_tokens_batched(&vec![0; rows], state)?;
+            state.reset()?;
+            self.forward_token(0, state)?;
+            state.reset()?;
+            Ok::<(), String>(())
+        })();
+        warmup.map_err(|e| format!(
+            "cannot reserve Qwen serving workspace for {} context tokens and {rows} prefill rows: {e}; reduce max_seq or move vision to CPU",
+            self.max_seq))?;
+        self.pool_f32.sealed.set(true);
+        self.pool_u8.sealed.set(true);
+        self.pool_u16.sealed.set(true);
+        self.pool_positions.sealed.set(true);
+        Ok(())
+    }
+
     pub fn forward_tokens_batched(&self, tokens: &[u32], state: &mut Qwen35GpuState)
         -> Result<Vec<f32>, String>
     {
         assert!(!tokens.is_empty(), "forward_tokens_batched needs ≥1 token");
+        let result = self.forward_tokens_batched_inner(tokens, state);
+        if result.is_err() {
+            // A failed launch can occur after several pooled buffers have
+            // been returned by stack unwinding. Release them after draining
+            // the stream so an OpenCode retry cannot turn one bad request
+            // into a persistent GPU OOM.
+            let _ = self.stream.synchronize();
+            self.pool_f32.clear();
+            self.pool_u8.clear();
+            self.pool_u16.clear();
+            self.prefill_warm_p.borrow_mut().clear();
+        }
+        result
+    }
+
+    fn forward_tokens_batched_inner(&self, tokens: &[u32], state: &mut Qwen35GpuState)
+        -> Result<Vec<f32>, String>
+    {
+        let mut last = None;
+        for chunk in tokens.chunks(self.max_seq.min(PREFILL_CHUNK)) {
+            last = Some(self.forward_tokens_batched_chunk(chunk, state)?);
+        }
+        Ok(last.expect("forward_tokens_batched called with an empty token slice"))
+    }
+
+    /// Process one bounded batched-prefill chunk. See
+    /// `forward_tokens_batched` for the public error-cleanup and chunking
+    /// wrapper.
+    fn forward_tokens_batched_chunk(&self, tokens: &[u32], state: &mut Qwen35GpuState)
+        -> Result<Vec<f32>, String>
+    {
+        debug_assert!(!tokens.is_empty() && tokens.len() <= PREFILL_CHUNK);
         let n = tokens.len();
         let h     = self.hidden;
         let q_dim = self.q_dim();
@@ -3886,9 +3989,9 @@ impl GpuQwen35 {
         let scaling = (self.head_dim as f32).powf(-0.5);
 
         // Per-call batched activation buffers.
-        let ba    = self.pool_f32.take(n * h)?;        // running hidden
-        let bb    = self.pool_f32.take(n * h)?;        // scratch
-        let bnorm = self.pool_f32.take(n * h)?;        // normed scratch
+        let ba    = self.pool_f32.take_rows(n, h)?;        // running hidden
+        let bb    = self.pool_f32.take_rows(n, h)?;        // scratch
+        let bnorm = self.pool_f32.take_rows(n, h)?;        // normed scratch
 
         // HIP graph capture around the prefill kernel chain. The first
         // prefill at each `n` runs uncaptured so the inner-block buffer
@@ -3899,6 +4002,7 @@ impl GpuQwen35 {
         let trace = std::env::var_os("REINSTINCT_PREFILL_TRACE").is_some();
         let pools_warm = self.prefill_warm_p.borrow().contains(&n);
         let no_graph = trace
+            || self.pool_f32.reserved_rows.get() > 0
             || !pools_warm
             || std::env::var_os("REINSTINCT_PREFILL_NO_GRAPH").is_some();
         if !no_graph {
@@ -4000,14 +4104,28 @@ impl GpuQwen35 {
                 state.kv_pos, self.max_seq));
         }
 
+        let chunk_rows = self.max_seq.min(PREFILL_CHUNK);
+        if n > chunk_rows {
+            let mut last = None;
+            let count = n.div_ceil(chunk_rows);
+            for (i, (embedding_chunk, position_chunk)) in embeddings.chunks(chunk_rows * self.hidden)
+                .zip(positions.chunks(chunk_rows)).enumerate() {
+                last = Some(self.forward_embeddings_mrope_batched(
+                    embedding_chunk, position_chunk,
+                    if i + 1 == count { n_pos } else { 0 }, state)?);
+            }
+            return Ok(last.unwrap());
+        }
+
         let h = self.hidden;
         let scaling = (self.head_dim as f32).powf(-0.5);
-        let ba = self.pool_f32.take(n * h)?;
-        let bb = self.pool_f32.take(n * h)?;
-        let bnorm = self.pool_f32.take(n * h)?;
+        let ba = self.pool_f32.take_rows(n, h)?;
+        let bb = self.pool_f32.take_rows(n, h)?;
+        let bnorm = self.pool_f32.take_rows(n, h)?;
         ba.copy_from_host(embeddings)?;
         let flat_positions: &[u32] = bytemuck::cast_slice(positions);
-        let device_positions = DeviceBuf::from_slice(flat_positions)?;
+        let device_positions = self.pool_positions.take_rows(n, 4)?;
+        device_positions.copy_from_host(flat_positions)?;
 
         for (block, st) in self.blocks.iter().zip(state.block_states.iter_mut()) {
             match (block, st) {
@@ -4055,9 +4173,9 @@ impl GpuQwen35 {
         let h = self.hidden;
         let scaling = (self.head_dim as f32).powf(-0.5);
 
-        let ba    = self.pool_f32.take(n * h)?;   // running hidden
-        let bb    = self.pool_f32.take(n * h)?;   // scratch
-        let bnorm = self.pool_f32.take(n * h)?;   // normed scratch
+        let ba    = self.pool_f32.take_rows(n, h)?;   // running hidden
+        let bb    = self.pool_f32.take_rows(n, h)?;   // scratch
+        let bnorm = self.pool_f32.take_rows(n, h)?;   // normed scratch
 
         for (r, &tok) in tokens.iter().enumerate() {
             let row_ptr = unsafe { (ba.raw_ptr() as *mut f32).add(r * h) } as *mut c_void;
@@ -4083,7 +4201,7 @@ impl GpuQwen35 {
         // dequant-to-fp16 fallback — far worse than n fast matvecs.
         self.launch_rmsnorm_multihead(ba.raw_ptr(), self.output_norm.raw_ptr(),
                                       bnorm.raw_ptr(), n as u32, h as u32, self.rms_eps)?;
-        let logits_all = self.pool_f32.take(n * self.vocab)?;
+        let logits_all = self.pool_f32.take_rows(n, self.vocab)?;
         for r in 0..n {
             let in_ptr  = unsafe { (bnorm.raw_ptr() as *mut f32).add(r * h) } as *mut c_void;
             let out_ptr = unsafe {
@@ -4118,17 +4236,17 @@ impl GpuQwen35 {
                                       bnorm.raw_ptr(), n as u32, h as u32, self.rms_eps)?;
 
         // QKV projections, batched.
-        let q_raw = self.pool_f32.take(n * 2 * q_dim)?;
-        let k_raw = self.pool_f32.take(n * kv_dim)?;
-        let v_raw = self.pool_f32.take(n * kv_dim)?;
+        let q_raw = self.pool_f32.take_rows(n, 2 * q_dim)?;
+        let k_raw = self.pool_f32.take_rows(n, kv_dim)?;
+        let v_raw = self.pool_f32.take_rows(n, kv_dim)?;
         self.bmm(&w.attn.attn_q, bnorm.raw_ptr(), n, q_raw.raw_ptr())?;
         self.bmm(&w.attn.attn_k, bnorm.raw_ptr(), n, k_raw.raw_ptr())?;
         self.bmm(&w.attn.attn_v, bnorm.raw_ptr(), n, v_raw.raw_ptr())?;
 
         // split q_raw → q, gate. The split kernel walks n_heads*head_dim
         // elements; passing n*n_heads covers all rows.
-        let q_buf = self.pool_f32.take(n * q_dim)?;
-        let gate  = self.pool_f32.take(n * q_dim)?;
+        let q_buf = self.pool_f32.take_rows(n, q_dim)?;
+        let gate  = self.pool_f32.take_rows(n, q_dim)?;
         self.launch_split_q_gate(q_raw.raw_ptr(), q_buf.raw_ptr(), gate.raw_ptr(),
                                  (n * self.n_heads) as u32, self.head_dim as u32)?;
         // per-head Q-norm (n*n_heads independent heads).
@@ -4142,7 +4260,7 @@ impl GpuQwen35 {
             self.launch_rope_batched(q_buf.raw_ptr(), self.n_heads as u32, n as u32, base_pos as u32)?;
         }
         // per-kv-head K-norm.
-        let k_norm = self.pool_f32.take(n * kv_dim)?;
+        let k_norm = self.pool_f32.take_rows(n, kv_dim)?;
         self.launch_rmsnorm_multihead(k_raw.raw_ptr(), w.attn.attn_k_norm.raw_ptr(),
                                       k_norm.raw_ptr(),
                                       (n * self.n_kv_heads) as u32, self.head_dim as u32,
@@ -4158,7 +4276,7 @@ impl GpuQwen35 {
         kv.v.copy_from_device_at_async(&v_raw,  base_pos * kv_dim, &self.stream)?;
 
         // Batched causal attention → attn_concat.
-        let attn = self.pool_f32.take(n * q_dim)?;
+        let attn = self.pool_f32.take_rows(n, q_dim)?;
         self.launch_attn_step_batched(q_buf.raw_ptr(), kv.k.raw_ptr(), kv.v.raw_ptr(),
                                       attn.raw_ptr(), base_pos as u32, n as u32, scaling)?;
         // output gate + projection.
@@ -4183,8 +4301,8 @@ impl GpuQwen35 {
         match ffn {
             BlockFfn::Dense(d) => {
                 let f = self.ffn;
-                let gate = self.pool_f32.take(n * f)?;
-                let up   = self.pool_f32.take(n * f)?;
+                let gate = self.pool_f32.take_rows(n, f)?;
+                let up   = self.pool_f32.take_rows(n, f)?;
                 self.bmm(&d.gate, input.raw_ptr(), n, gate.raw_ptr())?;
                 self.bmm(&d.up,   input.raw_ptr(), n, up.raw_ptr())?;
                 self.launch_swiglu(gate.raw_ptr(), up.raw_ptr(), gate.raw_ptr(), (n * f) as u32)?;
@@ -4230,10 +4348,10 @@ impl GpuQwen35 {
                                       bnorm.raw_ptr(), n as u32, h as u32, self.rms_eps)?;
 
         // Four projections, batched.
-        let qkv = self.pool_f32.take(n * cdim)?;
-        let z   = self.pool_f32.take(n * vdim)?;
-        let a   = self.pool_f32.take(n * self.gdn_n_heads)?;
-        let b   = self.pool_f32.take(n * self.gdn_n_heads)?;
+        let qkv = self.pool_f32.take_rows(n, cdim)?;
+        let z   = self.pool_f32.take_rows(n, vdim)?;
+        let a   = self.pool_f32.take_rows(n, self.gdn_n_heads)?;
+        let b   = self.pool_f32.take_rows(n, self.gdn_n_heads)?;
         self.bmm(&w.attn.attn_qkv,  bnorm.raw_ptr(), n, qkv.raw_ptr())?;
         self.bmm(&w.attn.attn_gate, bnorm.raw_ptr(), n, z.raw_ptr())?;
         self.bmm(&w.attn.ssm_alpha, bnorm.raw_ptr(), n, a.raw_ptr())?;
@@ -4241,7 +4359,7 @@ impl GpuQwen35 {
 
         // conv1d + SiLU, batched: one launch over all n rows (the kernel
         // threads the conv history through the rows internally).
-        let conv_out = self.pool_f32.take(n * cdim)?;
+        let conv_out = self.pool_f32.take_rows(n, cdim)?;
         self.launch_conv1d_step_silu_batched(
             qkv.raw_ptr(), w.attn.ssm_conv1d.raw_ptr(),
             st.conv_hist.raw_ptr(), conv_out.raw_ptr(),
@@ -4250,8 +4368,8 @@ impl GpuQwen35 {
         // L2-norm Q/K → q_all/k_all [n, kdim]. The conv output is
         // [n, cdim] with layout (q | k | v) per row; the batched kernel
         // strides by cdim to walk rows.
-        let q_all = self.pool_f32.take(n * kdim)?;
-        let k_all = self.pool_f32.take(n * kdim)?;
+        let q_all = self.pool_f32.take_rows(n, kdim)?;
+        let k_all = self.pool_f32.take_rows(n, kdim)?;
         let conv_q_ptr = conv_out.raw_ptr();
         let conv_k_ptr = unsafe { (conv_out.raw_ptr() as *mut f32).add(kdim) } as *mut c_void;
         self.launch_l2norm_qk_batched(
@@ -4266,7 +4384,7 @@ impl GpuQwen35 {
         // Recurrent step + decay/beta — single launch over all n rows;
         // the kernel loops internally with state threaded through.
         // v_in points at the v half of conv_out (offset 2*kdim per row).
-        let core = self.pool_f32.take(n * vdim)?;
+        let core = self.pool_f32.take_rows(n, vdim)?;
         let conv_v_ptr = unsafe { (conv_out.raw_ptr() as *mut f32).add(2 * kdim) } as *mut c_void;
         self.launch_gdn_recurrent_step_fused_batched(
             q_all.raw_ptr(), k_all.raw_ptr(), conv_v_ptr,
@@ -4514,6 +4632,46 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::gguf::GgufFile;
+
+    #[test]
+    fn sealed_workspace_rejects_growth_without_calling_hip() {
+        let pool = DeviceBufPool::<f32>::new();
+        pool.reserved_rows.set(16);
+        pool.sealed.set(true);
+        assert!(pool.take_rows(17, 4).err().unwrap().contains("exceeds reserved capacity"));
+        assert!(pool.take_rows(4, 4).err().unwrap().contains("request-time allocation disabled"));
+    }
+
+    #[test]
+    #[ignore = "requires a HIP GPU; reserves less than 1 KiB"]
+    fn reserved_workspace_reuses_storage_and_preserves_logical_copy_bounds() {
+        let _dev = hip::Device::set(0).unwrap();
+        let pool = DeviceBufPool::<f32>::new();
+        pool.reserved_rows.set(16);
+        let initial = hip::memory_snapshot().scratch_bytes;
+        let pointer = {
+            let buffer = pool.take_rows(16, 4).unwrap();
+            buffer.raw_ptr()
+        };
+        let reserved = hip::memory_snapshot().scratch_bytes;
+        assert_eq!(reserved - initial, 16 * 4 * 4);
+        pool.sealed.set(true);
+        for rows in [1, 7, 16, 3, 15] {
+            let buffer = pool.take_rows(rows, 4).unwrap();
+            assert_eq!(buffer.raw_ptr(), pointer);
+            assert_eq!(buffer.len(), rows * 4);
+            let source = vec![rows as f32; rows * 4];
+            buffer.copy_from_host(&source).unwrap();
+            let mut output = vec![0.0; source.len()];
+            buffer.copy_to_host(&mut output).unwrap();
+            assert_eq!(source, output);
+            assert_eq!(hip::memory_snapshot().scratch_bytes, reserved);
+        }
+        pool.clear();
+        assert_eq!(hip::memory_snapshot().scratch_bytes, reserved);
+        drop(pool);
+        assert_eq!(hip::memory_snapshot().scratch_bytes, initial);
+    }
 
     fn fixture_path() -> Option<PathBuf> {
         if let Ok(p) = std::env::var("REINSTINCT_GGUF_FIXTURE") {

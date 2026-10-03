@@ -134,6 +134,55 @@ impl MtmdProcessor {
         output
     }
 
+    /// Exercise the configured maximum image area before serving. libmtmd's
+    /// built-in warmup deliberately uses a smaller image on Qwen, so it does
+    /// not reserve the maximum projector workspace by itself.
+    pub fn reserve_qwen_vision_workspace(&mut self, mmproj: &Path, max_tokens: i32) -> Result<usize, String> {
+        let metadata = crate::gguf::GgufFile::open(mmproj).map_err(|e| e.to_string())?;
+        let number = |key: &str| metadata.metadata_get(key).and_then(|v| v.as_u64());
+        let patch = number("clip.vision.patch_size").ok_or("missing vision patch size for reservation")?;
+        let merge = number("clip.vision.spatial_merge_size").unwrap_or(2);
+        let unit = patch.checked_mul(merge).ok_or("vision patch area overflow")?;
+        if unit == 0 { return Err("vision patch and merge sizes must be positive".into()); }
+        let projector = metadata.metadata_get("clip.vision.projector_type")
+            .or_else(|| metadata.metadata_get("clip.projector_type"))
+            .and_then(|v| v.as_str());
+        let pixels = if max_tokens > 0 {
+            (max_tokens as u64).checked_mul(unit).and_then(|v| v.checked_mul(unit))
+                .ok_or("vision token area overflow")?
+        } else {
+            // These projectors use set_limit_image_tokens(8, 4096) in the
+            // bundled libmtmd, even when GGUF has no max-pixels metadata.
+            if matches!(projector, Some("qwen2vl_merger" | "qwen2.5vl_merger" | "qwen3vl_merger")) {
+                4096u64.checked_mul(unit).and_then(|v| v.checked_mul(unit))
+                    .ok_or("default vision token area overflow")?
+            } else {
+                number("clip.vision.image_max_pixels").ok_or(
+                    "vision reservation requires vision_max_tokens or clip.vision.image_max_pixels metadata")?
+            }
+        };
+        let side = (pixels as f64).sqrt().ceil() as usize;
+        if side == 0 || side > 16384 { return Err("vision reservation image dimension must be 1..16384".into()); }
+        // A plain BMP avoids adding a codec dependency just for startup.
+        let stride = (side * 3 + 3) & !3;
+        let length = 54 + stride * side;
+        let mut image = vec![0u8; length];
+        image[..2].copy_from_slice(b"BM");
+        image[2..6].copy_from_slice(&(length as u32).to_le_bytes());
+        image[10..14].copy_from_slice(&54u32.to_le_bytes());
+        image[14..18].copy_from_slice(&40u32.to_le_bytes());
+        image[18..22].copy_from_slice(&(side as i32).to_le_bytes());
+        image[22..26].copy_from_slice(&(side as i32).to_le_bytes());
+        image[26..28].copy_from_slice(&1u16.to_le_bytes());
+        image[28..30].copy_from_slice(&24u16.to_le_bytes());
+        let result = self.process("<|im_start|>user\n<__media__><|im_end|>\n<|im_start|>assistant\n", &image)
+            .map_err(|e| format!("cannot reserve maximum vision workspace ({pixels} pixels): {e}"))?;
+        Ok(result.chunks.iter().map(|chunk| match chunk {
+            Chunk::Image { embeddings, embedding_dim, .. } => embeddings.len() / embedding_dim,
+            _ => 0,
+        }).sum())
+    }
+
     unsafe fn copy_result(&self, result: *const ResultOpaque) -> Result<ProcessedImage, String> {
         // Every FFI function pointer and raw pointer dereference is confined
         // to this block. The bridge contract guarantees result ownership until
@@ -197,6 +246,18 @@ fn bridge_error(operation: &str, error: &[c_char]) -> String {
 mod tests {
     use super::MtmdProcessor;
     use std::path::Path;
+
+    #[test]
+    #[ignore = "requires the mtmd bridge and Qwen model/projector fixtures"]
+    fn reserves_configured_vision_area_on_cpu() {
+        let bridge = std::env::var("REINSTINCT_MTMD_BRIDGE").unwrap();
+        let model = std::env::var("REINSTINCT_GGUF_FIXTURE").unwrap();
+        let projector = std::env::var("REINSTINCT_MMPROJ_FIXTURE").unwrap();
+        let mut processor = MtmdProcessor::load(Path::new(&bridge), Path::new(&model),
+            Path::new(&projector), 2048, false, 4, -1, 256).unwrap();
+        let rows = processor.reserve_qwen_vision_workspace(Path::new(&projector), 256).unwrap();
+        assert_eq!(rows, 256);
+    }
 
     #[test]
     fn rejects_zero_image_token_limit_before_loading_library() {

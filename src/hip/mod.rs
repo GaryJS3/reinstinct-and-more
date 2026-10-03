@@ -43,6 +43,17 @@ static ALLOCATED_BYTES: [AtomicU64; MemoryCategory::COUNT] = [
     AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
     AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
 ];
+static SCRATCH_BORROWED_BYTES: AtomicU64 = AtomicU64::new(0);
+static SCRATCH_PEAK_BORROWED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn account_scratch_borrow(bytes: usize, add: bool) {
+    if add {
+        let current = SCRATCH_BORROWED_BYTES.fetch_add(bytes as u64, Ordering::Relaxed) + bytes as u64;
+        SCRATCH_PEAK_BORROWED_BYTES.fetch_max(current, Ordering::Relaxed);
+    } else {
+        SCRATCH_BORROWED_BYTES.fetch_sub(bytes as u64, Ordering::Relaxed);
+    }
+}
 
 fn account(category: MemoryCategory, bytes: usize, add: bool) {
     let counter = &ALLOCATED_BYTES[category.index()];
@@ -58,6 +69,8 @@ pub struct MemorySnapshot {
     pub context_bytes: u64,
     pub runtime_bytes: u64,
     pub scratch_bytes: u64,
+    pub scratch_borrowed_bytes: u64,
+    pub scratch_peak_borrowed_bytes: u64,
     pub vision_bytes: u64,
     pub unattributed_bytes: u64,
 }
@@ -76,6 +89,8 @@ pub fn memory_snapshot() -> MemorySnapshot {
         context_bytes: load(MemoryCategory::Context),
         runtime_bytes: load(MemoryCategory::Runtime),
         scratch_bytes: load(MemoryCategory::Scratch),
+        scratch_borrowed_bytes: SCRATCH_BORROWED_BYTES.load(Ordering::Relaxed),
+        scratch_peak_borrowed_bytes: SCRATCH_PEAK_BORROWED_BYTES.load(Ordering::Relaxed),
         vision_bytes: load(MemoryCategory::Vision),
         unattributed_bytes: load(MemoryCategory::Unattributed),
     }
@@ -209,6 +224,12 @@ impl<T: Copy> DeviceBuf<T> {
     }
 
     pub fn len(&self) -> usize { self.len }
+    /// Change the visible prefix without changing the owned allocation or
+    /// its memory accounting. Used by reserved scratch buffers.
+    pub(crate) fn set_logical_len(&mut self, len: usize) {
+        assert!(len <= self.bytes / std::mem::size_of::<T>());
+        self.len = len;
+    }
     pub fn is_empty(&self) -> bool { self.len == 0 }
     pub fn as_ptr(&self) -> *const T { self.ptr }
     pub fn as_mut_ptr(&mut self) -> *mut T { self.ptr }

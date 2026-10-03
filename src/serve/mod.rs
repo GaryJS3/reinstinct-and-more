@@ -822,7 +822,12 @@ fn parse_chat_completions(body: &str) -> Result<GenReq, (u16, &'static str, Stri
     }
     let (max_tokens, stop, sampler, use_speculative, speculative_k, speculative_p_min,
          request_timeout, stream, stream_include_usage, top_logprobs_n) =
-        parse_common_fields(&j, CHAT_DEFAULTS).map_err(&bad)?;
+        // Repeated XML delimiters are required syntax for Qwen tool calls.
+        // Penalizing them can turn a valid function call into malformed XML.
+        // Explicit caller penalties still override these defaults.
+        parse_common_fields(&j, if !tool_options.tools.is_empty() {
+            SamplerDefaults { repetition_penalty: 1.0, ..CHAT_DEFAULTS }
+        } else { CHAT_DEFAULTS }).map_err(&bad)?;
     let prompt = if rich_messages {
         PromptInput::ChatTools { messages: rich, options: tool_options }
     } else {
@@ -3106,6 +3111,19 @@ pub fn run(overrides: config::ServeOverrides)
 
 #[cfg(test)]
 mod logprobs_tests {
+    #[test]
+    fn tool_calls_use_neutral_repetition_default_and_preserve_overrides() {
+        let tool = r#"{"type":"function","function":{"name":"read","parameters":{"type":"object"}}}"#;
+        let body = format!(r#"{{"messages":[{{"role":"user","content":"Read it"}}],"tools":[{tool}]}}"#);
+        let request = super::parse_chat_completions(&body).unwrap();
+        assert_eq!(request.sampler.repetition_penalty, 1.0);
+        let mut explicit: serde_json::Value = serde_json::from_str(&body).unwrap();
+        explicit["repetition_penalty"] = serde_json::json!(1.2);
+        assert_eq!(super::parse_chat_completions(&explicit.to_string()).unwrap().sampler.repetition_penalty, 1.2);
+        explicit["tools"] = serde_json::json!([]);
+        explicit.as_object_mut().unwrap().remove("repetition_penalty");
+        assert_eq!(super::parse_chat_completions(&explicit.to_string()).unwrap().sampler.repetition_penalty, 1.1);
+    }
     use super::*;
 
     #[test]

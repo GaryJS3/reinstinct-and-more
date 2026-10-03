@@ -1442,7 +1442,7 @@ impl ServerModel {
                         // replace the marker with image embeddings.  We count its
                         // physical rows after processing rather than estimating
                         // from the text tokenizer here.
-                        let formatted = crate::chat::format_qwen3_with_media_marker(messages)?;
+                        let formatted = crate::chat::format_qwen3_with_media_marker(messages, req.qwen_enable_thinking)?;
                         let marker_count = formatted.matches("<__media__>").count();
                         if marker_count != 1 { return Err(format!("multimodal chat needs exactly one image marker, found {marker_count}")); }
                         // A placeholder keeps the normal text-only prompt path
@@ -1459,7 +1459,7 @@ impl ServerModel {
                 let thermal_wait_before_prefill = thermal_wait_ms;
                 let (mut logits, prompt_rows) = match &req.prompt {
                     PromptInput::ChatVision { messages, image } => {
-                        let formatted = crate::chat::format_qwen3_with_media_marker(messages)?;
+                        let formatted = crate::chat::format_qwen3_with_media_marker(messages, req.qwen_enable_thinking)?;
                         let processor = vision.as_mut().ok_or(
                             "image input is disabled; start serve with --mmproj PATH --mtmd-bridge PATH")?;
                         let mtmd_started = std::time::Instant::now();

@@ -500,7 +500,7 @@ fn render_qwen_tool_call(call: &crate::serve::tools::ToolCall) -> Result<String,
 /// Render Qwen chat text for the mtmd bridge.  Unlike `format_qwen3`, this
 /// keeps exactly one `<__media__>` marker literal so Furnace can replace it
 /// with projected image embeddings before ReInstinct evaluates the LLM.
-pub fn format_qwen3_with_media_marker(messages: &[ChatMessage]) -> Result<String, String> {
+pub fn format_qwen3_with_media_marker(messages: &[ChatMessage], enable_thinking: bool) -> Result<String, String> {
     let mut out = String::new();
     for m in messages {
         let role = match m.role {
@@ -517,5 +517,24 @@ pub fn format_qwen3_with_media_marker(messages: &[ChatMessage]) -> Result<String
     if !out.contains("<__media__>") {
         return Err("multimodal chat is missing its media marker".into());
     }
-    Ok(out + "<|im_start|>assistant\n")
+    out.push_str("<|im_start|>assistant\n<think>\n");
+    if !enable_thinking {
+        out.push_str("\n</think>\n\n");
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod media_thinking_tests {
+    use super::*;
+
+    #[test]
+    fn media_prompt_honors_thinking_mode() {
+        let messages = [ChatMessage { role: Role::User, content: "Describe <__media__>".into() }];
+        let enabled = format_qwen3_with_media_marker(&messages, true).unwrap();
+        let disabled = format_qwen3_with_media_marker(&messages, false).unwrap();
+        assert!(enabled.ends_with("<think>\n"));
+        assert!(disabled.ends_with("<think>\n\n</think>\n\n"));
+        assert_eq!(disabled.matches("<__media__>").count(), 1);
+    }
 }

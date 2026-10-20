@@ -1518,6 +1518,23 @@ impl GpuQwen35 {
         unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, Some(&self.stream), &mut args) }
     }
 
+    fn launch_embed_lookup_f16(module: &Module, stream: &Stream,
+                               table: *mut c_void, out: *mut c_void,
+                               token: u32, hidden: u32) -> Result<(), String>
+    {
+        let f = module.function("embed_lookup_f16_f32")?;
+        let block: u32 = 256;
+        let grid = hidden.div_ceil(block);
+        let mut t = table; let mut o = out; let mut row = token; let mut n = hidden;
+        let mut args: [*mut c_void; 4] = [
+            &mut t as *mut _ as *mut c_void,
+            &mut o as *mut _ as *mut c_void,
+            &mut row as *mut _ as *mut c_void,
+            &mut n as *mut _ as *mut c_void,
+        ];
+        unsafe { f.launch((grid, 1, 1), (block, 1, 1), 0, Some(stream), &mut args) }
+    }
+
     fn launch_embed_lookup_q6_k(&self, table: *mut c_void, out: *mut c_void,
                                 token: u32, hidden: u32) -> Result<(), String>
     {
@@ -1577,6 +1594,8 @@ impl GpuQwen35 {
         let hidden = table.in_dim;  // first dim of [hidden, vocab]
         match table.dtype {
             GgmlType::F32  => self.launch_embed_lookup(table.data.raw_ptr(), out, token, hidden),
+            GgmlType::F16  => Self::launch_embed_lookup_f16(
+                &self.embed_module, &self.stream, table.data.raw_ptr(), out, token, hidden),
             GgmlType::Q6_K => self.launch_embed_lookup_q6_k(table.data.raw_ptr(), out, token, hidden),
             GgmlType::Q4_K => self.launch_embed_lookup_q4_k(table.data.raw_ptr(), out, token, hidden),
             GgmlType::Q8_0 => self.launch_embed_lookup_q8_0(table.data.raw_ptr(), out, token, hidden),
@@ -4632,6 +4651,42 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::gguf::GgufFile;
+
+    #[test]
+    #[ignore = "requires a HIP GPU and kernel compiler"]
+    fn fp16_embedding_lookup_matches_cpu() {
+        let _dev = hip::Device::set(0).unwrap();
+        let cache = KernelCache::new().unwrap();
+        let module = Module::load(&cache.compile("embed_lookup", EMBED_LOOKUP_SOURCE).unwrap()).unwrap();
+        let stream = Stream::new().unwrap();
+        // Exercise partial blocks, full blocks, and every FP16 bit pattern,
+        // including signed zero, subnormals, infinities, and NaNs.
+        for hidden in [1usize, 255, 256, 257, 2560] {
+            let rows = if hidden == 257 { 256 } else { 3 };
+            let bits: Vec<u16> = (0..hidden * rows).map(|i| i as u16).collect();
+            let table = DeviceBuf::<u16>::new(bits.len()).unwrap();
+            table.copy_from_host(&bits).unwrap();
+            let out = DeviceBuf::<f32>::new(hidden + 1).unwrap();
+            for row in 0..rows {
+                out.copy_from_host(&vec![123456.0; hidden + 1]).unwrap();
+                GpuQwen35::launch_embed_lookup_f16(&module, &stream,
+                    table.raw_ptr(), out.raw_ptr(), row as u32, hidden as u32).unwrap();
+                stream.synchronize().unwrap();
+                let mut actual = vec![0.0; hidden + 1];
+                out.copy_to_host(&mut actual).unwrap();
+                for i in 0..hidden {
+                    let expected = half::f16::from_bits(bits[row * hidden + i]).to_f32();
+                    if expected.is_nan() {
+                        assert!(actual[i].is_nan());
+                    } else {
+                        assert_eq!(actual[i].to_bits(), expected.to_bits(),
+                            "hidden={hidden}, row={row}, column={i}");
+                    }
+                }
+                assert_eq!(actual[hidden], 123456.0, "wrote past embedding row");
+            }
+        }
+    }
 
     #[test]
     fn sealed_workspace_rejects_growth_without_calling_hip() {
